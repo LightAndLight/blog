@@ -1,0 +1,40 @@
+cradle:
+  cabal:
+    - path: "./src"
+      component: "lib:blog"
+
+    - path: "./cli/Main.hs"
+      component: "blog:exe:blog"
+
+    - path: "./server/Main.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Blog/Build.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Blog/Diagnostic.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Blog/Metadata.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Blog/Resource.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/IO.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Text/Pandoc/Builder.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Text/Pandoc/Definition.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Text/Pandoc/Html.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Text/Pandoc/Walk.hs"
+      component: "blog:exe:blog-server"
+
+    - path: "./server/Commonmark/Pandoc.hs"
+      component: "blog:exe:blog-server"

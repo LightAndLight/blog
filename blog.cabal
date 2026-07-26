@@ -1,0 +1,90 @@
+cabal-version:      3.0
+name:               blog
+version:            0.1.0.0
+license:            GPL-3.0-only
+license-file:       LICENSE
+author:             Isaac Elliott
+maintainer:         isaace71295@gmail.com
+category:           Web
+build-type:         Simple
+
+common warnings
+    ghc-options: -Wall
+
+library
+    import:           warnings
+    exposed-modules:  Blog
+    build-depends:
+        base ^>=4.20.2.0,
+        containers,
+        sage,
+        text >=2.0,
+        tomlin
+    hs-source-dirs:   src
+    default-language: Haskell2010
+
+executable blog
+    import:           warnings
+    main-is:          Main.hs
+    build-depends:
+        base ^>=4.20.2.0,
+        blog,
+        bytestring,
+        crypton-connection,
+        crypton-x509-store,
+        directory,
+        filepath,
+        http-client,
+        http-client-tls,
+        http-types,
+        optparse-applicative,
+        process,
+        sage,
+        time,
+        tls
+
+    hs-source-dirs:   cli
+    default-language: Haskell2010
+    ghc-options:      -threaded
+
+executable blog-server
+    import:           warnings
+    main-is:          Main.hs
+    other-modules:
+        Blog.Build
+        Blog.Diagnostic
+        Blog.Metadata
+        Blog.Resource
+        IO
+        Text.Pandoc.Builder
+        Text.Pandoc.Definition
+        Text.Pandoc.Html
+        Text.Pandoc.Walk
+        Commonmark.Pandoc
+    build-depends:
+        base ^>=4.20.2.0,
+        blog,
+        bytestring,
+        commonmark,
+        commonmark-extensions,
+        containers,
+        deepseq,
+        diagnostica,
+        diagnostica-sage,
+        directory,
+        filepath,
+        http-types,
+        mtl >=2.3.2,
+        optparse-applicative,
+        syb,
+        temple,
+        text >=2.0,
+        time,
+        tomlin,
+        wai,
+        warp,
+        warp-tls
+
+    hs-source-dirs:   server
+    default-language: Haskell2010
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N

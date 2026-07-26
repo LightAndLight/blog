@@ -1,0 +1,37 @@
+packages: .
+
+--- BEGIN HDEPS ---
+
+source-repository-package
+  type: git
+  location: https://github.com/LightAndLight/diagnostica.git
+  tag: ae00004b101bde236abedba7ce480d289707356d
+
+source-repository-package
+  type: git
+  location: https://github.com/LightAndLight/diagnostica-sage.git
+  tag: 431c636174a5c39f1a3bfc1141bf7d95c0b5b399
+
+source-repository-package
+  type: git
+  location: https://github.com/LightAndLight/sage.git
+  tag: c449a0eb061e1b9826b692e425ee86b85f4607d5
+  subdir: sage
+
+source-repository-package
+  type: git
+  location: https://github.com/LightAndLight/sage.git
+  tag: c449a0eb061e1b9826b692e425ee86b85f4607d5
+  subdir: sage-parsers-instances
+
+source-repository-package
+  type: git
+  location: https://github.com/LightAndLight/temple.git
+  tag: 73a967fbd8bad623b2c9bd98c89420984370ca45
+
+source-repository-package
+  type: git
+  location: https://github.com/LightAndLight/tomlin.git
+  tag: 0955615bb2f4061700c81014b99266e292def088
+
+--- END HDEPS ---

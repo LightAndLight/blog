@@ -1,0 +1,3 @@
+#! /usr/bin/env bash
+
+hdeps -i hdeps.json -o generated --cabal-project ../cabal.project $@
