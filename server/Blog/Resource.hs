@@ -14,8 +14,10 @@ where
 import Blog
   ( MetadataValue
   , ResourceConfig (..)
+  , ResourceId (..)
   , ResourceType (..)
-  , resourceConfigDecoder, ResourceId (..), renderResourceId
+  , renderResourceId
+  , resourceConfigDecoder
   )
 import Blog.Diagnostic (DiagnosticReports, tomlResult)
 import Blog.Metadata (resourceMetadataDecoder)
@@ -30,12 +32,15 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (catMaybes)
 import Data.Monoid (First (..))
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
+import Data.Traversable (for)
+import IO (WithCallStack (..))
 import qualified IO
 import System.Directory
   ( createDirectory
@@ -52,9 +57,6 @@ import Text.Pandoc.Builder (Blocks)
 import Text.Pandoc.Definition (Block (..))
 import Text.Pandoc.Walk (query)
 import qualified Toml
-import IO (WithCallStack(..))
-import Data.Traversable (for)
-import Data.Maybe (catMaybes)
 
 getResourceType ::
   (MonadError DiagnosticReports m, MonadIO m) =>
@@ -213,7 +215,7 @@ extractMetadataMarkdown resTy resName body = do
       let
         resourceFile =
           fromString $
-          "(" ++ renderResourceId (ResourceId (Text.unpack $ resourceTypeName resTy) resName) ++ "/metadata)"
+            "(" ++ renderResourceId (ResourceId (Text.unpack $ resourceTypeName resTy) resName) ++ "/metadata)"
       let content' = LazyByteString.toStrict content
       toml <- tomlResult resourceFile content $ Toml.parse content'
       values <- tomlResult resourceFile content $ Toml.decode toml decoder

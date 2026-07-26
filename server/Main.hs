@@ -5,7 +5,7 @@
 
 module Main (main) where
 
-import Blog (ResourceId (..))
+import Blog (ResourceId (..), renderResourceId)
 import qualified Blog.Build as Build
 import Blog.Diagnostic (renderDiagnosticReports)
 import Blog.Metadata (lookupResourceMetadata)
@@ -13,6 +13,7 @@ import Blog.Resource
   ( createResource
   , doesResourceExist
   , getResourceType
+  , listResource
   , lookupResource
   , updateResource
   )
@@ -122,6 +123,28 @@ app cli request respond =
                     if Wai.requestMethod request == fromString "PUT"
                       then httpResourcePut cli request
                       else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+      [part, resTyName]
+        | part == fromString ".resource" ->
+            if Wai.requestMethod request == fromString "GET"
+              then do
+                mResTy <- runExceptT $ getResourceType (cliData cli) resTyName
+                case mResTy of
+                  Left err ->
+                    throwError $ Wai.responseLBS badRequest400 [] (renderDiagnosticReports err)
+                  Right Nothing ->
+                    throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+                  Right (Just (resTyDir, resTy)) -> do
+                    mBody <- runExceptT $ listResource resTyDir resTy
+                    case mBody of
+                      Left err ->
+                        throwError $ Wai.responseLBS badRequest400 [] (renderDiagnosticReports err)
+                      Right items ->
+                        pure $
+                          Wai.responseLBS
+                            ok200
+                            []
+                            (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
+              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       [part, resTyName, resName]
         | part == fromString ".resource" ->
             if Wai.requestMethod request == fromString "GET"

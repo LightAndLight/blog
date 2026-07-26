@@ -29,12 +29,12 @@
     "type": "github",
     "owner": "LightAndLight",
     "repository": "temple",
-    "commit": "73a967fbd8bad623b2c9bd98c89420984370ca45"
+    "commit": "c3a148f37a5371212e8ef544c7a2a2d07af59819"
   },
   "tomlin": {
     "type": "github",
     "owner": "LightAndLight",
     "repository": "tomlin",
-    "commit": "0955615bb2f4061700c81014b99266e292def088"
+    "commit": "52b51a75decb69d0793941309000b6fa92999fbc"
   }
 }

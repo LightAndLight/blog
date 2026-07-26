@@ -44,6 +44,9 @@ data Command
       Bool
       -- | ID of resource to view
       String
+  | List
+      -- | Resource type
+      String
   | Create
       -- | Source file
       (Maybe FilePath)
@@ -69,6 +72,9 @@ cliParser =
       )
     <*> Options.hsubparser
       ( Options.command "view" (Options.info viewParser $ Options.progDesc "View a resource")
+          <> Options.command
+            "list"
+            (Options.info listParser $ Options.progDesc "List resources of a specific type")
           <> Options.command "create" (Options.info createParser $ Options.progDesc "Create an empty resource")
           <> Options.command "update" (Options.info updateParser $ Options.progDesc "Update a resource")
           <> Options.command "edit" (Options.info editParser $ Options.progDesc "Edit a resource")
@@ -80,6 +86,11 @@ cliParser =
           (Options.long "metadata" <> Options.help "View metadata only")
         <*> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to view (format: `TYPE:NAME`)")
+
+    listParser =
+      List
+        <$> Options.strArgument
+          (Options.metavar "TYPE" <> Options.help "Type of resource to view")
 
     createParser =
       Create
@@ -132,6 +143,8 @@ main = do
     View metadata resourceId -> do
       resourceId' <- parseResourceId resourceId
       view baseUrl mCertificateStore metadata resourceId'
+    List resourceTyName ->
+      list baseUrl mCertificateStore resourceTyName
     Create mSrcFile resourceId -> do
       resourceId' <- parseResourceId resourceId
       create baseUrl mCertificateStore mSrcFile resourceId'
@@ -311,6 +324,45 @@ view baseUrl mCertificateStore metadata resourceId = do
       exitFailure
     NotFound -> do
       putStrLn $ "error: resource " ++ renderResourceId resourceId ++ " not found"
+      exitFailure
+    Ok body -> do
+      LazyByteString.writeFile resourcePathLocal body
+
+  callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
+
+list ::
+  String ->
+  Maybe CertificateStore ->
+  -- | Resource type
+  String ->
+  IO ()
+list baseUrl mCertificateStore resourceTyName = do
+  dataHome <- getDataHome
+  pager <- getPager
+
+  manager <- httpManager mCertificateStore
+
+  let resourceDirLocal = dataHome </> "blog" </> "resource" </> (resourceTyName ++ ".d")
+  createDirectoryIfMissing True resourceDirLocal
+
+  let resourcePathLocal = resourceDirLocal </> "list"
+
+  (_responseHeaders, rBody) <- do
+    let
+      headers = []
+      url = baseUrl ++ "/.resource/" ++ resourceTyName
+
+    httpGet manager url headers
+
+  case rBody of
+    Conflict ->
+      error "impossible"
+    Created ->
+      error "impossible"
+    PreconditionFailed -> do
+      error "impossible"
+    NotFound -> do
+      putStrLn $ "error: resource type " ++ resourceTyName ++ " not found"
       exitFailure
     Ok body -> do
       LazyByteString.writeFile resourcePathLocal body

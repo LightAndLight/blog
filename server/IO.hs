@@ -7,8 +7,8 @@ import Control.Exception (Exception, catch, throwIO)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import GHC.Stack (CallStack, HasCallStack, callStack, prettyCallStack)
-import Prelude hiding (readFile, writeFile)
 import qualified System.Directory as Directory
+import Prelude hiding (readFile, writeFile)
 
 data WithCallStack a = WithCallStack CallStack a
 

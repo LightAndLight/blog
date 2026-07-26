@@ -8,6 +8,7 @@ module Blog
   , ResourceType (..)
   , ResourceConfig (..)
   , resourceConfigDecoder
+  , MetadataConfig (..)
   , MetadataType (..)
   , metadataTypeDecoder
   , MetadataValue (..)
@@ -15,9 +16,10 @@ module Blog
   )
 where
 
-import Control.Applicative (some, (<|>))
+import Control.Applicative (optional, some, (<|>))
 import qualified Data.Char as Char
 import Data.Map (Map)
+import Data.Maybe (fromMaybe, isJust)
 import Data.String (fromString)
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
@@ -60,12 +62,21 @@ data ResourceType
 data ResourceConfig
   = ResourceConfig
   { cfgContentType :: !Text
-  , cfgMetadata :: !(Map Text MetadataType)
+  , cfgMetadata :: !(Map Text MetadataConfig)
+  }
+  deriving (Show)
+
+data MetadataConfig
+  = MetadataConfig
+  { metaCfgType :: !MetadataType
+  , metaCfgOptional :: !Bool
+  , metaCfgDefault :: !(Maybe MetadataValue)
   }
   deriving (Show)
 
 data MetadataType
-  = TString
+  = TBool
+  | TString
   | TList MetadataType
   deriving (Show)
 
@@ -73,16 +84,47 @@ resourceConfigDecoder :: Toml.Decoder ResourceConfig
 resourceConfigDecoder =
   ResourceConfig
     <$> Toml.key (fromString "content-type") Toml.text
-    <*> Toml.table (fromString "metadata") (Toml.keys $ Toml.pstring metadataTypeParser)
+    <*> Toml.table
+      (fromString "metadata")
+      ( Toml.keys $
+          noDefault
+            <$> Toml.pstring metadataTypeParser
+              `Toml.alt` withDefault
+      )
+  where
+    noDefault ty = MetadataConfig{metaCfgType = ty, metaCfgOptional = False, metaCfgDefault = Nothing}
+
+    withDefault =
+      Toml.record $
+        ( \ty opt def ->
+            let
+              -- providing `default` implies `optional = true`
+              opt' = fromMaybe (isJust def) opt
+            in
+              MetadataConfig ty opt' def
+        )
+          <$> Toml.recordKey (fromString "type") (Toml.pstring metadataTypeParser)
+          <*> optional (Toml.recordKey (fromString "optional") Toml.bool)
+          <*> optional (Toml.recordKey (fromString "default") (fmap tomlValueToMetadataValue Toml.value))
+
+    tomlValueToMetadataValue Toml.VTrue = VTrue
+    tomlValueToMetadataValue Toml.VFalse = VFalse
+    tomlValueToMetadataValue (Toml.VString s) = VString s
+    tomlValueToMetadataValue (Toml.VArray s) = VList $ tomlValueToMetadataValue . Toml.locatedValue <$> s
+    tomlValueToMetadataValue val = error $ "TODO: " ++ show val
 
 metadataTypeParser :: Sage.Parser MetadataType
 metadataTypeParser =
-  TString <$ Sage.string (fromString "string")
+  TBool <$ Sage.string (fromString "bool")
+    <|> TString <$ Sage.string (fromString "string")
     <|> TList <$ Sage.string (fromString "list") <* Sage.char '(' <*> metadataTypeParser <* Sage.char ')'
 
 data MetadataValue
-  = VString !Text
+  = VTrue
+  | VFalse
+  | VString !Text
   | VList ![MetadataValue]
+  | VConstructor !Text ![MetadataValue]
   deriving (Show)
 
 metadataValueString :: HasCallStack => MetadataValue -> Text
@@ -90,5 +132,6 @@ metadataValueString (VString s) = s
 metadataValueString v = error $ "not a string: " ++ show v
 
 metadataTypeDecoder :: MetadataType -> Toml.ValueDecoder MetadataValue
+metadataTypeDecoder TBool = (\b -> if b then VTrue else VFalse) <$> Toml.bool
 metadataTypeDecoder TString = VString <$> Toml.text
 metadataTypeDecoder (TList ty) = fmap VList . Toml.list $ metadataTypeDecoder ty

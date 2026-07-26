@@ -72,6 +72,12 @@ tomlErrorReport err =
   case err of
     Toml.ParseError err' ->
       One $ Text.Diagnostic.Sage.parseError err'
+    Toml.DecodeFail offset ->
+      One $
+        Diagnostic.emit
+          (Diagnostic.Offset offset)
+          Diagnostic.Caret
+          (fromString "decode failure")
     Toml.MissingKey offset name ->
       One $
         Diagnostic.emit
@@ -113,3 +119,18 @@ tomlErrorReport err =
         (fromString "(string)")
         (LazyByteString.fromStrict string)
         (One $ Text.Diagnostic.Sage.parseError err')
+    Toml.ExpectedRecord offset ->
+      One $
+        Diagnostic.emit (Diagnostic.Offset offset) Diagnostic.Caret (fromString "expected a record")
+    Toml.MissingField offset name ->
+      One $
+        Diagnostic.emit
+          (Diagnostic.Offset offset)
+          Diagnostic.Caret
+          (fromString $ "missing field '" ++ Text.unpack name ++ "'")
+    Toml.UnexpectedFields fieldOffsets ->
+      One $
+        foldMap
+          ( \offset -> Diagnostic.emit (Diagnostic.Offset offset) Diagnostic.Caret (fromString "unexpected field")
+          )
+          fieldOffsets

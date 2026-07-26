@@ -25,7 +25,9 @@ import Blog
   , ResourceId (ResourceId)
   , metadataValueString
   , readResourceId
-  , renderResourceId, resourceName, resourceIdParser
+  , renderResourceId
+  , resourceIdParser
+  , resourceName
   )
 import Blog.Diagnostic (DiagnosticReports (..), sageErrorReport, tomlResult)
 import Blog.Metadata
@@ -35,17 +37,20 @@ import Blog.Metadata
   , metadataValueToTempleExpr
   , parseResourceMetadata
   , pathItem
-  , pathToList
+  , pathUncons
+  , renderPath
   )
 import Blog.Resource
   ( createResource
   , doesResourceExist
   , getResourceType
+  , listResource
   , lookupResource
-  , updateResource, listResource
+  , updateResource
   )
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
+import Control.Applicative ((<|>))
 import Control.Exception (catch, throwIO)
 import Control.Monad (guard, unless)
 import Control.Monad.Error.Class (MonadError, liftEither, throwError)
@@ -61,6 +66,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Foldable (for_)
 import Data.Kind (Type)
+import Data.List (sortOn)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (catMaybes)
@@ -73,6 +79,8 @@ import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Builder as Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
+import Data.Time.Clock (UTCTime (..))
+import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
 import qualified IO
 import System.Directory (createDirectoryIfMissing, doesFileExist, listDirectory, removeFile)
@@ -82,11 +90,7 @@ import qualified Temple
 import Text.Pandoc.Builder (Blocks)
 import qualified Text.Pandoc.Builder as Blocks (toList)
 import qualified Text.Pandoc.Html as Html
-import Data.Time.Format.ISO8601 (iso8601ParseM)
-import Data.Time.Clock (UTCTime (..))
-import Data.List (sortOn)
 import qualified Toml
-import Control.Applicative ((<|>))
 
 data Adjacency a
   = Adjacency
@@ -96,7 +100,7 @@ data Adjacency a
       a
       -- | Next
       (Maybe a)
-  deriving Functor
+  deriving (Functor)
 
 makeAdjacencies :: [a] -> [Adjacency a]
 makeAdjacencies xs =
@@ -107,10 +111,10 @@ makeAdjacencies xs =
     x : y : z : rest -> go x y z rest
   where
     go prev current next rest =
-      Adjacency (Just prev) current (Just next) :
-      case rest of
-        [] -> [Adjacency (Just current) next Nothing]
-        next' : rest' -> go current next next' rest'
+      Adjacency (Just prev) current (Just next)
+        : case rest of
+          [] -> [Adjacency (Just current) next Nothing]
+          next' : rest' -> go current next next' rest'
 
 rules :: Rules
 rules =
@@ -160,7 +164,8 @@ rules =
                   pure $ UTCTime day 0
               case parseDateTime input' <|> parseDate input' of
                 Nothing ->
-                  throwError . DiagnosticSimple $ renderResourceId article ++ "'s metadata an invalid 'published' field: " ++ Text.unpack input'
+                  throwError . DiagnosticSimple $
+                    renderResourceId article ++ "'s metadata an invalid 'published' field: " ++ Text.unpack input'
                 Just x -> pure (x :: UTCTime)
             pure (article, published)
 
@@ -174,16 +179,21 @@ rules =
               tomlString = (fromString "\"" <>) . (<> fromString "\"")
             putResource
               (ResourceId "adjacency" $ renderResourceId current)
-              (foldMap (<> fromString "\n") $
-                [ fromString "previous = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [prev]] ++
-                [ fromString "next = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [next]]
+              ( foldMap (<> fromString "\n") $
+                  [ fromString "previous = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [prev]
+                  ]
+                    ++ [fromString "next = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [next]]
               )
-
       )
     <> rule
       "article-html"
-      ((,,) <$> resourceType "article" <*> resourceType "adjacency" <*> resource "template" "article.html.temple")
-      ( \(articles, adjacencies, template) -> do
+      ( (,,,)
+          <$> resource "config" "base-url"
+          <*> resourceType "article"
+          <*> resourceType "adjacency"
+          <*> resource "template" "article.html.temple"
+      )
+      ( \(baseUrl, articles, adjacencies, template) -> do
           let
             -- TODO: can I make the rule dependency perform this "inner join"?
             articlesWithAdjacencies =
@@ -194,6 +204,13 @@ rules =
               ]
 
           unless (null articlesWithAdjacencies) $ do
+            let
+              baseUrl' =
+                LazyText.toStrict
+                  . LazyText.strip
+                  . Text.Lazy.Encoding.decodeUtf8
+                  $ resourceContent baseUrl
+
             let templatePath = resourcePath template
             let templateContent = resourceContent template
             template' <-
@@ -222,12 +239,13 @@ rules =
               (prev, next) <- do
                 let adjacencyFile = fromString $ "(" ++ renderResourceId (resourceId adjacency) ++ ")"
                 let adjacencyContent = resourceContent adjacency
-                toml <- tomlResult adjacencyFile adjacencyContent . Toml.parse $ LazyByteString.toStrict adjacencyContent
+                toml <-
+                  tomlResult adjacencyFile adjacencyContent . Toml.parse $ LazyByteString.toStrict adjacencyContent
                 let
                   decoder =
-                    (,) <$>
-                      Toml.optionalKey (fromString "previous") (Toml.pstring resourceIdParser) <*>
-                      Toml.optionalKey (fromString "next") (Toml.pstring resourceIdParser)
+                    (,)
+                      <$> Toml.optionalKey (fromString "previous") (Toml.pstring resourceIdParser)
+                      <*> Toml.optionalKey (fromString "next") (Toml.pstring resourceIdParser)
                 (prev, next) <- tomlResult adjacencyFile adjacencyContent $ Toml.decode toml decoder
 
                 let
@@ -239,8 +257,8 @@ rules =
                     content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
                     metadata <- parseResourceMetadata resTy resName content
                     pure $
-                      [(fromString "title", prev') | Just prev' <- [Map.lookup (fromString "title") metadata]] ++
-                      [(fromString "url", next') | Just next' <- [Map.lookup (fromString "url") metadata]]
+                      [(fromString "title", prev') | Just prev' <- [Map.lookup (fromString "title") metadata]]
+                        ++ [(fromString "url", next') | Just next' <- [Map.lookup (fromString "url") metadata]]
 
                 prev' <- traverse getAdjacencyFields prev
                 next' <- traverse getAdjacencyFields next
@@ -251,103 +269,121 @@ rules =
                 adjacencyExpr :: Path -> Maybe [(Text, MetadataValue)] -> Temple.LExpr Path
                 adjacencyExpr path adj =
                   Temple.Located path $
-                  case adj of
-                    Nothing ->
-                      Temple.Constructor (fromString "None") []
-                    Just fields ->
-                      let path' = path <> pathItem (ConstructorArg (fromString "Some") 0) in
-                      Temple.Constructor (fromString "Some")
-                        [Temple.Located path' $
-                          Temple.Record $
-                            fmap
-                              (\(key, value) ->
-                                let path'' = path' <> pathItem (RecordField key) in
-                                ( key
-                                , Temple.Located path'' $ metadataValueToTempleExpr path'' value
-                                )
-                              )
-                              fields
-                        ]
+                    case adj of
+                      Nothing ->
+                        Temple.Constructor (fromString "None") []
+                      Just fields ->
+                        let path' = path <> pathItem (ConstructorArg (fromString "Some") 0)
+                        in Temple.Constructor
+                             (fromString "Some")
+                             [ Temple.Located path' $
+                                 Temple.Record $
+                                   fmap
+                                     ( \(key, value) ->
+                                         let path'' = path' <> pathItem (RecordField key)
+                                         in ( key
+                                            , Temple.Located path'' $ metadataValueToTempleExpr path'' value
+                                            )
+                                     )
+                                     fields
+                             ]
 
                 exprs :: Map Text (Temple.LExpr Path)
                 exprs =
                   let
                     path = mempty
-                  in Map.fromList
-                       [
-                         ( fromString "self"
-                         , let path' = path <> pathItem (RecordField $ fromString "self")
-                           in Temple.Located path' $
-                                Temple.Record
-                                  [
-                                    ( fromString "metadata"
-                                    , let path'' = path' <> pathItem (RecordField $ fromString "metadata")
-                                      in Temple.Located path''
-                                           . Temple.Record
-                                           . fmap
-                                             ( \(key, value) ->
-                                                 let path''' = path'' <> pathItem (RecordField key)
-                                                 in (key, Temple.Located path''' $ metadataValueToTempleExpr path''' value)
-                                             )
-                                           . Map.toList
-                                           $ resourceMetadata article
-                                    )
-                                  ,
-                                    ( fromString "content"
-                                    , let path'' = path' <> pathItem (RecordField $ fromString "content")
-                                      in Temple.Located path'' $
-                                           Temple.String [Temple.PartText . LazyText.toStrict $ Builder.toLazyText articleHtml]
-                                    )
-                                  ,
-                                    ( fromString "previous"
-                                    , let path'' = path' <> pathItem (RecordField $ fromString "previous")
-                                      in adjacencyExpr path'' prev
-                                    )
-                                  ,
-                                    ( fromString "next"
-                                    , let path'' = path' <> pathItem (RecordField $ fromString "next")
-                                      in adjacencyExpr path'' next
-                                    )
-                                  ]
-                         )
-                       ]
+                  in
+                    Map.fromList
+                      [
+                        ( fromString "root"
+                        , let path' = path <> pathItem (RecordField $ fromString "root")
+                          in Temple.Located path' $
+                               Temple.String [Temple.PartText baseUrl']
+                        )
+                      ,
+                        ( fromString "self"
+                        , let path' = path <> pathItem (RecordField $ fromString "self")
+                          in Temple.Located path' $
+                               Temple.Record
+                                 [
+                                   ( fromString "metadata"
+                                   , let path'' = path' <> pathItem (RecordField $ fromString "metadata")
+                                     in Temple.Located path''
+                                          . Temple.Record
+                                          . fmap
+                                            ( \(key, value) ->
+                                                let path''' = path'' <> pathItem (RecordField key)
+                                                in (key, Temple.Located path''' $ metadataValueToTempleExpr path''' value)
+                                            )
+                                          . Map.toList
+                                          $ resourceMetadata article
+                                   )
+                                 ,
+                                   ( fromString "content"
+                                   , let path'' = path' <> pathItem (RecordField $ fromString "content")
+                                     in Temple.Located path'' $
+                                          Temple.String [Temple.PartText . LazyText.toStrict $ Builder.toLazyText articleHtml]
+                                   )
+                                 ,
+                                   ( fromString "previous"
+                                   , let path'' = path' <> pathItem (RecordField $ fromString "previous")
+                                     in adjacencyExpr path'' prev
+                                   )
+                                 ,
+                                   ( fromString "next"
+                                   , let path'' = path' <> pathItem (RecordField $ fromString "next")
+                                     in adjacencyExpr path'' next
+                                   )
+                                 ]
+                        )
+                      ]
 
               bindings' <- for bindings $ \binding -> do
                 let name = Temple.bindingName binding
-                let ty = Temple.bindingType binding
+                let tyScheme = Temple.bindingScheme binding
                 expr <-
                   case Map.lookup name exprs of
                     Nothing ->
-                      error $ "TODO: metadata missing required item " ++ show (name, ty)
+                      throwError . DiagnosticSimple $
+                        renderResourceId (resourceId template)
+                          ++ " has unsatisfied template parameter "
+                          ++ Text.unpack name
+                          ++ " : "
+                          ++ Temple.renderTypeScheme tyScheme
                     Just x ->
                       pure x
 
                 result <-
-                  Temple.runInferT
-                    (Temple.emptyInferEnv ".")
-                    Temple.emptyInferState
-                    (Temple.checkExpr Temple.checkPartIncludeDisabled expr ty)
+                  Temple.runInferT (Temple.emptyInferEnv ".") Temple.emptyInferState $ do
+                    ty <- Temple.instantiateTypeScheme tyScheme
+                    Temple.checkExpr Temple.checkPartIncludeDisabled expr ty
+
                 case result of
                   Left err ->
-                    case pathToList $ Temple.typeErrorLoc err of
-                      RecordField field : _ | field == fromString "self" ->
+                    case pathUncons $ Temple.typeErrorLoc err of
+                      Just (RecordField field, rest) | field == fromString "self" ->
                         throwError . DiagnosticSimple $
                           case err of
                             Temple.MissingFields _ fields ->
                               unlines $
-                                "article is missing fields:"
+                                (renderResourceId (resourceId article) ++ " is missing fields:")
                                   : fmap (\(field', ty') -> "  " ++ Text.unpack field' ++ " : " ++ Temple.renderType ty') fields
+                            Temple.TypeMismatch _ expected actual ->
+                              unlines
+                                [ renderResourceId (resourceId article) ++ " has a type error in " ++ renderPath rest ++ ":"
+                                , "  expected " ++ Temple.renderType expected ++ ", got " ++ Temple.renderType actual
+                                ]
                             _ ->
                               error $ "type error (TODO): " ++ show err
                       _ ->
                         error $ "type error (TODO): " ++ show err
                   Right (_s, ()) -> do
-                    let env = Temple.defaultEvalEnv (resourcePath article) mempty
+                    let env = Temple.defaultEvalEnv (resourcePath template) mempty
                     let !value = Temple.evalExpr env $ Temple.locatedVal expr
                     pure (name, value)
 
               let
-                env = Temple.defaultEvalEnv (resourcePath article) deps
+                env = Temple.defaultEvalEnv (resourcePath template) deps
                 output =
                   Temple.evalTemplate
                     env{Temple.eeScope = Map.fromList bindings' <> Temple.eeScope env}
@@ -355,11 +391,8 @@ rules =
 
               let
                 htmlName =
-                  case Map.lookup (fromString "url") $ resourceMetadata article of
-                    Nothing ->
-                      let ResourceId resTyName resName = resourceId article
-                      in resTyName ++ "/" ++ resName
-                    Just url -> Text.unpack $ metadataValueString url
+                  let ResourceId resTyName resName = resourceId article
+                  in resTyName ++ "-" ++ resName
               putResource (ResourceId "html" htmlName) output
       )
 
@@ -465,8 +498,11 @@ putResource resId@(ResourceId resTyName resName) content = do
   mResTy <- getResourceType dataDir $ fromString resTyName
   (resTyDir, resTy) <-
     case mResTy of
-      Nothing -> error $ "resource type not found: " ++ resTyName
-      Just x -> pure x
+      Nothing ->
+        throwError . DiagnosticSimple $
+          "resource type " ++ resTyName ++ " does not exist"
+      Just x ->
+        pure x
   exists <- liftIO $ doesResourceExist resTyDir resName
   if exists
     then updateResource dataDir resTy resName content
@@ -625,6 +661,7 @@ getTemplateDependencies template =
     exprDependencies expr =
       case expr of
         Temple.Var{} -> mempty
+        Temple.Bool{} -> mempty
         Temple.String parts -> foldMap partDependencies parts
         Temple.MultilineString parts -> foldMap partDependencies parts
         Temple.Call _name args -> foldMap (exprDependencies . Temple.locatedVal) args
