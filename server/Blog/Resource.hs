@@ -215,7 +215,7 @@ extractMetadataMarkdown resTy resName body = do
       let
         resourceFile =
           fromString $
-            "(" ++ renderResourceId (ResourceId (Text.unpack $ resourceTypeName resTy) resName) ++ "/metadata)"
+            "(" ++ renderResourceId (ResourceId (Text.unpack $ resourceTypeName resTy) resName) ++ ":metadata)"
       let content' = LazyByteString.toStrict content
       toml <- tomlResult resourceFile content $ Toml.parse content'
       values <- tomlResult resourceFile content $ Toml.decode toml decoder

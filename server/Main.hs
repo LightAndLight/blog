@@ -46,6 +46,7 @@ import System.Directory
   )
 import System.FilePath ((</>))
 import System.IO.Error (isDoesNotExistError)
+import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 
 data Cli
   = Cli
@@ -243,23 +244,25 @@ httpResourcePost cli request = do
               (fromString $ "resource " ++ resTyName ++ ":" ++ resName ++ " already exists")
         else do
           body <- liftIO $ Wai.consumeRequestBodyLazy request
-          do
-            result <- runExceptT $ do
-              createResource (cliData cli) resTy resName body
-              Build.evalRules putStrLn (cliData cli) Build.rules resId
-            case result of
-              Right () -> pure ()
-              Left err ->
-                throwError $
-                  Wai.responseLBS
-                    badRequest400
-                    []
-                    (renderDiagnosticReports err)
-          pure $
-            Wai.responseLBS
-              created201
-              []
-              (fromString $ "created " ++ resTyName ++ ":" ++ resName)
+          result <- runExceptT $ do
+            createResource (cliData cli) resTy resName body
+            Build.evalRules putStrLn (cliData cli) Build.rules resId
+          case result of
+            Right changes -> do
+              pure $
+                Wai.responseLBS
+                  created201
+                  []
+                  (ByteString.Lazy.Char8.unlines $
+                    fromString ("created " ++ resTyName ++ ":" ++ resName) :
+                    fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                  )
+            Left err ->
+              throwError $
+                Wai.responseLBS
+                  badRequest400
+                  []
+                  (renderDiagnosticReports err)
 
 httpResourcePut :: MonadIO m => Cli -> Wai.Request -> HandlerT m Wai.Response
 httpResourcePut cli request = do
@@ -307,23 +310,26 @@ httpResourcePut cli request = do
           if maybe True (serverModificationTime <=) mLocalModificationTime
             then do
               body <- liftIO $ Wai.consumeRequestBodyLazy request
-              do
-                result <- runExceptT $ do
-                  updateResource (cliData cli) resTy resName body
-                  Build.evalRules putStrLn (cliData cli) Build.rules resId
-                case result of
-                  Right () -> pure ()
-                  Left err ->
-                    throwError $
-                      Wai.responseLBS
-                        badRequest400
-                        []
-                        (renderDiagnosticReports err)
-              pure $
-                Wai.responseLBS
-                  ok200
-                  responseHeaders
-                  (fromString $ "updated " ++ resTyName ++ ":" ++ resName)
+              result <- runExceptT $ do
+                updateResource (cliData cli) resTy resName body
+                Build.evalRules putStrLn (cliData cli) Build.rules resId
+              case result of
+                Right changes -> do
+                  pure $
+                    Wai.responseLBS
+                      ok200
+                      responseHeaders
+                      (ByteString.Lazy.Char8.unlines $
+                        fromString ("updated " ++ resTyName ++ ":" ++ resName) :
+                        fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                      )
+                  
+                Left err ->
+                  throwError $
+                    Wai.responseLBS
+                      badRequest400
+                      []
+                      (renderDiagnosticReports err)
             else
               throwError $
                 Wai.responseLBS

@@ -178,7 +178,7 @@ data Response a
   = NotFound
   | PreconditionFailed
   | Conflict
-  | Created
+  | Created a
   | Ok a
 
 http ::
@@ -205,7 +205,7 @@ http manager url method headers body = do
     409 -> pure (Http.responseHeaders response, Conflict)
     412 -> pure (Http.responseHeaders response, PreconditionFailed)
     200 -> pure (Http.responseHeaders response, Ok $ Http.responseBody response)
-    201 -> pure (Http.responseHeaders response, Created)
+    201 -> pure (Http.responseHeaders response, Created $ Http.responseBody response)
     _status -> do
       putStrLn $ ByteString.Lazy.Char8.unpack (Http.responseBody response)
       exitFailure
@@ -317,7 +317,7 @@ view baseUrl mCertificateStore metadata resourceId = do
   case rBody of
     Conflict ->
       error "impossible"
-    Created ->
+    Created{} ->
       error "impossible"
     PreconditionFailed -> do
       putStrLn "error: the local copy of this resource is out of date"
@@ -357,7 +357,7 @@ list baseUrl mCertificateStore resourceTyName = do
   case rBody of
     Conflict ->
       error "impossible"
-    Created ->
+    Created{} ->
       error "impossible"
     PreconditionFailed -> do
       error "impossible"
@@ -391,8 +391,8 @@ create baseUrl mCertificateStore mSrcFile resourceId = do
     Conflict -> do
       putStrLn $ "error: " ++ renderResourceId resourceId ++ " already exists"
       exitFailure
-    Created -> do
-      putStrLn $ "created " ++ renderResourceId resourceId
+    Created a -> do
+      ByteString.Lazy.Char8.putStrLn a
 
 update :: String -> Maybe CertificateStore -> FilePath -> ResourceId -> IO ()
 update baseUrl mCertificateStore srcFile resourceId = do
@@ -412,8 +412,8 @@ update baseUrl mCertificateStore srcFile resourceId = do
       error "impossible"
     Conflict -> do
       error "impossible"
-    Ok{} -> do
-      putStrLn $ "updated " ++ renderResourceId resourceId
+    Ok body -> do
+      ByteString.Lazy.Char8.putStrLn body
 
 edit :: String -> Maybe CertificateStore -> ResourceId -> IO ()
 edit baseUrl mCertificateStore resourceId = do
@@ -451,7 +451,7 @@ edit baseUrl mCertificateStore resourceId = do
     case rBody of
       Conflict ->
         error "impossible"
-      Created ->
+      Created{} ->
         error "impossible"
       PreconditionFailed -> do
         putStrLn "error: the local copy of this resource is out of date"
@@ -493,9 +493,9 @@ edit baseUrl mCertificateStore resourceId = do
     PreconditionFailed -> do
       putStrLn "error: the server has a newer copy of the resource (update aborted)"
       exitFailure
-    Created -> do
-      putStrLn $ "created " ++ renderResourceId resourceId
+    Created body -> do
+      ByteString.Lazy.Char8.putStrLn body
       removeFile resourcePathLocal
-    Ok _body -> do
-      putStrLn $ "updated " ++ renderResourceId resourceId
+    Ok body -> do
+      ByteString.Lazy.Char8.putStrLn body
       removeFile resourcePathLocal

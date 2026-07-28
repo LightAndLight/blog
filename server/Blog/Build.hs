@@ -9,14 +9,27 @@
 module Blog.Build
   ( rules
   , Rules
+  , Change(..)
+  , renderChange
+  , Status(..)
+  , Reason(..)
   , evalRules
   , rule
+  , Input
+  , Resources(..)
   , Resource (..)
-  , Depends
-  , resource
-  , resourceType
+  , iResource
+  , iResourceType
+  , Output
+  , WriteResourceNamed
+  , writeResourceNamed
+  , WriteResource
+  , writeResource
+  , oResource
+  , oResourceType
   , Action
   , setDependencies
+  , trace
   )
 where
 
@@ -29,7 +42,7 @@ import Blog
   , resourceIdParser
   , resourceName
   )
-import Blog.Diagnostic (DiagnosticReports (..), sageErrorReport, tomlResult)
+import Blog.Diagnostic (DiagnosticReports (..), sageErrorReport, tomlResult, templeTypeErrorReport)
 import Blog.Metadata
   ( Path
   , PathItem (..)
@@ -60,13 +73,13 @@ import Control.Monad.Reader (ReaderT, runReaderT)
 import Control.Monad.Reader.Class (asks)
 import Control.Monad.State.Class (get, put)
 import Control.Monad.State.Strict (evalStateT, modify)
-import Control.Monad.Writer.CPS (WriterT, runWriterT)
+import Control.Monad.Writer.CPS (WriterT, runWriterT, execWriterT)
 import Control.Monad.Writer.Class (tell)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Foldable (for_)
 import Data.Kind (Type)
-import Data.List (sortOn)
+import Data.List (sortOn, intercalate, nub, find)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (catMaybes)
@@ -91,6 +104,7 @@ import Text.Pandoc.Builder (Blocks)
 import qualified Text.Pandoc.Builder as Blocks (toList)
 import qualified Text.Pandoc.Html as Html
 import qualified Toml
+import Data.Graph (graphFromEdges, topSort)
 
 data Adjacency a
   = Adjacency
@@ -120,23 +134,28 @@ rules :: Rules
 rules =
   rule
     "template-dependency"
-    (resourceType "template")
-    ( \templates ->
+    (iResourceType "template")
+    (pure ())
+    ( \templates () ->
         for_ (resourcesData templates) $ \template -> do
           template' <-
             case Temple.parse (resourcePath template) (LazyByteString.toStrict $ resourceContent template) of
-              Left err -> error "TODO: " err
+              Left err ->
+                throwError $
+                DiagnosticReports
+                  (fromString $ resourcePath template) (resourceContent template) (sageErrorReport err)
               Right x -> pure x
           let templateDependencies = getTemplateDependencies template'
           setDependencies (resourceId template) templateDependencies
     )
     <> rule
       "article-adjacency"
-      (resourceType "article")
-      ( \articles -> do
+      (iResourceType "article")
+      (oResourceType "adjacency")
+      ( \iArticles oAdjacency -> do
           dataDir <- askDataDir
-          mResTy <- getResourceType dataDir $ fromString (resourcesType articles)
-          (resTyDir, resTy) <- maybe (error $ resourcesType articles ++ " does not exist") pure mResTy
+          mResTy <- getResourceType dataDir $ fromString (resourcesType iArticles)
+          (resTyDir, resTy) <- maybe (error $ resourcesType iArticles ++ " does not exist") pure mResTy
           articles' <- listResource resTyDir resTy
           articlesWithPublished <- for articles' $ \article -> do
             metadata <- do
@@ -177,8 +196,9 @@ rules =
             let
               -- TODO: string escaping, move to `tomlin` library
               tomlString = (fromString "\"" <>) . (<> fromString "\"")
-            putResource
-              (ResourceId "adjacency" $ renderResourceId current)
+            writeResourceNamed
+              oAdjacency
+              (renderResourceId current)
               ( foldMap (<> fromString "\n") $
                   [ fromString "previous = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [prev]
                   ]
@@ -188,22 +208,29 @@ rules =
     <> rule
       "article-html"
       ( (,,,)
-          <$> resource "config" "base-url"
-          <*> resourceType "article"
-          <*> resourceType "adjacency"
-          <*> resource "template" "article.html.temple"
+          <$> iResource "config" "base-url"
+          <*> iResource "template" "article.html.temple"
+          <*> iResourceType "article"
+          <*> iResourceType "adjacency"
       )
-      ( \(baseUrl, articles, adjacencies, template) -> do
+      (oResourceType "html")
+      ( \(iBaseUrls, iTemplates, iArticles, iAdjacencies) oHtml -> do
           let
             -- TODO: can I make the rule dependency perform this "inner join"?
-            articlesWithAdjacencies =
-              [ (article, adjacency)
-              | article <- resourcesData articles
-              , adjacency <- resourcesData adjacencies
-              , renderResourceId (resourceId article) == resourceName (resourceId adjacency)
+            tuples =
+              [ ( baseUrl
+                , template
+                , [ (article, adjacency)
+                  | article <- resourcesData iArticles
+                  , adjacency <- resourcesData iAdjacencies
+                  , renderResourceId (resourceId article) == resourceName (resourceId adjacency)
+                  ]
+                )
+              | baseUrl <- resourcesData iBaseUrls
+              , template <- resourcesData iTemplates
               ]
 
-          unless (null articlesWithAdjacencies) $ do
+          for_ tuples $ \(baseUrl, template, articlesWithAdjacencies) -> do
             let
               baseUrl' =
                 LazyText.toStrict
@@ -220,7 +247,11 @@ rules =
             (deps, bindings) <- do
               result <- runExceptT $ Temple.inferBindings (resourcePath template) template'
               case result of
-                Left err -> error "TODO: " err
+                Left err -> do
+                  reports <- liftIO $ templeTypeErrorReport err
+                  throwError $
+                    DiagnosticReports
+                      (fromString $ resourcePath template) (resourceContent template) reports
                 Right x -> pure x
 
             for_ articlesWithAdjacencies $ \(article, adjacency) -> do
@@ -393,30 +424,47 @@ rules =
                 htmlName =
                   let ResourceId resTyName resName = resourceId article
                   in resTyName ++ "-" ++ resName
-              putResource (ResourceId "html" htmlName) output
+              writeResourceNamed oHtml htmlName output
       )
 
 newtype Rules = Rules [Rule]
   deriving (Semigroup, Monoid)
 
-data Rule = forall a. Rule !String (Depends a) (a -> Action ())
+data Rule = forall a b. Rule !String (Input a) (Output b) (a -> b -> Action ())
 
-matchRule :: Rule -> ResourceId -> Maybe (Action ())
-matchRule (Rule name deps f) resId = do
-  let (Any match, action) = matchDepends deps resId
+matchRule :: Rule -> ResourceId -> Maybe ([Reason], Action ())
+matchRule (Rule _name inputs outputs f) resId = do
+  let (Any match, reasons, action) = matchInput inputs resId
   guard match
-  pure $ do
-    trace $ "rule: " ++ name
-    action >>= f
+  pure
+    ( reasons
+    , do
+        inputs' <- action
+        let outputs' = makeOutput outputs
+        f inputs' outputs'
+    )
 
-newtype Action a = Action (ReaderT ActionEnv (WriterT [ResourceId] (ExceptT DiagnosticReports IO)) a)
+newtype Action a = Action (ReaderT ActionEnv (WriterT ActionSummary (ExceptT DiagnosticReports IO)) a)
   deriving (Functor, Applicative, Monad, MonadIO, MonadError DiagnosticReports)
 
 data ActionEnv
   = ActionEnv
   { aeTrace :: !(String -> IO ())
   , aeDataDir :: !FilePath
+  , aeReasons :: ![Reason]
   }
+
+data ActionSummary
+  = ActionSummary
+  { asPending :: ![ResourceId]
+  , asChanges :: ![Change]
+  }
+
+instance Semigroup ActionSummary where
+  ActionSummary a b <> ActionSummary a' b' = ActionSummary (a <> a') (b <> b')
+
+instance Monoid ActionSummary where
+  mempty = ActionSummary mempty mempty
 
 runAction ::
   (MonadError DiagnosticReports m, MonadIO m) =>
@@ -424,12 +472,14 @@ runAction ::
   (String -> IO ()) ->
   -- | Data directory
   FilePath ->
+  -- | Why the action was triggered
+  [Reason] ->
   Action a ->
-  m ([ResourceId], a)
-runAction fTrace dataDir (Action ma) = do
-  let env = ActionEnv{aeTrace = fTrace, aeDataDir = dataDir}
-  (a, pending) <- liftEither =<< liftIO (runExceptT . runWriterT . flip runReaderT env $ ma)
-  pure (pending, a)
+  m ([ResourceId], [Change], a)
+runAction fTrace dataDir reasons (Action ma) = do
+  let env = ActionEnv{aeTrace = fTrace, aeDataDir = dataDir, aeReasons = reasons}
+  (a, ActionSummary pending changes) <- liftEither =<< liftIO (runExceptT . runWriterT . flip runReaderT env $ ma)
+  pure (pending, changes, a)
 
 askDataDir :: Action FilePath
 askDataDir = Action $ asks aeDataDir
@@ -495,6 +545,8 @@ setDependencies a bs = do
 putResource :: ResourceId -> LazyByteString -> Action ()
 putResource resId@(ResourceId resTyName resName) content = do
   dataDir <- askDataDir
+  reasons <- Action $ asks aeReasons
+
   mResTy <- getResourceType dataDir $ fromString resTyName
   (resTyDir, resTy) <-
     case mResTy of
@@ -505,46 +557,39 @@ putResource resId@(ResourceId resTyName resName) content = do
         pure x
   exists <- liftIO $ doesResourceExist resTyDir resName
   if exists
-    then updateResource dataDir resTy resName content
-    else createResource dataDir resTy resName content
-  Action $ tell [resId]
+    then do
+      updateResource dataDir resTy resName content
+      let changes = [Change Updated resId reasons]
+      Action $ tell mempty{asChanges = changes}
+    else do
+      createResource dataDir resTy resName content
+      let changes = [Change Created resId reasons]
+      Action $ tell mempty{asChanges = changes}
+  Action $ tell mempty{asPending = [resId]}
 
 rule ::
   -- | ID
   String ->
-  Depends a ->
+  Input a ->
+  Output b ->
   -- | Action
-  (a -> Action ()) ->
+  (a -> b -> Action ()) ->
   Rules
-rule name deps f = Rules [Rule name deps f]
+rule name inputs outputs f = Rules [Rule name inputs outputs f]
 
-data Depends :: Type -> Type where
-  DFmap :: (a -> b) -> Depends a -> Depends b
-  DPure :: a -> Depends a
-  DApply :: Depends (a -> b) -> Depends a -> Depends b
-  DResourceType :: String -> Depends Resources
-  DResource :: ResourceId -> Depends Resource
+data Input :: Type -> Type where
+  IFmap :: (a -> b) -> Input a -> Input  b
+  IPure :: a -> Input  a
+  IApply :: Input  (a -> b) -> Input  a -> Input  b
+  IResourceType :: String -> Input Resources
+  IResource :: ResourceId -> Input Resources
 
-instance Functor Depends where
-  fmap = DFmap
+instance Functor Input where
+  fmap = IFmap
 
-instance Applicative Depends where
-  pure = DPure
-  (<*>) = DApply
-
-matchDepends :: Depends a -> ResourceId -> (Any, Action a)
-matchDepends (DFmap f deps) resId =
-  (fmap . fmap . fmap) f (matchDepends deps) resId
-matchDepends (DPure a) _resId =
-  (mempty, pure a)
-matchDepends (DApply deps deps') resId =
-  liftA2 (<*>) (matchDepends deps resId) (matchDepends deps' resId)
-matchDepends (DResourceType resTyName) resId@(ResourceId resTyName' _resName) =
-  if resTyName == resTyName'
-    then (Any True, Resources resTyName . pure <$> makeResource resId)
-    else (Any False, makeResources resTyName)
-matchDepends (DResource resId) resId' =
-  (Any $ resId == resId', makeResource resId)
+instance Applicative Input where
+  pure = IPure
+  (<*>) = IApply
 
 data Resources
   = Resources
@@ -560,7 +605,23 @@ data Resource
   , resourceContent :: LazyByteString
   }
 
-makeResource :: ResourceId -> Action Resource
+matchInput :: Input a -> ResourceId -> (Any, [Reason], Action a)
+matchInput (IFmap f deps) resId =
+  (fmap . fmap . fmap) f (matchInput deps) resId
+matchInput (IPure a) _resId =
+  (mempty, [], pure a)
+matchInput (IApply deps deps') resId =
+  liftA2 (<*>) (matchInput deps resId) (matchInput deps' resId)
+matchInput (IResourceType resTyName) resId@(ResourceId resTyName' _resName) =
+  if resTyName == resTyName'
+    then (Any True, [Reason Updated resId], makeResource resId)
+    else (Any False, [], makeResources resTyName)
+matchInput (IResource resId) resId' =
+  if resId == resId'
+  then (Any True, [Reason Updated resId], makeResource resId)
+  else (Any False, [], makeResource resId)
+
+makeResource :: ResourceId -> Action Resources
 makeResource resId@(ResourceId resTyName resName) = do
   dataDir <- askDataDir
   (resTyDir, resTy) <-
@@ -570,18 +631,26 @@ makeResource resId@(ResourceId resTyName resName) = do
   mContent <- liftIO $ lookupResource resTyDir resName
   case mContent of
     Nothing ->
-      throwError . DiagnosticSimple $ "resource " ++ renderResourceId resId ++ " does not exist"
+      pure
+        Resources
+        { resourcesType = resTyName
+        , resourcesData = []
+        }
     Just content -> do
       metadata <- do
         mMetadataContent <- liftIO $ lookupResourceMetadata resTyDir resName
         maybe (pure mempty) (parseResourceMetadata resTy resName) mMetadataContent
       pure
+        Resources
+          {resourcesType = resTyName
+          , resourcesData = [
         Resource
           { resourceId = resId
           , resourcePath = resPath
           , resourceMetadata = metadata
           , resourceContent = content
           }
+          ]}
 
 makeResources ::
   -- | Resource type name
@@ -617,19 +686,63 @@ makeResources resTyName = do
           pure Nothing
   pure $ Resources resTyName resources
 
-resource ::
+iResource ::
   -- | Resource type name
   String ->
   -- | Resource name
   String ->
-  Depends Resource
-resource resTyName = DResource . ResourceId resTyName
+  Input Resources
+iResource resTyName = IResource . ResourceId resTyName
 
-resourceType ::
+iResourceType ::
   -- | Resource type
   String ->
-  Depends Resources
-resourceType = DResourceType
+  Input Resources
+iResourceType = IResourceType
+
+data Output :: Type -> Type where
+  OFmap :: (a -> b) -> Output a -> Output  b
+  OPure :: a -> Output a
+  OApply :: Output  (a -> b) -> Output  a -> Output  b
+  OResourceType :: String -> Output WriteResourceNamed
+  OResource :: ResourceId -> Output WriteResource
+
+instance Functor Output where
+  fmap = OFmap
+
+instance Applicative Output where
+  pure = OPure
+  (<*>) = OApply
+
+newtype WriteResourceNamed
+  = WriteResourceNamed
+  { writeResourceNamed :: String -> LazyByteString -> Action ()
+  }
+
+newtype WriteResource
+  = WriteResource
+  { writeResource :: LazyByteString -> Action ()
+  }
+
+oResourceType :: String -> Output WriteResourceNamed
+oResourceType = OResourceType
+
+oResource ::
+  -- | Resource type name
+  String ->
+  -- | Resource name
+  String ->
+  Output WriteResource
+oResource resTyName resTy = OResource $ ResourceId resTyName resTy
+
+makeOutput :: Output a -> a
+makeOutput (OFmap f a) = f (makeOutput a)
+makeOutput (OPure a) = a
+makeOutput (OApply a b) = makeOutput a (makeOutput b)
+makeOutput (OResourceType resTyName) =
+  WriteResourceNamed (\resName -> putResource $ ResourceId resTyName resName)
+makeOutput (OResource resId) =
+  WriteResource (putResource resId)
 
 getTemplateDependencies :: Temple.Template loc -> Set ResourceId
 getTemplateDependencies template =
@@ -684,6 +797,77 @@ getTemplateDependencies template =
           exprDependencies (Temple.locatedVal items)
             <> exprDependencies (Temple.locatedVal yield)
 
+data Change
+  = Change
+      -- | What happened
+      !Status
+      -- | Target resource
+      !ResourceId
+      -- | Why the change occurred
+      ![Reason]
+  deriving Show
+
+data Status
+  = Created
+  | Updated
+  deriving Show
+
+data Reason = Reason !Status !ResourceId
+  deriving Show
+
+renderChange :: Change -> String
+renderChange (Change status resId reasons) =
+  renderStatus status ++
+  " " ++
+  renderResourceId resId ++
+  if null reasons
+    then " (no reason)"
+    else " (" ++ intercalate ", " (fmap renderReason reasons) ++ ")"
+
+renderStatus :: Status -> String
+renderStatus status =
+  case status of
+    Created -> "created"
+    Updated -> "updated"
+  
+renderReason :: Reason -> String
+renderReason (Reason status resId) =
+  renderResourceId resId ++ " " ++ renderStatus status
+
+data ResourceIdPattern
+  = ResourceIdPattern
+      -- | Resource type name
+      !String
+      !ResourceNamePattern
+  deriving (Show, Eq)
+
+data ResourceNamePattern
+  = PAny
+  | PExact !String
+  deriving (Show, Eq)
+
+inputResourceIdPatterns :: Input a -> [ResourceIdPattern]
+inputResourceIdPatterns (IFmap _f a) = inputResourceIdPatterns a
+inputResourceIdPatterns (IPure _a) = []
+inputResourceIdPatterns (IApply a b) = inputResourceIdPatterns a ++ inputResourceIdPatterns b
+inputResourceIdPatterns (IResourceType resTyName) = [ResourceIdPattern resTyName PAny]
+inputResourceIdPatterns (IResource (ResourceId resTyName resName)) = [ResourceIdPattern resTyName $ PExact resName]
+
+outputResourceIdPatterns :: Output a -> [ResourceIdPattern]
+outputResourceIdPatterns (OFmap _f a) = outputResourceIdPatterns a
+outputResourceIdPatterns (OPure _a) = []
+outputResourceIdPatterns (OApply a b) = outputResourceIdPatterns a ++ outputResourceIdPatterns b
+outputResourceIdPatterns (OResourceType resTyName) = [ResourceIdPattern resTyName PAny]
+outputResourceIdPatterns (OResource (ResourceId resTyName resName)) = [ResourceIdPattern resTyName $ PExact resName]
+
+resourceIdPatternMatches :: ResourceIdPattern -> ResourceIdPattern -> Bool
+resourceIdPatternMatches (ResourceIdPattern resTyName resNamePattern) (ResourceIdPattern resTyName' resNamePattern') =
+  resTyName == resTyName' &&
+  case (resNamePattern, resNamePattern') of
+    (PAny, _) -> True
+    (_, PAny) -> True
+    (PExact name, PExact name') -> name == name'
+
 evalRules ::
   (MonadError DiagnosticReports m, MonadIO m) =>
   -- | Trace
@@ -693,14 +877,36 @@ evalRules ::
   Rules ->
   -- | The created/updated resource
   ResourceId ->
-  m ()
+  m [Change]
 evalRules fTrace dataDir (Rules rs) resId = do
-  flip evalStateT [] $ go resId
+  execWriterT . flip evalStateT (Set.singleton resId) $ go
   where
+    (graph, fromVertex, fromKey) =
+      graphFromEdges
+        [ ( r
+          , name
+          , [ name'
+            | Rule name' inputs' _outputs' _f <- rs
+            , let inputPatterns = nub $ inputResourceIdPatterns inputs'
+            , or $ resourceIdPatternMatches <$> outputPatterns <*> inputPatterns
+            ]
+          )
+        | r@(Rule name _inputs outputs _f) <- rs
+        , let outputPatterns = nub $ outputResourceIdPatterns outputs
+        ]
+
+    vertices = topSort graph
+
+    go = for vertices $ \vertex -> do
+      let (r, _, _) = fromVertex vertex
+      _
+
+    {-
     go resId' = do
-      for_ rs $ \r -> for_ (matchRule r resId') $ \action -> do
-        (pending, ()) <- runAction fTrace dataDir action
+      for_ rs $ \r -> for_ (matchRule r resId') $ \(reasons, action) -> do
+        (pending, changes, ()) <- runAction fTrace dataDir reasons action
         modify (++ pending)
+        tell changes
 
       dependents <- liftIO $ getDependents dataDir resId'
       pending <- get
@@ -708,3 +914,4 @@ evalRules fTrace dataDir (Rules rs) resId = do
       case dependents ++ pending of
         [] -> pure ()
         resId'' : pending'' -> put pending'' *> go resId''
+    -}
