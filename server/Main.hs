@@ -17,12 +17,14 @@ import Blog.Resource
   , lookupResource
   , updateResource
   )
+import qualified Blog.Rules
 import Control.Exception (catch, throwIO)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT, runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
+import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.String (fromString)
 import qualified Data.Text as Text
 import Data.Time.Clock (UTCTime)
@@ -46,7 +48,6 @@ import System.Directory
   )
 import System.FilePath ((</>))
 import System.IO.Error (isDoesNotExistError)
-import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 
 data Cli
   = Cli
@@ -246,16 +247,16 @@ httpResourcePost cli request = do
           body <- liftIO $ Wai.consumeRequestBodyLazy request
           result <- runExceptT $ do
             createResource (cliData cli) resTy resName body
-            Build.evalRules putStrLn (cliData cli) Build.rules resId
+            Build.evalRules putStrLn (cliData cli) Blog.Rules.rules resId
           case result of
             Right changes -> do
               pure $
                 Wai.responseLBS
                   created201
                   []
-                  (ByteString.Lazy.Char8.unlines $
-                    fromString ("created " ++ resTyName ++ ":" ++ resName) :
-                    fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                  ( ByteString.Lazy.Char8.unlines $
+                      fromString ("created " ++ resTyName ++ ":" ++ resName)
+                        : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
                   )
             Left err ->
               throwError $
@@ -312,18 +313,17 @@ httpResourcePut cli request = do
               body <- liftIO $ Wai.consumeRequestBodyLazy request
               result <- runExceptT $ do
                 updateResource (cliData cli) resTy resName body
-                Build.evalRules putStrLn (cliData cli) Build.rules resId
+                Build.evalRules putStrLn (cliData cli) Blog.Rules.rules resId
               case result of
                 Right changes -> do
                   pure $
                     Wai.responseLBS
                       ok200
                       responseHeaders
-                      (ByteString.Lazy.Char8.unlines $
-                        fromString ("updated " ++ resTyName ++ ":" ++ resName) :
-                        fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                      ( ByteString.Lazy.Char8.unlines $
+                          fromString ("updated " ++ resTyName ++ ":" ++ resName)
+                            : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
                       )
-                  
                 Left err ->
                   throwError $
                     Wai.responseLBS

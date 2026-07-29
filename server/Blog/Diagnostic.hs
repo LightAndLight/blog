@@ -14,13 +14,13 @@ import Control.Monad.Error.Class (MonadError, throwError)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
+import Data.List (intercalate)
 import Data.String (fromString)
 import qualified Data.Text as Text
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
 import qualified Text.Diagnostic.Sage
 import qualified Toml
-import Data.List (intercalate)
 
 data DiagnosticReports
   = DiagnosticReports

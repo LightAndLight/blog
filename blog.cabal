@@ -55,6 +55,7 @@ executable blog-server
         Blog.Diagnostic
         Blog.Metadata
         Blog.Resource
+        Blog.Rules
         IO
         Text.Pandoc.Builder
         Text.Pandoc.Definition
