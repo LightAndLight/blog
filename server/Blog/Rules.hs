@@ -54,10 +54,10 @@ import qualified Toml
 
 rules :: Build.Rules
 rules =
-  Build.rule "template-dependency" (Build.iResourceType "template") (pure ()) templateDependency
+  Build.rule "template-dependency" (Build.iResource "template" Build.iAny) (pure ()) templateDependency
     <> Build.rule
       "article-adjacency"
-      (Build.iResourceTypeAll "article")
+      (Build.iResourceAll "article" Build.iAny)
       (Build.oResource "adjacency" $ Build.oMatch "article-" *< Build.oAny)
       articleAdjacency
     <> Build.rule

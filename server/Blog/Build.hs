@@ -17,12 +17,11 @@ module Blog.Build
   , ResourceInput (..)
   , ResourceInputs (..)
   , iResource
+  , iResourceAll
   , ResourceNamePattern
   , iMatch
   , iBind
   , iAny
-  , iResourceType
-  , iResourceTypeAll
   , Output
   , ResourceOutput
   , writeResource
@@ -63,7 +62,6 @@ import Blog.Resource
   , lookupResource
   , updateResource
   )
-import Control.Applicative ((<|>))
 import Control.Exception (catch, throwIO)
 import Control.Monad (guard, unless)
 import Control.Monad.Error.Class (MonadError, liftEither, throwError)
@@ -89,7 +87,6 @@ import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
 import Data.Traversable (for)
-import qualified Debug.Trace as Debug
 import qualified IO
 import System.Directory (createDirectoryIfMissing, listDirectory, removeFile)
 import System.FilePath ((</>))
@@ -264,9 +261,7 @@ data Input :: Type -> Type where
   IFmap :: (a -> b) -> Input a -> Input b
   IPure :: a -> Input a
   IApply :: Input (a -> b) -> Input a -> Input b
-  IResourceType :: String -> Input ResourceInput
-  IResourceTypeAll :: String -> Input ResourceInputs
-  IResource :: String -> ResourceNamePattern -> Input ResourceInput
+  IResource :: InputQuantifier a -> String -> ResourceNamePattern -> Input a
 
 instance Functor Input where
   fmap = IFmap
@@ -274,6 +269,10 @@ instance Functor Input where
 instance Applicative Input where
   pure = IPure
   (<*>) = IApply
+
+data InputQuantifier a where
+  IAny :: InputQuantifier ResourceInput
+  IAll :: InputQuantifier ResourceInputs
 
 data ResourceInput
   = ResourceInput
@@ -328,8 +327,7 @@ merge (age1, reasons1, tuples1, bindings1, f) (age2, reasons2, tuples2, bindings
     left = Map.difference bindings1 common
     right = Map.difference bindings2 common
 
-  common' <- sequence common <|> Debug.trace (show (bindings1, bindings2)) Nothing
-
+  common' <- sequence common
   pure (age1 <> age2, reasons1 <> reasons2, tuples1 <> tuples2, left <> right <> common', f a)
 
 matchInput ::
@@ -349,67 +347,20 @@ matchInput i = go i
       pure $ pure [(Old, [], [], mempty, a)]
     go (IApply deps deps') changes =
       (liftA2 . liftA2)
-        ( \l r ->
+        ( \lAll rAll ->
             let
-              (lOld, lNew) = partition (\(x, _, _, _, _) -> x == New) l
-              rNew = filter (\(x, _, _, _, _) -> x == New) r
+              (lOld, lNew) = partition (\(x, _, _, _, _) -> x == New) lAll
+              rNew = filter (\(x, _, _, _, _) -> x == New) rAll
             in
-              [z | x <- lNew, y <- r, Just z <- [merge x y]]
+              [z | x <- lNew, y <- rAll, Just z <- [merge x y]]
                 ++ [z | x <- lOld, y <- rNew, Just z <- [merge x y]]
         )
         (go deps changes)
         (go deps' changes)
-    go (IResourceType resTyName) changes = do
+    go (IResource quant resTyName resNamePat) changes = do
       changes' <-
         fmap catMaybes
-          . for (Set.toList changes)
-          $ \resId@(ResourceId resTyName' _resName) ->
-            if resTyName == resTyName'
-              then do
-                tell $ Any True
-                pure . Just $ (,,,,) New [Reason Updated resId] [resId] mempty <$> makeResource resId
-              else
-                pure Nothing
-      pure $ do
-        (resTyDir, resTy) <- do
-          dataDir <- askDataDir
-          mResTy <- getResourceType dataDir $ fromString resTyName
-          maybe (error $ resTyName ++ " does not exist") pure mResTy
-        news <- sequence changes'
-        olds <- traverse makeResource . filter (`Set.notMember` changes) =<< listResource resTyDir resTy
-        pure $ news ++ fmap (\old -> (Old, [], [resourceInputId old], mempty, old)) olds
-    go (IResourceTypeAll resTyName) changes = do
-      changes' <-
-        fmap catMaybes
-          . for (Set.toList changes)
-          $ \resId@(ResourceId resTyName' _resName) ->
-            if resTyName == resTyName'
-              then do
-                tell $ Any True
-                pure . Just $ (,) [Reason Updated resId] <$> makeResource resId
-              else
-                pure Nothing
-      pure $ do
-        (resTyDir, resTy) <- do
-          dataDir <- askDataDir
-          mResTy <- getResourceType dataDir $ fromString resTyName
-          maybe (error $ resTyName ++ " does not exist") pure mResTy
-        news <- sequence changes'
-        let reasons = nub [reason' | (reasons', _) <- news, reason' <- reasons']
-        olds <- traverse makeResource . filter (`Set.notMember` changes) =<< listResource resTyDir resTy
-        pure
-          [
-            ( New
-            , reasons
-            , [ResourceId resTyName "*"]
-            , mempty
-            , ResourceInputs resTyName . fmap (\(_, x) -> x) $ news ++ fmap pure olds
-            )
-          ]
-    go (IResource resTyName resNamePat) changes = do
-      changes' <-
-        fmap catMaybes
-          . for (Set.toList changes)
+          . for (Set.toAscList changes)
           $ \resId'@(ResourceId resTyName' resName') -> do
             let
               matchSuccess bindings resId = do
@@ -428,6 +379,7 @@ matchInput i = go i
           dataDir <- askDataDir
           mResTy <- getResourceType dataDir $ fromString resTyName
           maybe (error $ resTyName ++ " does not exist") pure mResTy
+
         news <- sequence changes'
         olds <- do
           listed <- listResource resTyDir resTy
@@ -440,10 +392,29 @@ matchInput i = go i
                     pure (bindings, old)
                 )
                 listed
-          for olds $ \(bindings, old) -> do
-            old' <- makeResource old
-            pure (Old, [], [old], bindings, old')
-        pure $ news ++ olds
+          pure olds
+        case quant of
+          IAny -> do
+            olds' <-
+              for olds $ \(bindings, old) -> do
+                old' <- makeResource old
+                pure (Old, [], [old], bindings, old')
+            pure $ news ++ olds'
+          IAll -> do
+            let reasons = nub [reason' | (_, reasons', _, _, _) <- news, reason' <- reasons']
+            olds' <-
+              for olds $ \(bindings, old) -> do
+                old' <- makeResource old
+                pure (Old, [], [old], bindings, old')
+            pure
+              [
+                ( New
+                , reasons
+                , [ResourceId resTyName "*"]
+                , mempty
+                , ResourceInputs resTyName . fmap (\(_, _, _, _, x) -> x) $ news ++ olds'
+                )
+              ]
 
 makeResource :: ResourceId -> Action ResourceInput
 makeResource resId@(ResourceId resTyName resName) = do
@@ -545,25 +516,27 @@ resourcePatternsOverlap (ResourceNamePattern ps) (ResourceNamePattern ps') =
         PBind _var ->
           go parts []
 
+-- | Declare an input of a particular resource type, matching the given pattern.
+--
+-- Every matching input in the change set triggers a rule invocation.
 iResource ::
   -- | Resource type name
   String ->
   -- | Resource name
   ResourceNamePattern ->
   Input ResourceInput
-iResource resTyName = IResource resTyName
+iResource resTyName = IResource IAny resTyName
 
-iResourceType ::
+-- | Declare a bulk input of a particular resource type, matching the given pattern.
+--
+-- Every matching input in the change set is collected, and passed to a single rule invocation as a single input.
+iResourceAll ::
   -- | Resource type
   String ->
-  Input ResourceInput
-iResourceType = IResourceType
-
-iResourceTypeAll ::
-  -- | Resource type
-  String ->
+  -- | Resource name
+  ResourceNamePattern ->
   Input ResourceInputs
-iResourceTypeAll = IResourceTypeAll
+iResourceAll = IResource IAll
 
 data Output :: Type -> Type where
   OFmap :: (a -> b) -> Output a -> Output b
@@ -711,9 +684,7 @@ inputResourceIdPatterns :: Input a -> [ResourceIdPattern]
 inputResourceIdPatterns (IFmap _f a) = inputResourceIdPatterns a
 inputResourceIdPatterns (IPure _a) = []
 inputResourceIdPatterns (IApply a b) = inputResourceIdPatterns a ++ inputResourceIdPatterns b
-inputResourceIdPatterns (IResourceType resTyName) = [ResourceIdPattern resTyName iAny]
-inputResourceIdPatterns (IResourceTypeAll resTyName) = [ResourceIdPattern resTyName iAny]
-inputResourceIdPatterns (IResource resTyName resNamePat) = [ResourceIdPattern resTyName resNamePat]
+inputResourceIdPatterns (IResource _quant resTyName resNamePat) = [ResourceIdPattern resTyName resNamePat]
 
 outputResourceIdPatterns :: Output a -> [ResourceIdPattern]
 outputResourceIdPatterns (OFmap _f a) = outputResourceIdPatterns a
