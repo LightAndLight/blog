@@ -1,5 +1,5 @@
 { fetchzip }:
 fetchzip {
-  url = "https://github.com/LightAndLight/temple/archive/c3a148f37a5371212e8ef544c7a2a2d07af59819.tar.gz";
-  sha256 = "0ysxfr3v30ykavmj28340z175y0vi5hwbqbydxsvzy4bs6yxjzhb";
+  url = "https://github.com/LightAndLight/temple/archive/4c70dc0c9f175271c6d2535ffdff158fc7816d49.tar.gz";
+  sha256 = "0dw3mw7791nm0klcdppmsd9a9g4k0v6xv2ix490d1d3mgav9d0wv";
 }

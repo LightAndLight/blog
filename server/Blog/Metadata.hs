@@ -2,8 +2,7 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module Blog.Metadata
-  ( lookupResourceMetadata
-  , resourceMetadataDecoder
+  ( resourceMetadataDecoder
   , parseResourceMetadata
   , Path
   , pathToList
@@ -17,19 +16,17 @@ where
 
 import Blog
   ( MetadataValue (..)
+  , ResourceConfig
   , ResourceId (..)
-  , ResourceType
   , cfgMetadata
   , metaCfgDefault
   , metaCfgOptional
   , metaCfgType
   , metadataTypeDecoder
   , renderResourceId
-  , resourceTypeConfig
-  , resourceTypeName
   )
-import Blog.Diagnostic (DiagnosticReports, tomlResult)
-import Control.Exception (catch, throwIO)
+import Blog.Diagnostic (DiagnosticReports)
+import Blog.Error (tomlResult)
 import Control.Monad.Error.Class (MonadError)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
@@ -39,27 +36,13 @@ import Data.Maybe (fromMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
-import IO (WithCallStack (..))
-import qualified IO
-import System.FilePath ((</>))
-import System.IO.Error (isDoesNotExistError)
 import qualified Temple
 import qualified Toml
 
-lookupResourceMetadata ::
-  -- | Resource type directory
-  FilePath ->
-  -- | Resource name
-  String ->
-  IO (Maybe LazyByteString)
-lookupResourceMetadata resTy resName =
-  fmap Just (IO.readFile $ resTy </> (resName ++ ".d") </> "metadata")
-    `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
-
 resourceMetadataDecoder ::
-  ResourceType ->
+  ResourceConfig ->
   Toml.Decoder (Map Text MetadataValue)
-resourceMetadataDecoder resTy =
+resourceMetadataDecoder config =
   Map.fromList
     <$> traverse
       ( \(key, metaCfg) ->
@@ -76,20 +59,22 @@ resourceMetadataDecoder resTy =
                 fromMaybe def
                   <$> Toml.optionalKey key (metadataTypeDecoder $ metaCfgType metaCfg)
       )
-      (Map.toList . cfgMetadata $ resourceTypeConfig resTy)
+      (Map.toList $ cfgMetadata config)
 
 parseResourceMetadata ::
   MonadError DiagnosticReports m =>
-  ResourceType ->
+  ResourceConfig ->
+  -- | Resource type
+  String ->
   -- | Resource name
   String ->
   LazyByteString ->
   m (Map Text MetadataValue)
-parseResourceMetadata resTy resName content = do
-  let decoder = resourceMetadataDecoder resTy
+parseResourceMetadata config resTyName resName content = do
+  let decoder = resourceMetadataDecoder config
   let resourceFile =
         fromString $
-          "(" ++ renderResourceId (ResourceId (Text.unpack $ resourceTypeName resTy) resName) ++ ")"
+          "(" ++ renderResourceId (ResourceId resTyName resName) ++ ")"
   let content' = LazyByteString.toStrict content
   toml <- tomlResult resourceFile content $ Toml.parse content'
   tomlResult resourceFile content $ Toml.decode toml decoder

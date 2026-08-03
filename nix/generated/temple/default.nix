@@ -12,8 +12,8 @@ mkDerivation {
     base bytestring containers filepath mtl sage text
   ];
   executableHaskellDepends = [
-    base bytestring containers diagnostica diagnostica-sage mtl
-    optparse-applicative sage text
+    base bytestring containers diagnostica diagnostica-sage filepath
+    mtl optparse-applicative sage text
   ];
   testHaskellDepends = [ base bytestring hspec sage ];
   testToolDepends = [ hspec-discover ];

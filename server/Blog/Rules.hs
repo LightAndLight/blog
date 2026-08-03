@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 module Blog.Rules (rules) where
 
@@ -12,29 +13,31 @@ import Blog
   )
 import Blog.Build ((*<))
 import qualified Blog.Build as Build
-import Blog.Diagnostic (DiagnosticReports (..), sageErrorReport, templeTypeErrorReport, tomlResult)
+import Blog.Diagnostic (DiagnosticReports (..))
+import Blog.Error (sageErrorReport, templeTypeErrorReport, tomlResult)
 import Blog.Metadata
   ( Path
   , PathItem (..)
-  , lookupResourceMetadata
   , metadataValueToTempleExpr
   , parseResourceMetadata
   , pathItem
   , pathUncons
   , renderPath
   )
-import Blog.Resource (getResourceType, listResource)
+import qualified Blog.Store as Store
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
 import Control.Applicative ((<|>))
 import Control.Monad.Error.Class (throwError)
 import Control.Monad.Except (runExceptT)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Foldable (for_)
 import Data.List (sortOn)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
@@ -52,9 +55,13 @@ import qualified Text.Pandoc.Builder as Blocks (toList)
 import qualified Text.Pandoc.Html as Html
 import qualified Toml
 
-rules :: Build.Rules
+rules :: MonadIO m => Build.Rules m
 rules =
-  Build.rule "template-dependency" (Build.iResource "template" Build.iAny) (pure ()) templateDependency
+  Build.rule
+    "template-dependency"
+    (Build.iResource "template" Build.iAny)
+    (pure ())
+    templateDependency
     <> Build.rule
       "article-adjacency"
       (Build.iResourceAll "article" Build.iAny)
@@ -72,18 +79,18 @@ rules =
       articleHtml
 
 templateDependency ::
-  Build.ResourceInput ->
+  Monad m =>
+  Build.ResourceInput m ->
   () ->
-  Build.Action ()
+  Build.ActionT m ()
 templateDependency template () = do
+  let location = "(" ++ renderResourceId (Build.resourceInputId template) ++ ")"
   template' <-
-    case Temple.parse
-      (Build.resourceInputPath template)
-      (LazyByteString.toStrict $ Build.resourceInputContent template) of
+    case Temple.parse (LazyByteString.toStrict $ Build.resourceInputContent template) of
       Left err ->
         throwError $
           DiagnosticReports
-            (fromString $ Build.resourceInputPath template)
+            (fromString location)
             (Build.resourceInputContent template)
             (sageErrorReport err)
       Right x -> pure x
@@ -93,10 +100,11 @@ templateDependency template () = do
 getTemplateDependencies :: Temple.Template loc -> Set ResourceId
 getTemplateDependencies template =
   case template of
-    Temple.TemplateBase _ parts ->
+    Temple.TemplateBase parts ->
       foldMap partDependencies parts
-    Temple.TemplateChild _ parent pragmas ->
-      Set.insert (ResourceId "template" $ Temple.locatedVal parent) $ foldMap pragmaDependencies pragmas
+    Temple.TemplateChild parent pragmas ->
+      let Temple.TemplateRef templateName = Temple.locatedVal parent
+      in Set.insert (ResourceId "template" templateName) $ foldMap pragmaDependencies pragmas
   where
     partDependencies :: Temple.Part loc -> Set ResourceId
     partDependencies part =
@@ -104,9 +112,10 @@ getTemplateDependencies template =
         Temple.PartText{} -> mempty
         Temple.PartExpr expr -> exprDependencies $ Temple.locatedVal expr
         Temple.PartExprStream expr -> exprDependencies $ Temple.locatedVal expr
-        Temple.PartInclude file bindings ->
-          Set.insert (ResourceId "template" . Text.unpack $ Temple.locatedVal file) $
-            (foldMap . foldMap) (\(_name, expr) -> exprDependencies $ Temple.locatedVal expr) bindings
+        Temple.PartInclude target bindings ->
+          let Temple.TemplateRef templateName = Temple.locatedVal target
+          in Set.insert (ResourceId "template" templateName) $
+               (foldMap . foldMap) (\(_name, expr) -> exprDependencies $ Temple.locatedVal expr) bindings
 
     pragmaDependencies :: Temple.Pragma loc -> Set ResourceId
     pragmaDependencies pragma =
@@ -144,24 +153,28 @@ getTemplateDependencies template =
             <> exprDependencies (Temple.locatedVal yield)
 
 articleAdjacency ::
-  Build.ResourceInputs ->
-  Build.ResourceOutput String ->
-  Build.Action ()
+  Monad m =>
+  Build.ResourceInputs m ->
+  Build.ResourceOutput m String ->
+  Build.ActionT m ()
 articleAdjacency iArticles oAdjacency = do
-  dataDir <- Build.askDataDir
-  (resTyDir, resTy) <- do
+  store <- Build.askStore
+  resTy <- do
     let resTyName = Build.resourceInputsType iArticles
-    mResTy <- getResourceType dataDir $ fromString resTyName
-    maybe (error $ resTyName ++ " does not exist") pure mResTy
-  articles' <- listResource resTyDir resTy
+    Store.getResourceType store resTyName
+  articles' <- Store.listResource resTy
   articlesWithPublished <- for articles' $ \article -> do
     metadata <- do
-      mMetadata <- liftIO $ lookupResourceMetadata resTyDir $ resourceName article
+      mMetadata <- Store.readResourceMetadata resTy $ resourceName article
       case mMetadata of
         Nothing ->
           throwError . DiagnosticSimple $ renderResourceId article ++ " has no metadata"
         Just metadata ->
-          parseResourceMetadata resTy (resourceName article) metadata
+          parseResourceMetadata
+            (Store.resourceTypeConfig resTy)
+            (Store.resourceTypeName resTy)
+            (resourceName article)
+            metadata
 
     published <- do
       input <- case Map.lookup (fromString "published") metadata of
@@ -227,9 +240,11 @@ makeAdjacencies xs =
           next' : rest' -> go current next next' rest'
 
 articleHtml ::
-  (Build.ResourceInput, Build.ResourceInput, Build.ResourceInput, Build.ResourceInput) ->
-  Build.ResourceOutput () ->
-  Build.Action ()
+  forall m.
+  MonadIO m =>
+  (Build.ResourceInput m, Build.ResourceInput m, Build.ResourceInput m, Build.ResourceInput m) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
 articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
   -- TODO: process baseUrl and template only once
   -- TODO: push article/adjacency name matching into rule dependencies
@@ -240,20 +255,44 @@ articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
         . Text.Lazy.Encoding.decodeUtf8
         $ Build.resourceInputContent iBaseUrl
 
-  let templatePath = Build.resourceInputPath iTemplate
+  let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+
+  let
+    templateResourceType = resourceType $ Build.resourceInputId iTemplate
+
+  let
+    renderTemplateRef (Temple.TemplateRef name) =
+      "(" ++ renderResourceId (ResourceId templateResourceType name) ++ ")"
+
+    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
+    readTemplateRef (Temple.TemplateRef name) =
+      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+
   let templateContent = Build.resourceInputContent iTemplate
   template' <-
-    case Temple.parse templatePath (LazyByteString.toStrict templateContent) of
-      Left err -> throwError $ DiagnosticReports (fromString templatePath) templateContent (sageErrorReport err)
-      Right x -> pure x
-  (deps, bindings) <- do
-    result <- runExceptT $ Temple.inferBindings (Build.resourceInputPath iTemplate) template'
-    case result of
-      Left err -> do
-        reports <- liftIO $ templeTypeErrorReport err
+    case Temple.parse (LazyByteString.toStrict templateContent) of
+      Left err ->
         throwError $
           DiagnosticReports
-            (fromString $ Build.resourceInputPath iTemplate)
+            (fromString $ renderTemplateRef inputTemplateRef)
+            templateContent
+            (sageErrorReport err)
+      Right x -> pure x
+  (deps, bindings) <- do
+    result <- do
+      let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+      runExceptT $ Temple.inferBindings readTemplateRef ref template'
+    case result of
+      Left err -> do
+        let
+          getTemplateRef (Temple.TemplateRef name) =
+            fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
+              <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+        reports <- templeTypeErrorReport renderTemplateRef getTemplateRef err
+        throwError $
+          DiagnosticReports
+            (fromString $ renderTemplateRef inputTemplateRef)
             (Build.resourceInputContent iTemplate)
             reports
       Right x -> pure x
@@ -284,12 +323,16 @@ articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
 
     let
       getAdjacencyFields resId@(ResourceId resTyName resName) = do
-        dataDir <- Build.askDataDir
-        mResTy <- getResourceType dataDir $ fromString resTyName
-        (resTyDir, resTy) <- maybe (error $ "resource type " ++ resTyName ++ " does not exist") pure mResTy
-        mContent <- liftIO $ lookupResourceMetadata resTyDir resName
+        store <- Build.askStore
+        resTy <- Store.getResourceType store resTyName
+        mContent <- Store.readResourceMetadata resTy resName
         content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
-        metadata <- parseResourceMetadata resTy resName content
+        metadata <-
+          parseResourceMetadata
+            (Store.resourceTypeConfig resTy)
+            (Store.resourceTypeName resTy)
+            resName
+            content
         pure $
           [(fromString "title", prev') | Just prev' <- [Map.lookup (fromString "title") metadata]]
             ++ [(fromString "url", next') | Just next' <- [Map.lookup (fromString "url") metadata]]
@@ -388,9 +431,12 @@ articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
           pure x
 
     result <-
-      Temple.runInferT (Temple.emptyInferEnv ".") Temple.emptyInferState $ do
-        ty <- Temple.instantiateTypeScheme tyScheme
-        Temple.checkExpr Temple.checkPartIncludeDisabled expr ty
+      Temple.runInferT
+        (Temple.emptyInferEnv readTemplateRef $ Temple.TemplateRef ".")
+        Temple.emptyInferState
+        $ do
+          ty <- Temple.instantiateTypeScheme tyScheme
+          Temple.checkExpr Temple.checkPartIncludeDisabled expr ty
 
     case result of
       Left err ->
@@ -415,12 +461,12 @@ articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
           _ ->
             error $ "type error (TODO): " ++ show err
       Right (_s, ()) -> do
-        let env = Temple.defaultEvalEnv (Build.resourceInputPath iTemplate) mempty
+        let env = Temple.defaultEvalEnv inputTemplateRef mempty
         let !value = Temple.evalExpr env $ Temple.locatedVal expr
         pure (name, value)
 
   let
-    env = Temple.defaultEvalEnv (Build.resourceInputPath iTemplate) deps
+    env = Temple.defaultEvalEnv (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate) deps
     output =
       Temple.evalTemplate
         env{Temple.eeScope = Map.fromList bindings' <> Temple.eeScope env}

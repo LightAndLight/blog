@@ -1,11 +1,20 @@
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeApplications #-}
 
-module IO (readFile, writeFile, listDirectory, WithCallStack (..)) where
+module IO
+  ( readFile
+  , writeFile
+  , removeFile
+  , removeDirectory
+  , listDirectory
+  , getModificationTime
+  , WithCallStack (..)
+  ) where
 
 import Control.Exception (Exception, catch, throwIO)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
+import Data.Time.Clock (UTCTime)
 import GHC.Stack (CallStack, HasCallStack, callStack, prettyCallStack)
 import qualified System.Directory as Directory
 import Prelude hiding (readFile, writeFile)
@@ -23,5 +32,14 @@ readFile path = LazyByteString.readFile path `catch` (throwIO . WithCallStack @I
 writeFile :: HasCallStack => FilePath -> LazyByteString -> IO ()
 writeFile path content = LazyByteString.writeFile path content `catch` (throwIO . WithCallStack @IOError callStack)
 
+removeFile :: HasCallStack => FilePath -> IO ()
+removeFile path = Directory.removeFile path `catch` (throwIO . WithCallStack @IOError callStack)
+
+removeDirectory :: HasCallStack => FilePath -> IO ()
+removeDirectory path = Directory.removeDirectory path `catch` (throwIO . WithCallStack @IOError callStack)
+
 listDirectory :: HasCallStack => FilePath -> IO [String]
 listDirectory path = Directory.listDirectory path `catch` (throwIO . WithCallStack @IOError callStack)
+
+getModificationTime :: HasCallStack => FilePath -> IO UTCTime
+getModificationTime path = Directory.getModificationTime path `catch` (throwIO . WithCallStack @IOError callStack)

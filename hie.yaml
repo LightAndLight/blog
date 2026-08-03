@@ -15,13 +15,16 @@ cradle:
     - path: "./server/Blog/Diagnostic.hs"
       component: "blog:exe:blog-server"
 
+    - path: "./server/Blog/Error.hs"
+      component: "blog:exe:blog-server"
+
     - path: "./server/Blog/Metadata.hs"
       component: "blog:exe:blog-server"
 
-    - path: "./server/Blog/Resource.hs"
+    - path: "./server/Blog/Rules.hs"
       component: "blog:exe:blog-server"
 
-    - path: "./server/Blog/Rules.hs"
+    - path: "./server/Blog/Store.hs"
       component: "blog:exe:blog-server"
 
     - path: "./server/IO.hs"

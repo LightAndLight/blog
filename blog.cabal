@@ -53,9 +53,10 @@ executable blog-server
     other-modules:
         Blog.Build
         Blog.Diagnostic
+        Blog.Error
         Blog.Metadata
-        Blog.Resource
         Blog.Rules
+        Blog.Store
         IO
         Text.Pandoc.Builder
         Text.Pandoc.Definition
