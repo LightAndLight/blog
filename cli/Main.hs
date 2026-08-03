@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Blog (ResourceId (..), renderResourceId, resourceIdParser)
+import Blog (ResourceId (..), getPropertiesDir, renderResourceId, resourceIdParser)
 import Control.Applicative (optional, (<**>))
 import Control.Exception (catch, finally, throwIO)
 import Control.Monad (when)
@@ -8,6 +8,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
+import Data.Foldable (for_)
 import Data.Maybe (isNothing)
 import Data.String (fromString)
 import Data.Time.Format (defaultTimeLocale, formatTime, rfc822DateFormat)
@@ -21,7 +22,13 @@ import Network.HTTP.Types.Status (statusCode)
 import qualified Network.TLS as Tls
 import Network.TLS.Extra.Cipher (ciphersuite_default)
 import qualified Options.Applicative as Options
-import System.Directory (createDirectoryIfMissing, getModificationTime, removeFile)
+import System.Directory
+  ( createDirectoryIfMissing
+  , doesFileExist
+  , getModificationTime
+  , listDirectory
+  , removeFile
+  )
 import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
@@ -52,6 +59,11 @@ data Command
       (Maybe FilePath)
       -- | ID of resource to create
       String
+  | CreateAll
+      -- | Source directory
+      FilePath
+      -- | Resource type to create
+      String
   | Update
       -- | Source file
       FilePath
@@ -76,6 +88,9 @@ cliParser =
             "list"
             (Options.info listParser $ Options.progDesc "List resources of a specific type")
           <> Options.command "create" (Options.info createParser $ Options.progDesc "Create an empty resource")
+          <> Options.command
+            "create-all"
+            (Options.info createAllParser $ Options.progDesc "Create multiple resources")
           <> Options.command "update" (Options.info updateParser $ Options.progDesc "Update a resource")
           <> Options.command "edit" (Options.info editParser $ Options.progDesc "Edit a resource")
       )
@@ -100,6 +115,13 @@ cliParser =
           )
         <*> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to create (format: `TYPE:NAME`)")
+
+    createAllParser =
+      CreateAll
+        <$> Options.strOption
+          (Options.long "from" <> Options.short 'f' <> Options.metavar "DIR" <> Options.help "Source directory")
+        <*> Options.strArgument
+          (Options.metavar "TYPE" <> Options.help "Type of resource to create")
 
     updateParser =
       Update
@@ -148,6 +170,8 @@ main = do
     Create mSrcFile resourceId -> do
       resourceId' <- parseResourceId resourceId
       create baseUrl mCertificateStore mSrcFile resourceId'
+    CreateAll srcDir resTy ->
+      createAll baseUrl mCertificateStore srcDir resTy
     Update srcFile resourceId -> do
       resourceId' <- parseResourceId resourceId
       update baseUrl mCertificateStore srcFile resourceId'
@@ -281,7 +305,8 @@ view baseUrl mCertificateStore metadata resourceId = do
 
   let
     resourceDirLocal
-      | metadata = dataHome </> "blog" </> resourceType resourceId </> (resourceName resourceId ++ ".d")
+      | metadata =
+          getPropertiesDir (dataHome </> "blog" </> resourceType resourceId) (resourceName resourceId)
       | otherwise = dataHome </> "blog" </> resourceType resourceId
   createDirectoryIfMissing True resourceDirLocal
 
@@ -342,7 +367,7 @@ list baseUrl mCertificateStore resourceTyName = do
 
   manager <- httpManager mCertificateStore
 
-  let resourceDirLocal = dataHome </> "blog" </> "resource" </> (resourceTyName ++ ".d")
+  let resourceDirLocal = dataHome </> "blog" </> "resource" </> (resourceTyName ++ ":temp")
   createDirectoryIfMissing True resourceDirLocal
 
   let resourcePathLocal = resourceDirLocal </> "list"
@@ -393,6 +418,22 @@ create baseUrl mCertificateStore mSrcFile resourceId = do
       exitFailure
     Created a -> do
       ByteString.Lazy.Char8.putStrLn a
+
+createAll :: String -> Maybe CertificateStore -> FilePath -> String -> IO ()
+createAll baseUrl mCertificateStore srcDir resTy = do
+  entries <- listDirectory srcDir
+  when (null entries) $ do
+    putStrLn $ "error: " ++ srcDir ++ " is empty"
+    exitFailure
+  for_ entries $ \entry -> do
+    let path = srcDir </> entry
+    isFile <- doesFileExist path
+    if isFile
+      then do
+        let resourceId = ResourceId resTy entry
+        create baseUrl mCertificateStore (Just path) resourceId
+      else do
+        putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
 
 update :: String -> Maybe CertificateStore -> FilePath -> ResourceId -> IO ()
 update baseUrl mCertificateStore srcFile resourceId = do

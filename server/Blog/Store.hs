@@ -43,6 +43,7 @@ import Blog
   ( MetadataValue
   , ResourceConfig (..)
   , ResourceId (..)
+  , getPropertiesDir
   , readResourceId
   , renderResourceId
   , resourceConfigDecoder
@@ -212,27 +213,27 @@ resourceTypeFromDirectory storeDir resTyName config =
     updateMetadata :: String -> Metadata -> m ()
     updateMetadata resName metadata = do
       let
-        metadataDir = resTyDir </> (resName ++ ".d")
-        metadataFile = metadataDir </> "metadata"
+        propertiesDir = getPropertiesDir resTyDir resName
+        metadataFile = propertiesDir </> "metadata"
 
       if Map.null $ metadataValues metadata
         then liftIO $ do
           IO.removeFile metadataFile
             `catch` \(WithCallStack _cs err) -> unless (isDoesNotExistError err) $ throwIO err
           mEntries <-
-            fmap Just (IO.listDirectory metadataDir)
+            fmap Just (IO.listDirectory propertiesDir)
               `catch` \(WithCallStack _cs err) -> if isDoesNotExistError err then pure Nothing else throwIO err
           case mEntries of
             Nothing -> pure ()
-            Just entries -> when (null entries) $ IO.removeDirectory metadataDir
+            Just entries -> when (null entries) $ IO.removeDirectory propertiesDir
         else liftIO $ do
-          createDirectoryIfMissing False metadataDir
+          createDirectoryIfMissing False propertiesDir
           IO.writeFile metadataFile . LazyByteString.fromStrict $ metadataSource metadata
 
     readResourceMetadataImpl :: String -> m (Maybe LazyByteString)
     readResourceMetadataImpl resName =
       liftIO $
-        fmap Just (IO.readFile $ resTyDir </> (resName ++ ".d") </> "metadata")
+        fmap Just (IO.readFile $ getPropertiesDir resTyDir resName </> "metadata")
           `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
 
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
@@ -251,7 +252,7 @@ resourceTypeFromDirectory storeDir resTyName config =
 
     listDependenciesImpl :: String -> m [ResourceId]
     listDependenciesImpl resName = do
-      let dependenciesDir = resTyDir </> (resName ++ ".d") </> "dependencies"
+      let dependenciesDir = getPropertiesDir resTyDir resName </> "dependencies"
       liftIO $ do
         entries <-
           IO.listDirectory dependenciesDir
@@ -260,7 +261,7 @@ resourceTypeFromDirectory storeDir resTyName config =
 
     listDependentsImpl :: String -> m [ResourceId]
     listDependentsImpl resName = do
-      let dependenciesDir = resTyDir </> (resName ++ ".d") </> "dependents"
+      let dependenciesDir = getPropertiesDir resTyDir resName </> "dependents"
       liftIO $ do
         entries <-
           IO.listDirectory dependenciesDir
@@ -268,15 +269,16 @@ resourceTypeFromDirectory storeDir resTyName config =
         pure $ fmap readResourceId entries
 
     createDependencyImpl :: String -> ResourceId -> m ()
-    createDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyDirTgt resNameTgt) = do
+    createDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
 
-      let dependenciesDir = resTyDir </> (resNameSrc ++ ".d") </> "dependencies"
+      let dependenciesDir = getPropertiesDir resTyDir resNameSrc </> "dependencies"
       liftIO $ do
         createDirectoryIfMissing True dependenciesDir
         IO.writeFile (dependenciesDir </> renderResourceId dependencyTarget) mempty
 
-      let dependentsDir = resTyDirTgt </> (resNameTgt ++ ".d") </> "dependents"
+      let resTyDirTgt = storeDir </> resTyNameTgt
+      let dependentsDir = getPropertiesDir resTyDirTgt resNameTgt </> "dependents"
       liftIO $ do
         createDirectoryIfMissing True dependentsDir
         IO.writeFile (dependentsDir </> renderResourceId dependencySource) mempty
@@ -285,12 +287,12 @@ resourceTypeFromDirectory storeDir resTyName config =
     removeDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyDirTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
       liftIO $ do
-        let dependenciesDir = resTyDir </> (resNameSrc ++ ".d") </> "dependencies"
+        let dependenciesDir = getPropertiesDir resTyDir resNameSrc </> "dependencies"
         IO.removeFile (dependenciesDir </> renderResourceId dependencySource)
           `catch` \(WithCallStack _cs err) -> unless (isDoesNotExistError err) $ throwIO err
 
       liftIO $ do
-        let dependentsDir = resTyDirTgt </> (resNameTgt ++ ".d") </> "dependents"
+        let dependentsDir = getPropertiesDir resTyDirTgt resNameTgt </> "dependents"
         IO.removeFile (dependentsDir </> renderResourceId dependencyTarget)
           `catch` \(WithCallStack _cs err) -> unless (isDoesNotExistError err) $ throwIO err
 
