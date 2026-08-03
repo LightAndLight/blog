@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
@@ -72,7 +73,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import Data.Foldable (foldlM, for_, traverse_)
 import Data.Graph (graphFromEdges, topSort)
 import Data.Kind (Type)
-import Data.List (intercalate, nub, partition, stripPrefix)
+import Data.List (intercalate, nub, stripPrefix)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (catMaybes, mapMaybe)
@@ -100,14 +101,20 @@ matchRule (Rule name inputs outputs f) changes = do
   guard matched
   pure $ do
     trace $ "begin " ++ name
-    inputs' <- action
+    InputTuples _olds news <- action
     traverse_
-      ( \(age, reasons, tuple, bindings, input') -> do
-          trace $ show (age, reasons, tuple, bindings)
+      ( \tuple -> do
+          let age = inputTupleAge tuple
+          let reasons = inputTupleReasons tuple
+          let headers = inputTupleHeaders tuple
+          let bindings = inputTupleBindings tuple
+          let input' = inputTupleValue tuple
+
+          trace $ show (age, reasons, headers, bindings)
           let outputs' = makeOutput bindings outputs
           withReasons reasons $ f input' outputs'
       )
-      inputs'
+      news
     trace $ "end " ++ name
 
 withReasons :: Monad m => [Reason] -> ActionT m a -> ActionT m a
@@ -273,26 +280,71 @@ instance Semigroup Age where
 instance Monoid Age where
   mempty = Old
 
-merge ::
-  (Age, [Reason], [ResourceId], Map String String, a -> b) ->
-  (Age, [Reason], [ResourceId], Map String String, a) ->
-  Maybe (Age, [Reason], [ResourceId], Map String String, b)
-merge (age1, reasons1, tuples1, bindings1, f) (age2, reasons2, tuples2, bindings2, a) = do
+data InputTuple a
+  = InputTuple
+  { inputTupleAge :: !Age
+  , inputTupleReasons :: ![Reason]
+  , inputTupleHeaders :: ![ResourceId]
+  , inputTupleBindings :: !(Map String String)
+  , inputTupleValue :: !a
+  }
+  deriving (Functor)
+
+inputTuplePure :: a -> InputTuple a
+inputTuplePure a =
+  InputTuple
+    { inputTupleAge = Old
+    , inputTupleReasons = []
+    , inputTupleHeaders = []
+    , inputTupleBindings = mempty
+    , inputTupleValue = a
+    }
+
+data InputTuples a
+  = InputTuples
+      -- | Olds
+      [InputTuple a]
+      -- | News
+      [InputTuple a]
+  deriving (Functor)
+
+inputTupleJoin ::
+  InputTuple (a -> b) ->
+  InputTuple a ->
+  Maybe (InputTuple b)
+inputTupleJoin t1 t2 = do
   let
     common :: Map String (Maybe String)
-    common = Map.intersectionWith (\x y -> x <$ guard (x == y)) bindings1 bindings2
+    common =
+      Map.intersectionWith (\x y -> x <$ guard (x == y)) (inputTupleBindings t1) (inputTupleBindings t2)
 
-    left = Map.difference bindings1 common
-    right = Map.difference bindings2 common
+    left = Map.difference (inputTupleBindings t1) common
+    right = Map.difference (inputTupleBindings t2) common
 
   common' <- sequence common
-  pure (age1 <> age2, reasons1 <> reasons2, tuples1 <> tuples2, left <> right <> common', f a)
+  pure $!
+    InputTuple
+      { inputTupleAge = inputTupleAge t1 <> inputTupleAge t2
+      , inputTupleReasons = inputTupleReasons t1 <> inputTupleReasons t2
+      , inputTupleHeaders = inputTupleHeaders t1 <> inputTupleHeaders t2
+      , inputTupleBindings = left <> right <> common'
+      , inputTupleValue = inputTupleValue t1 (inputTupleValue t2)
+      }
+
+instance Applicative InputTuples where
+  pure a = InputTuples [inputTuplePure a] []
+  (<*>) (InputTuples old1 new1) (InputTuples old2 new2) =
+    InputTuples
+      [z | x <- old1, y <- old2, Just z <- [inputTupleJoin x y]]
+      ( [z | x <- new1, y <- old2 ++ new2, Just z <- [inputTupleJoin x y]]
+          ++ [z | x <- old1, y <- new2, Just z <- [inputTupleJoin x y]]
+      )
 
 matchInput ::
   Monad m =>
   Input m a ->
   Set ResourceId ->
-  (Any, ActionT m [(Age, [Reason], [ResourceId], Map String String, a)])
+  (Any, ActionT m (InputTuples a))
 matchInput i = go i
   where
     go ::
@@ -300,21 +352,14 @@ matchInput i = go i
       MonadWriter Any n =>
       Input m a ->
       Set ResourceId ->
-      n (ActionT m [(Age, [Reason], [ResourceId], Map String String, a)])
+      n (ActionT m (InputTuples a))
     go (IFmap f deps) changes =
-      (fmap . fmap . fmap . fmap) f (go deps changes)
+      (fmap . fmap . fmap) f (go deps changes)
     go (IPure a) _changes =
-      pure $ pure [(Old, [], [], mempty, a)]
+      pure . pure $ pure a
     go (IApply deps deps') changes =
       (liftA2 . liftA2)
-        ( \lAll rAll ->
-            let
-              (lOld, lNew) = partition (\(x, _, _, _, _) -> x == New) lAll
-              rNew = filter (\(x, _, _, _, _) -> x == New) rAll
-            in
-              [z | x <- lNew, y <- rAll, Just z <- [merge x y]]
-                ++ [z | x <- lOld, y <- rNew, Just z <- [merge x y]]
-        )
+        (<*>)
         (go deps changes)
         (go deps' changes)
     go (IResource quant resTyName resNamePat) changes = do
@@ -325,7 +370,16 @@ matchInput i = go i
             let
               matchSuccess bindings resId = do
                 tell $ Any True
-                pure . Just $ (,,,,) New [Reason Updated resId] [resId] bindings <$> makeResource resId
+                pure . Just $ do
+                  value <- makeResource resId
+                  pure $
+                    InputTuple
+                      { inputTupleAge = New
+                      , inputTupleReasons = [Reason Updated resId]
+                      , inputTupleHeaders = [resId]
+                      , inputTupleBindings = bindings
+                      , inputTupleValue = value
+                      }
 
               matchFailure = pure Nothing
 
@@ -356,23 +410,53 @@ matchInput i = go i
             olds' <-
               for olds $ \(bindings, old) -> do
                 old' <- makeResource old
-                pure (Old, [], [old], bindings, old')
-            pure $ news ++ olds'
+                pure
+                  InputTuple
+                    { inputTupleAge = Old
+                    , inputTupleReasons = []
+                    , inputTupleHeaders = [old]
+                    , inputTupleBindings = bindings
+                    , inputTupleValue = old'
+                    }
+            pure $ InputTuples olds' news
           IAll -> do
-            let reasons = nub [reason' | (_, reasons', _, _, _) <- news, reason' <- reasons']
+            let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
             olds' <-
               for olds $ \(bindings, old) -> do
                 old' <- makeResource old
-                pure (Old, [], [old], bindings, old')
-            pure
-              [
-                ( New
-                , reasons
-                , [ResourceId resTyName "*"]
-                , mempty
-                , ResourceInputs resTyName . fmap (\(_, _, _, _, x) -> x) $ news ++ olds'
-                )
-              ]
+                pure
+                  InputTuple
+                    { inputTupleAge = Old
+                    , inputTupleReasons = []
+                    , inputTupleHeaders = [old]
+                    , inputTupleBindings = bindings
+                    , inputTupleValue = old'
+                    }
+            if null reasons
+              then
+                pure $
+                  InputTuples
+                    [ InputTuple
+                        { inputTupleAge = Old
+                        , inputTupleReasons = reasons
+                        , inputTupleHeaders = [ResourceId resTyName "*"]
+                        , inputTupleBindings = mempty
+                        , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds'
+                        }
+                    ]
+                    []
+              else
+                pure $
+                  InputTuples
+                    []
+                    [ InputTuple
+                        { inputTupleAge = New
+                        , inputTupleReasons = reasons
+                        , inputTupleHeaders = [ResourceId resTyName "*"]
+                        , inputTupleBindings = mempty
+                        , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds'
+                        }
+                    ]
 
 makeResource :: Monad m => ResourceId -> ActionT m (ResourceInput m)
 makeResource resId@(ResourceId resTyName resName) = do
