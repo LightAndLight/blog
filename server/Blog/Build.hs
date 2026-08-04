@@ -68,7 +68,7 @@ import Control.Monad.State.Class (get)
 import Control.Monad.State.Strict (StateT, evalStateT, modify)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Writer.CPS (WriterT, execWriterT, runWriterT)
-import Control.Monad.Writer.Class (MonadWriter, tell)
+import Control.Monad.Writer.Class (tell)
 import Data.ByteString.Lazy (LazyByteString)
 import Data.Foldable (foldlM, for_, traverse_)
 import Data.Graph (graphFromEdges, topSort)
@@ -76,13 +76,10 @@ import Data.Kind (Type)
 import Data.List (intercalate, nub, stripPrefix)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (catMaybes, mapMaybe)
-import Data.Monoid (Any (..))
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
-import Data.Traversable (for)
 import Prelude hiding (any)
 
 newtype Rules m = Rules [Rule m]
@@ -90,18 +87,16 @@ newtype Rules m = Rules [Rule m]
 
 data Rule m = forall a b. Rule !String (Input m a) (Output m b) (a -> b -> ActionT m ())
 
-matchRule ::
+runRule ::
   MonadIO m =>
   Rule m ->
   -- | Changes
   Set ResourceId ->
-  Maybe (ActionT m ())
-matchRule (Rule name inputs outputs f) changes = do
-  let (Any matched, action) = matchInput inputs changes
-  guard matched
-  pure $ do
+  ActionT m ()
+runRule (Rule name inputs outputs f) changes = do
+  InputTuples _olds news <- queryInputs inputs changes
+  unless (null news) $ do
     trace $ "begin " ++ name
-    InputTuples _olds news <- action
     traverse_
       ( \tuple -> do
           let age = inputTupleAge tuple
@@ -290,16 +285,6 @@ data InputTuple a
   }
   deriving (Functor)
 
-inputTuplePure :: a -> InputTuple a
-inputTuplePure a =
-  InputTuple
-    { inputTupleAge = Old
-    , inputTupleReasons = []
-    , inputTupleHeaders = []
-    , inputTupleBindings = mempty
-    , inputTupleValue = a
-    }
-
 data InputTuples a
   = InputTuples
       -- | Olds
@@ -332,7 +317,17 @@ inputTupleJoin t1 t2 = do
       }
 
 instance Applicative InputTuples where
-  pure a = InputTuples [inputTuplePure a] []
+  pure a =
+    InputTuples
+      [ InputTuple
+          { inputTupleAge = Old
+          , inputTupleReasons = []
+          , inputTupleHeaders = []
+          , inputTupleBindings = mempty
+          , inputTupleValue = a
+          }
+      ]
+      []
   (<*>) (InputTuples old1 new1) (InputTuples old2 new2) =
     InputTuples
       [z | x <- old1, y <- old2, Just z <- [inputTupleJoin x y]]
@@ -340,123 +335,99 @@ instance Applicative InputTuples where
           ++ [z | x <- old1, y <- new2, Just z <- [inputTupleJoin x y]]
       )
 
-matchInput ::
+queryInputs ::
   Monad m =>
   Input m a ->
   Set ResourceId ->
-  (Any, ActionT m (InputTuples a))
-matchInput i = go i
+  ActionT m (InputTuples a)
+queryInputs i = go i
   where
     go ::
       Monad m =>
-      MonadWriter Any n =>
       Input m a ->
       Set ResourceId ->
-      n (ActionT m (InputTuples a))
+      ActionT m (InputTuples a)
     go (IFmap f deps) changes =
-      (fmap . fmap . fmap) f (go deps changes)
+      (fmap . fmap) f (go deps changes)
     go (IPure a) _changes =
-      pure . pure $ pure a
+      pure $ pure a
     go (IApply deps deps') changes =
-      (liftA2 . liftA2)
+      liftA2
         (<*>)
         (go deps changes)
         (go deps' changes)
     go (IResource quant resTyName resNamePat) changes = do
-      changes' <-
-        fmap catMaybes
-          . for (Set.toAscList changes)
-          $ \resId'@(ResourceId resTyName' resName') -> do
-            let
-              matchSuccess bindings resId = do
-                tell $ Any True
-                pure . Just $ do
-                  value <- makeResource resId
-                  pure $
-                    InputTuple
-                      { inputTupleAge = New
-                      , inputTupleReasons = [Reason Updated resId]
-                      , inputTupleHeaders = [resId]
-                      , inputTupleBindings = bindings
-                      , inputTupleValue = value
+      store <- askStore
+      resTy <- Store.getResourceType store resTyName
+      resources <- Store.listResource resTy
+
+      (olds, news) <- do
+        (olds, news) <-
+          foldlM
+            ( \acc@(olds', news') resId ->
+                case matchResourceName resNamePat $ resourceName resId of
+                  Nothing -> pure acc
+                  Just bindings -> do
+                    value <- makeResource resId
+                    if resId `Set.member` changes
+                      then do
+                        let
+                          new =
+                            InputTuple
+                              { inputTupleAge = New
+                              , inputTupleReasons = [Reason Updated resId]
+                              , inputTupleHeaders = [resId]
+                              , inputTupleBindings = bindings
+                              , inputTupleValue = value
+                              }
+                        pure (olds', news' . (new :))
+                      else do
+                        let
+                          old =
+                            InputTuple
+                              { inputTupleAge = Old
+                              , inputTupleReasons = []
+                              , inputTupleHeaders = [resId]
+                              , inputTupleBindings = bindings
+                              , inputTupleValue = value
+                              }
+
+                        pure (olds' . (old :), news')
+            )
+            (id, id)
+            resources
+        pure (olds [], news [])
+
+      case quant of
+        IAny ->
+          pure $ InputTuples olds news
+        IAll ->
+          if null news
+            then
+              pure $
+                InputTuples
+                  [ InputTuple
+                      { inputTupleAge = Old
+                      , inputTupleReasons = []
+                      , inputTupleHeaders = [ResourceId resTyName "*"]
+                      , inputTupleBindings = mempty
+                      , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
                       }
-
-              matchFailure = pure Nothing
-
-            if resTyName == resTyName'
-              then case matchResourceName resNamePat resName' of
-                Nothing -> matchFailure
-                Just bindings -> matchSuccess bindings resId'
-              else matchFailure
-      pure $ do
-        store <- askStore
-        resTy <- Store.getResourceType store resTyName
-
-        news <- sequence changes'
-        olds <- do
-          listed <- Store.listResource resTy
-          let
-            olds =
-              mapMaybe
-                ( \old@(ResourceId _resTyName resName) -> do
-                    guard $ old `Set.notMember` changes
-                    bindings <- matchResourceName resNamePat resName
-                    pure (bindings, old)
-                )
-                listed
-          pure olds
-        case quant of
-          IAny -> do
-            olds' <-
-              for olds $ \(bindings, old) -> do
-                old' <- makeResource old
-                pure
-                  InputTuple
-                    { inputTupleAge = Old
-                    , inputTupleReasons = []
-                    , inputTupleHeaders = [old]
-                    , inputTupleBindings = bindings
-                    , inputTupleValue = old'
-                    }
-            pure $ InputTuples olds' news
-          IAll -> do
-            let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
-            olds' <-
-              for olds $ \(bindings, old) -> do
-                old' <- makeResource old
-                pure
-                  InputTuple
-                    { inputTupleAge = Old
-                    , inputTupleReasons = []
-                    , inputTupleHeaders = [old]
-                    , inputTupleBindings = bindings
-                    , inputTupleValue = old'
-                    }
-            if null reasons
-              then
-                pure $
-                  InputTuples
-                    [ InputTuple
-                        { inputTupleAge = Old
-                        , inputTupleReasons = reasons
-                        , inputTupleHeaders = [ResourceId resTyName "*"]
-                        , inputTupleBindings = mempty
-                        , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds'
-                        }
-                    ]
-                    []
-              else
-                pure $
-                  InputTuples
-                    []
-                    [ InputTuple
-                        { inputTupleAge = New
-                        , inputTupleReasons = reasons
-                        , inputTupleHeaders = [ResourceId resTyName "*"]
-                        , inputTupleBindings = mempty
-                        , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds'
-                        }
-                    ]
+                  ]
+                  []
+            else do
+              let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
+              pure $
+                InputTuples
+                  []
+                  [ InputTuple
+                      { inputTupleAge = New
+                      , inputTupleReasons = reasons
+                      , inputTupleHeaders = [ResourceId resTyName "*"]
+                      , inputTupleBindings = mempty
+                      , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
+                      }
+                  ]
 
 makeResource :: Monad m => ResourceId -> ActionT m (ResourceInput m)
 makeResource resId@(ResourceId resTyName resName) = do
@@ -779,15 +750,16 @@ evalRules fTrace store (Rules rs) resId = do
     go = for_ vertices $ \vertex -> do
       let (r, _, _) = fromVertex vertex
       changedResources <- get
-      for_ (matchRule r changedResources) $ \action -> do
-        (changedResources', changes, ()) <- lift . lift $ runActionT fTrace store [] action
-        dependents <-
-          concat
-            <$> traverse
-              ( \changed -> lift . lift $ do
-                  resTy <- Store.getResourceType store $ resourceType changed
-                  Store.listDependents resTy $ resourceName changed
-              )
-              changedResources'
-        modify $ (Set.fromList changedResources' <>) . (Set.fromList dependents <>)
-        tell changes
+      (changedResources', changes, ()) <-
+        lift . lift . runActionT fTrace store [] $
+          runRule r changedResources
+      dependents <-
+        concat
+          <$> traverse
+            ( \changed -> lift . lift $ do
+                resTy <- Store.getResourceType store $ resourceType changed
+                Store.listDependents resTy $ resourceName changed
+            )
+            changedResources'
+      modify $ (Set.fromList changedResources' <>) . (Set.fromList dependents <>)
+      tell changes
