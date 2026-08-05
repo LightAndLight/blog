@@ -8,7 +8,7 @@ module Blog
   , ResourceType (..)
   , ResourceConfig (..)
   , resourceConfigDecoder
-  , getPropertiesDir
+  , propertiesPart
   , MetadataConfig (..)
   , MetadataType (..)
   , metadataTypeDecoder
@@ -24,7 +24,6 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.String (fromString)
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
-import System.FilePath ((</>))
 import qualified Text.Sage as Sage
 import qualified Toml
 
@@ -68,13 +67,11 @@ data ResourceConfig
   }
   deriving (Show)
 
-getPropertiesDir ::
-  -- | Resource type directory
-  FilePath ->
+propertiesPart ::
   -- | Resource name
   String ->
   FilePath
-getPropertiesDir resTyDir resName = resTyDir </> (resName ++ ":properties")
+propertiesPart resName = resName ++ ":properties"
 
 data MetadataConfig
   = MetadataConfig

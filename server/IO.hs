@@ -5,6 +5,7 @@ module IO
   ( readFile
   , writeFile
   , removeFile
+  , createDirectoryIfMissing
   , removeDirectory
   , listDirectory
   , getModificationTime
@@ -34,6 +35,11 @@ writeFile path content = LazyByteString.writeFile path content `catch` (throwIO 
 
 removeFile :: HasCallStack => FilePath -> IO ()
 removeFile path = Directory.removeFile path `catch` (throwIO . WithCallStack @IOError callStack)
+
+createDirectoryIfMissing :: HasCallStack => Bool -> FilePath -> IO ()
+createDirectoryIfMissing parent path =
+  Directory.createDirectoryIfMissing parent path
+    `catch` (throwIO . WithCallStack @IOError callStack)
 
 removeDirectory :: HasCallStack => FilePath -> IO ()
 removeDirectory path = Directory.removeDirectory path `catch` (throwIO . WithCallStack @IOError callStack)

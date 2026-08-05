@@ -1,9 +1,10 @@
 module Main (main) where
 
-import Blog (ResourceId (..), getPropertiesDir, renderResourceId, resourceIdParser)
+import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
 import Control.Applicative (optional, (<**>))
 import Control.Exception (catch, finally, throwIO)
 import Control.Monad (when)
+import Control.Monad.Catch (ExitCase (..), generalBracket)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
@@ -169,7 +170,7 @@ main = do
       list baseUrl mCertificateStore resourceTyName
     Create mSrcFile resourceId -> do
       resourceId' <- parseResourceId resourceId
-      create baseUrl mCertificateStore mSrcFile resourceId'
+      create baseUrl mCertificateStore Nothing mSrcFile resourceId'
     CreateAll srcDir resTy ->
       createAll baseUrl mCertificateStore srcDir resTy
     Update srcFile resourceId -> do
@@ -290,6 +291,11 @@ resourceIdHeaders resourceId =
   , (fromString "X-Blog-ResourceName", fromString $ resourceName resourceId)
   ]
 
+transactionIdHeaders :: ByteString -> RequestHeaders
+transactionIdHeaders xactId =
+  [ (fromString "X-Blog-TransactionId", xactId)
+  ]
+
 view ::
   String ->
   Maybe CertificateStore ->
@@ -306,7 +312,7 @@ view baseUrl mCertificateStore metadata resourceId = do
   let
     resourceDirLocal
       | metadata =
-          getPropertiesDir (dataHome </> "blog" </> resourceType resourceId) (resourceName resourceId)
+          dataHome </> "blog" </> resourceType resourceId </> propertiesPart (resourceName resourceId)
       | otherwise = dataHome </> "blog" </> resourceType resourceId
   createDirectoryIfMissing True resourceDirLocal
 
@@ -394,11 +400,20 @@ list baseUrl mCertificateStore resourceTyName = do
 
   callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
 
-create :: String -> Maybe CertificateStore -> Maybe FilePath -> ResourceId -> IO ()
-create baseUrl mCertificateStore mSrcFile resourceId = do
+create ::
+  -- | Base URL
+  String ->
+  Maybe CertificateStore ->
+  -- | Transaction ID
+  Maybe ByteString ->
+  -- | Source file
+  Maybe FilePath ->
+  ResourceId ->
+  IO ()
+create baseUrl mCertificateStore mXactId mSrcFile resourceId = do
   manager <- httpManager mCertificateStore
 
-  let headers = resourceIdHeaders resourceId
+  let headers = resourceIdHeaders resourceId ++ foldMap transactionIdHeaders mXactId
   (_responseHeaders, response) <- do
     body <-
       case mSrcFile of
@@ -419,21 +434,99 @@ create baseUrl mCertificateStore mSrcFile resourceId = do
     Created a -> do
       ByteString.Lazy.Char8.putStrLn a
 
+begin ::
+  String ->
+  Maybe CertificateStore ->
+  -- | Transaction ID
+  IO ByteString
+begin baseUrl mCertificateStore = do
+  manager <- httpManager mCertificateStore
+
+  (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") [] mempty
+
+  case response of
+    PreconditionFailed ->
+      error "impossible"
+    NotFound ->
+      error "impossible"
+    Created{} ->
+      error "impossible"
+    Conflict ->
+      error "impossible"
+    Ok a -> do
+      pure $ LazyByteString.toStrict a
+
+commit ::
+  String ->
+  Maybe CertificateStore ->
+  -- | Transaction ID
+  ByteString ->
+  IO ()
+commit baseUrl mCertificateStore xactId = do
+  manager <- httpManager mCertificateStore
+
+  let headers = transactionIdHeaders xactId
+  (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
+
+  case response of
+    PreconditionFailed ->
+      error "impossible"
+    NotFound ->
+      error "impossible"
+    Conflict ->
+      error "impossible"
+    Created{} -> do
+      error "impossible"
+    Ok _ ->
+      pure ()
+
+rollback ::
+  String ->
+  Maybe CertificateStore ->
+  -- | Transaction ID
+  ByteString ->
+  IO ()
+rollback baseUrl mCertificateStore xactId = do
+  manager <- httpManager mCertificateStore
+
+  let headers = transactionIdHeaders xactId
+  (_responseHeaders, response) <-
+    httpPost manager (baseUrl ++ "/.transaction/rollback") headers mempty
+
+  case response of
+    PreconditionFailed ->
+      error "impossible"
+    NotFound ->
+      error "impossible"
+    Conflict ->
+      error "impossible"
+    Created{} -> do
+      error "impossible"
+    Ok _ ->
+      pure ()
+
 createAll :: String -> Maybe CertificateStore -> FilePath -> String -> IO ()
 createAll baseUrl mCertificateStore srcDir resTy = do
   entries <- listDirectory srcDir
   when (null entries) $ do
     putStrLn $ "error: " ++ srcDir ++ " is empty"
     exitFailure
-  for_ entries $ \entry -> do
-    let path = srcDir </> entry
-    isFile <- doesFileExist path
-    if isFile
-      then do
-        let resourceId = ResourceId resTy entry
-        create baseUrl mCertificateStore (Just path) resourceId
-      else do
-        putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
+  ((), ()) <-
+    generalBracket (begin baseUrl mCertificateStore) exit $ \xactId ->
+      for_ entries $ \entry -> do
+        let path = srcDir </> entry
+        isFile <- doesFileExist path
+        if isFile
+          then do
+            let resourceId = ResourceId resTy entry
+            create baseUrl mCertificateStore (Just xactId) (Just path) resourceId
+          else do
+            putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
+  pure ()
+  where
+    exit xactId (ExitCaseSuccess _a) = commit baseUrl mCertificateStore xactId
+    exit xactId (ExitCaseException _err) = rollback baseUrl mCertificateStore xactId
+    exit xactId ExitCaseAbort = rollback baseUrl mCertificateStore xactId
 
 update :: String -> Maybe CertificateStore -> FilePath -> ResourceId -> IO ()
 update baseUrl mCertificateStore srcFile resourceId = do

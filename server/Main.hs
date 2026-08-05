@@ -12,6 +12,7 @@ import Blog.Diagnostic (DiagnosticReports, renderDiagnosticReports)
 import qualified Blog.Rules
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Control.Monad.Catch (MonadMask)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -111,6 +112,26 @@ handleExceptT ma = do
     Right a ->
       pure a
 
+optionalTransactionIdHeader ::
+  MonadError Wai.Response m => RequestHeaders -> m (Maybe Store.TransactionId)
+optionalTransactionIdHeader headers =
+  case lookup (fromString "X-Blog-TransactionId") headers of
+    Nothing ->
+      pure Nothing
+    Just xactId ->
+      Just <$> parseTransactionId (ByteString.Char8.unpack xactId)
+
+parseTransactionId :: MonadError Wai.Response m => String -> m Store.TransactionId
+parseTransactionId value =
+  case Store.parseTransactionId value of
+    Nothing -> throwError $ Wai.responseLBS badRequest400 [] (fromString $ "invalid transaction ID: " ++ show value)
+    Just x -> pure x
+
+withTransaction ::
+  MonadMask m => Store m -> Maybe Store.TransactionId -> (Store.TransactionId -> m a) -> m a
+withTransaction store Nothing f = Store.withTransaction store f
+withTransaction _store (Just xactId) f = f xactId
+
 app :: Cli -> Wai.Application
 app cli request respond = do
   store :: Store (ExceptT DiagnosticReports IO) <- Store.fromDirectory $ cliData cli
@@ -131,20 +152,56 @@ app cli request respond = do
         | part == fromString ".resource" ->
             if Wai.requestMethod request == fromString "GET"
               then do
-                resTy <- handleExceptT $ Store.getResourceType store (Text.unpack resTyName)
-                items <- handleExceptT $ Store.listResource resTy
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+                items <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+                  Store.listResource resTy
+
                 pure $
                   Wai.responseLBS
                     ok200
                     []
                     (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+      [part, action]
+        | part == fromString ".transaction" ->
+            if action == fromString "begin"
+              then do
+                xactId <- handleExceptT $ Store.beginTransaction store
+                pure $ Wai.responseLBS ok200 [] (fromString $ Store.renderTransactionId xactId)
+              else
+                if action == fromString "commit"
+                  then do
+                    let headers = Wai.requestHeaders request
+                    xactId <- do
+                      value <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-TransactionId"
+                      parseTransactionId value
+                    handleExceptT $ Store.commitTransaction store xactId
+                    pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
+                  else
+                    if action == fromString "rollback"
+                      then do
+                        let headers = Wai.requestHeaders request
+                        xactId <- do
+                          value <-
+                            fmap ByteString.Char8.unpack . requireHeader headers $
+                              fromString "X-Blog-TransactionId"
+                          parseTransactionId value
+                        handleExceptT $ Store.rollbackTransaction store xactId
+                        pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
+                      else
+                        throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part, resTyName, resName]
         | part == fromString ".resource" ->
             if Wai.requestMethod request == fromString "GET"
               then do
-                resTy <- handleExceptT $ Store.getResourceType store (Text.unpack resTyName)
-                mBody <- handleExceptT $ Store.readResource resTy (Text.unpack resName)
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+                mBody <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+                  Store.readResource resTy (Text.unpack resName)
+
                 case mBody of
                   Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
                   Just body -> pure $ Wai.responseLBS ok200 [] body
@@ -154,8 +211,12 @@ app cli request respond = do
         , part' == fromString "metadata" ->
             if Wai.requestMethod request == fromString "GET"
               then do
-                resTy <- handleExceptT $ Store.getResourceType store (Text.unpack resTyName)
-                mBody <- handleExceptT $ Store.readResourceMetadata resTy (Text.unpack resName)
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+                mBody <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+                  Store.readResourceMetadata resTy (Text.unpack resName)
+
                 case mBody of
                   Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
                   Just body -> pure $ Wai.responseLBS ok200 [] body
@@ -164,7 +225,7 @@ app cli request respond = do
         throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
 
 httpResourceGet ::
-  MonadIO m =>
+  (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
   Wai.Request ->
   HandlerT m Wai.Response
@@ -175,9 +236,11 @@ httpResourceGet store request = do
     fmap (Text.pack . ByteString.Char8.unpack) . requireHeader headers $
       fromString "X-Blog-ResourceType"
   resName <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-ResourceName"
+  mXactId <- optionalTransactionIdHeader headers
 
-  resTy <- handleExceptT $ Store.getResourceType store (Text.unpack resTyName)
-  exists <- handleExceptT $ Store.doesResourceExist resTy resName
+  exists <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+    resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+    Store.doesResourceExist resTy resName
   if exists
     then do
       body <- liftIO $ Wai.consumeRequestBodyLazy request
@@ -190,7 +253,7 @@ httpResourceGet store request = do
           (fromString $ "resource " ++ Text.unpack resTyName ++ ":" ++ resName ++ " does not exist")
 
 httpResourcePost ::
-  MonadIO m =>
+  (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
   Wai.Request ->
   HandlerT m Wai.Response
@@ -201,21 +264,26 @@ httpResourcePost store request = do
     fmap (ByteString.Char8.unpack) . requireHeader headers $ fromString "X-Blog-ResourceType"
   resName <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-ResourceName"
   let resId = ResourceId resTyName resName
+  mXactId <- optionalTransactionIdHeader headers
 
-  resTy <- handleExceptT $ Store.getResourceType store (fromString resTyName)
-  exists <- handleExceptT $ Store.doesResourceExist resTy resName
-  if exists
-    then
+  mChanges <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+    resTy <- Store.getResourceType store xactId (fromString resTyName)
+    exists <- Store.doesResourceExist resTy resName
+    if exists
+      then pure Nothing
+      else do
+        body <- liftIO $ Wai.consumeRequestBodyLazy request
+        do
+          Store.writeResource resTy resName body
+          Just <$> Build.evalRules putStrLn store xactId Blog.Rules.rules resId
+  case mChanges of
+    Nothing ->
       throwError $
         Wai.responseLBS
           badRequest400
           []
           (fromString $ "resource " ++ resTyName ++ ":" ++ resName ++ " already exists")
-    else do
-      body <- liftIO $ Wai.consumeRequestBodyLazy request
-      changes <- handleExceptT $ do
-        Store.writeResource resTy resName body
-        Build.evalRules putStrLn store Blog.Rules.rules resId
+    Just changes ->
       pure $
         Wai.responseLBS
           created201
@@ -226,7 +294,7 @@ httpResourcePost store request = do
           )
 
 httpResourcePut ::
-  MonadIO m =>
+  (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
   Wai.Request ->
   HandlerT m Wai.Response
@@ -236,6 +304,7 @@ httpResourcePut store request = do
   resTyName <- fmap ByteString.Char8.unpack $ requireHeader headers "X-Blog-ResourceType"
   resName <- fmap ByteString.Char8.unpack $ requireHeader headers "X-Blog-ResourceName"
   let resId = ResourceId resTyName resName
+  mXactId <- optionalTransactionIdHeader headers
 
   mLocalModificationTime <- do
     let mValue = ByteString.Char8.unpack <$> lookup (fromString "If-Unmodified-Since") headers
@@ -251,37 +320,35 @@ httpResourcePut store request = do
                 (fromString "If-Unmodified-Since: invalid date format")
           Just x -> pure $ Just (x :: UTCTime)
 
-  resTy <- handleExceptT $ Store.getResourceType store resTyName
-  mServerModificationTime <- handleExceptT $ Store.readResourceModificationTime resTy resName
-  case mServerModificationTime of
-    Just serverModificationTime -> do
-      let
-        responseHeaders =
-          [ (hLastModified, fromString $ formatTime defaultTimeLocale rfc822DateFormat serverModificationTime)
-          ]
-      if maybe True (serverModificationTime <=) mLocalModificationTime
-        then do
-          body <- liftIO $ Wai.consumeRequestBodyLazy request
-          changes <- handleExceptT $ do
-            Store.writeResource resTy resName body
-            Build.evalRules putStrLn store Blog.Rules.rules resId
-          pure $
-            Wai.responseLBS
-              ok200
-              responseHeaders
-              ( ByteString.Lazy.Char8.unlines $
-                  fromString ("updated " ++ resTyName ++ ":" ++ resName)
-                    : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
-              )
-        else
-          throwError $
-            Wai.responseLBS
-              preconditionFailed412
-              responseHeaders
-              (fromString "the local copy of the resource is out of date")
-    Nothing ->
-      throwError $
+  eChanges <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+    resTy <- Store.getResourceType store xactId resTyName
+    mServerModificationTime <- Store.readResourceModificationTime resTy resName
+    case mServerModificationTime of
+      Just serverModificationTime -> do
+        let
+          responseHeaders =
+            [ (hLastModified, fromString $ formatTime defaultTimeLocale rfc822DateFormat serverModificationTime)
+            ]
+        if maybe True (serverModificationTime <=) mLocalModificationTime
+          then do
+            body <- liftIO $ Wai.consumeRequestBodyLazy request
+            changes <- do
+              Store.writeResource resTy resName body
+              Build.evalRules putStrLn store xactId Blog.Rules.rules resId
+            pure $ Right (responseHeaders, changes)
+          else
+            pure $ Left (preconditionFailed412, "the local copy of the resource is out of date")
+      Nothing ->
+        pure $ Left (badRequest400, "resource " ++ resTyName ++ ":" ++ resName ++ " does not exist")
+  case eChanges of
+    Left (status, err) ->
+      pure $ Wai.responseLBS status [] (fromString err)
+    Right (responseHeaders, changes) ->
+      pure $
         Wai.responseLBS
-          badRequest400
-          []
-          (fromString $ "resource " ++ resTyName ++ ":" ++ resName ++ " does not exist")
+          ok200
+          responseHeaders
+          ( ByteString.Lazy.Char8.unlines $
+              fromString ("updated " ++ resTyName ++ ":" ++ resName)
+                : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+          )

@@ -34,6 +34,7 @@ executable blog
         crypton-connection,
         crypton-x509-store,
         directory,
+        exceptions,
         filepath,
         http-client,
         http-client-tls,
@@ -58,12 +59,15 @@ executable blog-server
         Blog.Metadata
         Blog.Rules
         Blog.Store
+        ID
         IO
+
+        -- Vendored
+        Commonmark.Pandoc
         Text.Pandoc.Builder
         Text.Pandoc.Definition
         Text.Pandoc.Html
         Text.Pandoc.Walk
-        Commonmark.Pandoc
     build-depends:
         base ^>=4.20.2.0,
         blog,
@@ -75,6 +79,8 @@ executable blog-server
         diagnostica,
         diagnostica-sage,
         directory,
+        entropy,
+        exceptions,
         filepath,
         http-types,
         mtl >=2.3.2,

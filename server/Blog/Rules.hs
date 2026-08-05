@@ -159,9 +159,11 @@ articleAdjacency ::
   Build.ActionT m ()
 articleAdjacency iArticles oAdjacency = do
   store <- Build.askStore
+  xactId <- Build.askTransactionId
+
   resTy <- do
     let resTyName = Build.resourceInputsType iArticles
-    Store.getResourceType store resTyName
+    Store.getResourceType store xactId resTyName
   articles' <- Store.listResource resTy
   articlesWithPublished <- for articles' $ \article -> do
     metadata <- do
@@ -324,7 +326,9 @@ articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
     let
       getAdjacencyFields resId@(ResourceId resTyName resName) = do
         store <- Build.askStore
-        resTy <- Store.getResourceType store resTyName
+        xactId <- Build.askTransactionId
+
+        resTy <- Store.getResourceType store xactId resTyName
         mContent <- Store.readResourceMetadata resTy resName
         content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
         metadata <-

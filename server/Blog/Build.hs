@@ -37,6 +37,7 @@ module Blog.Build
   , oResourceType
   , ActionT
   , askStore
+  , askTransactionId
   , setDependencies
   , trace
 
@@ -56,7 +57,7 @@ import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Metadata
   ( parseResourceMetadata
   )
-import Blog.Store (Store, hoistStore)
+import Blog.Store (Store, TransactionId, hoistStore)
 import qualified Blog.Store as Store
 import Control.Monad (guard, unless)
 import Control.Monad.Error.Class (MonadError, liftEither, throwError)
@@ -126,6 +127,7 @@ data ActionEnv m
   = ActionEnv
   { aeTrace :: !(String -> IO ())
   , aeStore :: !(Store (ActionT m))
+  , aeTransactionId :: !TransactionId
   , aeReasons :: ![Reason]
   }
 
@@ -146,15 +148,17 @@ runActionT ::
   -- | Trace
   (String -> IO ()) ->
   Store m ->
+  TransactionId ->
   -- | Why the action was triggered
   [Reason] ->
   ActionT m a ->
   m ([ResourceId], [Change], a)
-runActionT fTrace store reasons (ActionT ma) = do
+runActionT fTrace store transactionId reasons (ActionT ma) = do
   let env =
         ActionEnv
           { aeTrace = fTrace
           , aeStore = hoistStore lift store
+          , aeTransactionId = transactionId
           , aeReasons = reasons
           }
   (a, ActionSummary pending changes) <-
@@ -164,6 +168,9 @@ runActionT fTrace store reasons (ActionT ma) = do
 askStore :: Monad m => ActionT m (Store (ActionT m))
 askStore = ActionT $ asks aeStore
 
+askTransactionId :: Monad m => ActionT m TransactionId
+askTransactionId = ActionT $ asks aeTransactionId
+
 trace :: MonadIO m => String -> ActionT m ()
 trace s = ActionT $ do
   f <- asks aeTrace
@@ -172,11 +179,13 @@ trace s = ActionT $ do
 setDependencies :: Monad m => ResourceId -> Set ResourceId -> ActionT m ()
 setDependencies a bs = do
   store <- askStore
-  resTyA <- Store.getResourceType store $ resourceType a
+  transactionId <- askTransactionId
+
+  resTyA <- Store.getResourceType store transactionId $ resourceType a
 
   for_ bs $ \b -> do
     let ResourceId resTyName resName = b
-    resTyB <- Store.getResourceType store resTyName
+    resTyB <- Store.getResourceType store transactionId resTyName
     exists <- Store.doesResourceExist resTyB resName
     unless exists . throwError . DiagnosticSimple $
       "dependency " ++ renderResourceId b ++ " does not exist"
@@ -192,9 +201,11 @@ putResource resId@(ResourceId resTyName resName) content = do
   trace $ "putResource: " ++ renderResourceId resId
 
   store <- askStore
+  transactionId <- askTransactionId
+
   reasons <- ActionT $ asks aeReasons
 
-  resTy <- Store.getResourceType store $ fromString resTyName
+  resTy <- Store.getResourceType store transactionId $ fromString resTyName
   exists <- Store.doesResourceExist resTy resName
   if exists
     then do
@@ -358,7 +369,9 @@ queryInputs i = go i
         (go deps' changes)
     go (IResource quant resTyName resNamePat) changes = do
       store <- askStore
-      resTy <- Store.getResourceType store resTyName
+      transactionId <- askTransactionId
+
+      resTy <- Store.getResourceType store transactionId resTyName
       resources <- Store.listResource resTy
 
       (olds, news) <- do
@@ -432,7 +445,9 @@ queryInputs i = go i
 makeResource :: Monad m => ResourceId -> ActionT m (ResourceInput m)
 makeResource resId@(ResourceId resTyName resName) = do
   store <- askStore
-  resTy <- Store.getResourceType store resTyName
+  transactionId <- askTransactionId
+
+  resTy <- Store.getResourceType store transactionId resTyName
   mContent <- Store.readResource resTy resName
   case mContent of
     Nothing ->
@@ -719,13 +734,14 @@ evalRules ::
   -- | Trace
   (String -> IO ()) ->
   Store m ->
+  TransactionId ->
   Rules m ->
   -- | The created/updated resource
   ResourceId ->
   m [Change]
-evalRules fTrace store (Rules rs) resId = do
+evalRules fTrace store transactionId (Rules rs) resId = do
   execWriterT . flip evalStateT mempty $ do
-    resTy <- Store.getResourceType (hoistStore (lift . lift) store) $ resourceType resId
+    resTy <- Store.getResourceType (hoistStore (lift . lift) store) transactionId $ resourceType resId
     dependents <- Store.listDependents resTy $ resourceName resId
     modify $ (Set.fromList dependents <>) . Set.insert resId
     go
@@ -751,13 +767,13 @@ evalRules fTrace store (Rules rs) resId = do
       let (r, _, _) = fromVertex vertex
       changedResources <- get
       (changedResources', changes, ()) <-
-        lift . lift . runActionT fTrace store [] $
+        lift . lift . runActionT fTrace store transactionId [] $
           runRule r changedResources
       dependents <-
         concat
           <$> traverse
             ( \changed -> lift . lift $ do
-                resTy <- Store.getResourceType store $ resourceType changed
+                resTy <- Store.getResourceType store transactionId $ resourceType changed
                 Store.listDependents resTy $ resourceName changed
             )
             changedResources'
