@@ -58,6 +58,8 @@ import Blog
   )
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (tomlResult)
+import Blog.ID (ID)
+import qualified Blog.ID as ID
 import Blog.Metadata (resourceMetadataDecoder)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
@@ -82,13 +84,10 @@ import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime)
 import Data.Traversable (for)
 import GHC.Stack (HasCallStack)
-import ID (ID)
-import qualified ID
 import IO (WithCallStack (..))
 import qualified IO
 import System.Directory
-  ( copyFile
-  , createDirectory
+  ( createDirectory
   , doesDirectoryExist
   , doesFileExist
   , removeDirectoryRecursive
@@ -181,7 +180,16 @@ fromDirectory storeDir = do
                         else throwIO err
               config <- parseResourceConfig resTyName content
               liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
-            else pure Nothing
+            else do
+              let xactDir = getTransactionIdDir storeDir xactId </> changePart Create
+              let xactResTyDir = xactDir </> resTyName
+              inCreated <- liftIO $ doesDirectoryExist xactResTyDir
+              if inCreated
+                then do
+                  content <- liftIO $ IO.readFile (xactDir </> "resource" </> resTyName)
+                  config <- parseResourceConfig resTyName content
+                  liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
+                else pure Nothing
 
     beginTransactionImpl :: m TransactionId
     beginTransactionImpl = do
@@ -201,22 +209,59 @@ fromDirectory storeDir = do
       -- \* If the server crashes mid-commit, then the store is in an invalid state.
       liftIO $ do
         let xactDir = getTransactionIdDir storeDir xactId
-        mergeDirectory (xactDir </> changePart Create) storeDir
-        mergeDirectory (xactDir </> changePart Update) storeDir
+        mergeDirectoryCreate (xactDir </> changePart Create) storeDir
+        mergeDirectoryUpdate (xactDir </> changePart Update) storeDir
         subtractDirectory (xactDir </> changePart Delete) storeDir
         removeDirectoryRecursive xactDir
 
     -- \| Recursively copy the contents of the source directory into the target directory.
     --
     -- Afterward, the target directory's tree is a superset of the source directory.
-    mergeDirectory ::
+    --
+    -- An empty directory within the source directory results in a corresponding empty
+    -- directory in the target directory. So if that empty directory already exists in
+    -- the target directory, then the contents will be deleted.
+    mergeDirectoryCreate ::
       HasCallStack =>
       -- \| Source directory
       FilePath ->
       -- \| Target directory
       FilePath ->
       IO ()
-    mergeDirectory srcDir tgtDir = do
+    mergeDirectoryCreate srcDir' tgtDir' = do
+      entries <- IO.listDirectory srcDir'
+      go entries srcDir' tgtDir'
+      where
+        go entries srcDir tgtDir =
+          for_ entries $ \entry -> do
+            let srcPath = srcDir </> entry
+            let tgtPath = tgtDir </> entry
+            isDir <- doesDirectoryExist srcPath
+            if isDir
+              then do
+                entries' <- IO.listDirectory srcPath
+                if null entries'
+                  then do
+                    IO.removeDirectory tgtPath `catch` \err'@(WithCallStack _cs err) -> unless (isDoesNotExistError err) $ throwIO err'
+                    IO.createDirectoryIfMissing False tgtPath
+                  else do
+                    IO.createDirectoryIfMissing False tgtPath
+                    go entries' srcPath tgtPath
+              else do
+                putStrLn $ "create: copy " ++ srcPath ++ " to " ++ tgtPath
+                IO.copyFile srcPath tgtPath
+
+    -- \| Recursively copy the contents of the source directory into the target directory.
+    --
+    -- Afterward, the target directory's tree is a superset of the source directory.
+    mergeDirectoryUpdate ::
+      HasCallStack =>
+      -- \| Source directory
+      FilePath ->
+      -- \| Target directory
+      FilePath ->
+      IO ()
+    mergeDirectoryUpdate srcDir tgtDir = do
       entries <- IO.listDirectory srcDir
       for_ entries $ \entry -> do
         let srcPath = srcDir </> entry
@@ -225,8 +270,10 @@ fromDirectory storeDir = do
         if isDir
           then do
             IO.createDirectoryIfMissing False tgtPath
-            mergeDirectory srcPath tgtPath
-          else copyFile srcPath tgtPath
+            mergeDirectoryUpdate srcPath tgtPath
+          else do
+            putStrLn $ "update: copy " ++ srcPath ++ " to " ++ tgtPath
+            IO.copyFile srcPath tgtPath
 
     -- \| Recursively remove the contents of the source directory from the target directory.
     --
@@ -434,6 +481,30 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       IO.createDirectoryIfMissing True dir'
       IO.writeFile (dir' </> name) body
 
+    xactCreateDir ::
+      HasCallStack =>
+      -- \| Directory, relative to store directory
+      FilePath ->
+      IO ()
+    xactCreateDir dir = do
+      let xactDir = getTransactionIdDir storeDir xactId
+
+      inRemoved <- doesDirectoryExist $ xactDir </> changePart Delete </> dir
+      if inRemoved
+        then do
+          isEmpty <- null <$> IO.listDirectory (xactDir </> changePart Delete </> dir)
+          if isEmpty
+            then do
+              IO.removeDirectory $ xactDir </> changePart Delete </> dir
+              IO.createDirectoryIfMissing True $ xactDir </> changePart Update </> dir
+            else
+              pure ()
+        else do
+          exists <- doesDirectoryExist $ storeDir </> dir
+          if exists
+            then pure ()
+            else IO.createDirectoryIfMissing True $ xactDir </> changePart Create </> dir
+
     writeResourceImpl :: String -> LazyByteString -> m ()
     writeResourceImpl resName body = do
       removed <- liftIO . doesFileExist $ xactResTyDir Delete </> resName
@@ -453,8 +524,8 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           | resTyName == "resource" = do
               _config <- parseResourceConfig resName body
               liftIO $ do
-                IO.createDirectoryIfMissing False (getTransactionIdDir storeDir xactId </> resName)
-                xactWriteFile (xactResTyDir change) resName body
+                xactWriteFile "resource" resName body
+                xactCreateDir resName
           | otherwise = do
               liftIO $ IO.createDirectoryIfMissing False (xactResTyDir change)
               metadata <- extractMetadata resTyName config resName body

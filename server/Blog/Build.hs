@@ -371,76 +371,83 @@ queryInputs i = go i
       store <- askStore
       transactionId <- askTransactionId
 
-      resTy <- Store.getResourceType store transactionId resTyName
-      resources <- Store.listResource resTy
+      mResTy <- Store.lookupResourceType store transactionId resTyName
+      case mResTy of
+        Nothing ->
+          -- TODO: not sure if this is the best way to handle missing resource types,
+          -- but right now anything stricter stops me from state-machine-testing the
+          -- system due to the built-in rules.
+          pure $ InputTuples [] []
+        Just resTy -> do
+          resources <- Store.listResource resTy
 
-      (olds, news) <- do
-        (olds, news) <-
-          foldlM
-            ( \acc@(olds', news') resId ->
-                case matchResourceName resNamePat $ resourceName resId of
-                  Nothing -> pure acc
-                  Just bindings -> do
-                    value <- makeResource resId
-                    if resId `Set.member` changes
-                      then do
-                        let
-                          new =
-                            InputTuple
-                              { inputTupleAge = New
-                              , inputTupleReasons = [Reason Updated resId]
-                              , inputTupleHeaders = [resId]
-                              , inputTupleBindings = bindings
-                              , inputTupleValue = value
-                              }
-                        pure (olds', news' . (new :))
-                      else do
-                        let
-                          old =
-                            InputTuple
-                              { inputTupleAge = Old
-                              , inputTupleReasons = []
-                              , inputTupleHeaders = [resId]
-                              , inputTupleBindings = bindings
-                              , inputTupleValue = value
-                              }
+          (olds, news) <- do
+            (olds, news) <-
+              foldlM
+                ( \acc@(olds', news') resId ->
+                    case matchResourceName resNamePat $ resourceName resId of
+                      Nothing -> pure acc
+                      Just bindings -> do
+                        value <- makeResource resId
+                        if resId `Set.member` changes
+                          then do
+                            let
+                              new =
+                                InputTuple
+                                  { inputTupleAge = New
+                                  , inputTupleReasons = [Reason Updated resId]
+                                  , inputTupleHeaders = [resId]
+                                  , inputTupleBindings = bindings
+                                  , inputTupleValue = value
+                                  }
+                            pure (olds', news' . (new :))
+                          else do
+                            let
+                              old =
+                                InputTuple
+                                  { inputTupleAge = Old
+                                  , inputTupleReasons = []
+                                  , inputTupleHeaders = [resId]
+                                  , inputTupleBindings = bindings
+                                  , inputTupleValue = value
+                                  }
 
-                        pure (olds' . (old :), news')
-            )
-            (id, id)
-            resources
-        pure (olds [], news [])
+                            pure (olds' . (old :), news')
+                )
+                (id, id)
+                resources
+            pure (olds [], news [])
 
-      case quant of
-        IAny ->
-          pure $ InputTuples olds news
-        IAll ->
-          if null news
-            then
-              pure $
-                InputTuples
-                  [ InputTuple
-                      { inputTupleAge = Old
-                      , inputTupleReasons = []
-                      , inputTupleHeaders = [ResourceId resTyName "*"]
-                      , inputTupleBindings = mempty
-                      , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
-                      }
-                  ]
-                  []
-            else do
-              let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
-              pure $
-                InputTuples
-                  []
-                  [ InputTuple
-                      { inputTupleAge = New
-                      , inputTupleReasons = reasons
-                      , inputTupleHeaders = [ResourceId resTyName "*"]
-                      , inputTupleBindings = mempty
-                      , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
-                      }
-                  ]
+          case quant of
+            IAny ->
+              pure $ InputTuples olds news
+            IAll ->
+              if null news
+                then
+                  pure $
+                    InputTuples
+                      [ InputTuple
+                          { inputTupleAge = Old
+                          , inputTupleReasons = []
+                          , inputTupleHeaders = [ResourceId resTyName "*"]
+                          , inputTupleBindings = mempty
+                          , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
+                          }
+                      ]
+                      []
+                else do
+                  let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
+                  pure $
+                    InputTuples
+                      []
+                      [ InputTuple
+                          { inputTupleAge = New
+                          , inputTupleReasons = reasons
+                          , inputTupleHeaders = [ResourceId resTyName "*"]
+                          , inputTupleBindings = mempty
+                          , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
+                          }
+                      ]
 
 makeResource :: Monad m => ResourceId -> ActionT m (ResourceInput m)
 makeResource resId@(ResourceId resTyName resName) = do

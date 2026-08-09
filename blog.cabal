@@ -13,10 +13,14 @@ common warnings
 
 library
     import:           warnings
-    exposed-modules:  Blog
+    exposed-modules:
+        Blog
+        Blog.ID
     build-depends:
         base ^>=4.20.2.0,
+        bytestring,
         containers,
+        entropy,
         filepath,
         sage,
         text >=2.0,
@@ -59,7 +63,6 @@ executable blog-server
         Blog.Metadata
         Blog.Rules
         Blog.Store
-        ID
         IO
 
         -- Vendored
@@ -79,7 +82,6 @@ executable blog-server
         diagnostica,
         diagnostica-sage,
         directory,
-        entropy,
         exceptions,
         filepath,
         http-types,
@@ -90,10 +92,44 @@ executable blog-server
         text >=2.0,
         time,
         tomlin,
+        transformers,
         wai,
         warp,
         warp-tls
 
     hs-source-dirs:   server
+    default-language: Haskell2010
+    ghc-options:      -threaded -rtsopts -with-rtsopts=-N
+
+test-suite blog-server-tests
+    import:           warnings
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    build-depends:
+        async,
+        base,
+        barbies,
+        blog,
+        bytestring,
+        containers,
+        crypton-connection,
+        crypton-x509-store,
+        deepseq,
+        directory,
+        filepath,
+        hedgehog,
+        hspec,
+        hspec-core,
+        hspec-hedgehog,
+        http-client,
+        http-client-tls,
+        http-types,
+        mmorph,
+        mtl,
+        process,
+        temporary,
+        tls
+
     default-language: Haskell2010
     ghc-options:      -threaded -rtsopts -with-rtsopts=-N

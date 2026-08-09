@@ -1,7 +1,7 @@
 {-# LANGUAGE BinaryLiterals #-}
 
 -- | <https://www.rfc-editor.org/info/rfc9562/#section-5.4>
-module ID
+module Blog.ID
   ( ID
   , toString
   , fromString
@@ -10,7 +10,7 @@ module ID
 where
 
 import Control.Monad ((<=<))
-import Data.Bits (shiftL, shiftR, (.|.))
+import Data.Bits (shiftL, shiftR, (.&.), (.|.))
 import qualified Data.ByteString as ByteString
 import Data.Maybe (fromMaybe)
 import Data.Word (Word64, Word8)
@@ -19,10 +19,15 @@ import System.Entropy (getEntropy)
 
 data ID = ID !Word64 !Word64
 
+instance Show ID where
+  showsPrec d x = showParen (d > app_prec) $ showString "ID.fromString " . showString (toString x)
+    where
+      app_prec = 10
+
 toString :: ID -> String
 toString (ID a b) =
   foldMap
-    (\byte -> showHex byte "")
+    (\byte -> showHex (byte `shiftR` 4) "" ++ showHex (byte .&. 0xF) "")
     [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15]
   where
     from word ix =

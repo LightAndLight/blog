@@ -30,9 +30,6 @@ cradle:
     - path: "./server/IO.hs"
       component: "blog:exe:blog-server"
 
-    - path: "./server/ID.hs"
-      component: "blog:exe:blog-server"
-
     - path: "./server/Commonmark/Pandoc.hs"
       component: "blog:exe:blog-server"
 
@@ -47,3 +44,6 @@ cradle:
 
     - path: "./server/Text/Pandoc/Walk.hs"
       component: "blog:exe:blog-server"
+
+    - path: "./test"
+      component: "blog:test:blog-server-tests"

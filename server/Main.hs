@@ -17,6 +17,7 @@ import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans (MonadTrans, lift)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
@@ -41,6 +42,7 @@ import System.Directory
   ( createDirectoryIfMissing
   )
 import System.FilePath ((</>))
+import System.IO (BufferMode (..), hSetBuffering, stdout)
 
 data Cli
   = Cli
@@ -75,12 +77,21 @@ main :: IO ()
 main = do
   cli <- Options.execParser $ Options.info cliParser Options.fullDesc
 
-  putStrLn $ "Running at https://localhost:" ++ show (cliPort cli)
-  putStrLn $ "  Data directory: " ++ cliData cli
+  hSetBuffering stdout LineBuffering
   initData $ cliData cli
 
   let tlsSettings = WarpTLS.tlsSettings (cliCert cli) (cliKey cli)
-  let settings = Warp.setPort (cliPort cli) Warp.defaultSettings
+
+  let
+    printReady = do
+      putStrLn $ "Running at https://localhost:" ++ show (cliPort cli)
+      putStrLn $ "  Data directory: " ++ cliData cli
+
+    settings =
+      Warp.setPort (cliPort cli) $
+        Warp.setBeforeMainLoop printReady $
+          Warp.defaultSettings
+
   WarpTLS.runTLS tlsSettings settings $ app cli
 
 newtype HandlerT m a = HandlerT (ExceptT Wai.Response m a)
@@ -124,7 +135,9 @@ optionalTransactionIdHeader headers =
 parseTransactionId :: MonadError Wai.Response m => String -> m Store.TransactionId
 parseTransactionId value =
   case Store.parseTransactionId value of
-    Nothing -> throwError $ Wai.responseLBS badRequest400 [] (fromString $ "invalid transaction ID: " ++ show value)
+    Nothing ->
+      throwError $
+        Wai.responseLBS badRequest400 [] (fromString $ "invalid transaction ID: " ++ show value)
     Just x -> pure x
 
 withTransaction ::
@@ -154,15 +167,19 @@ app cli request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                items <- handleExceptT . withTransaction store mXactId $ \xactId -> do
-                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-                  Store.listResource resTy
+                mItems <- handleExceptT . runMaybeT . withTransaction (Store.hoistStore lift store) mXactId $ \xactId -> do
+                  resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
+                  lift $ Store.listResource resTy
 
-                pure $
-                  Wai.responseLBS
-                    ok200
-                    []
-                    (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
+                case mItems of
+                  Nothing ->
+                    pure $ Wai.responseLBS notFound404 [] (fromString "not found")
+                  Just items ->
+                    pure $
+                      Wai.responseLBS
+                        ok200
+                        []
+                        (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       [part, action]
         | part == fromString ".transaction" ->
@@ -198,9 +215,9 @@ app cli request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                mBody <- handleExceptT . withTransaction store mXactId $ \xactId -> do
-                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-                  Store.readResource resTy (Text.unpack resName)
+                mBody <- handleExceptT . runMaybeT . withTransaction (Store.hoistStore lift store) mXactId $ \xactId -> do
+                  resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
+                  MaybeT $ Store.readResource resTy (Text.unpack resName)
 
                 case mBody of
                   Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
@@ -238,14 +255,13 @@ httpResourceGet store request = do
   resName <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-ResourceName"
   mXactId <- optionalTransactionIdHeader headers
 
-  exists <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+  mBody <- handleExceptT . withTransaction store mXactId $ \xactId -> do
     resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-    Store.doesResourceExist resTy resName
-  if exists
-    then do
-      body <- liftIO $ Wai.consumeRequestBodyLazy request
+    Store.readResource resTy resName
+  case mBody of
+    Just body ->
       pure $ Wai.responseLBS ok200 [] body
-    else
+    Nothing ->
       throwError $
         Wai.responseLBS
           badRequest400

@@ -4,6 +4,7 @@
 module IO
   ( readFile
   , writeFile
+  , copyFile
   , removeFile
   , createDirectoryIfMissing
   , removeDirectory
@@ -32,6 +33,9 @@ readFile path = LazyByteString.readFile path `catch` (throwIO . WithCallStack @I
 
 writeFile :: HasCallStack => FilePath -> LazyByteString -> IO ()
 writeFile path content = LazyByteString.writeFile path content `catch` (throwIO . WithCallStack @IOError callStack)
+
+copyFile :: HasCallStack => FilePath -> FilePath -> IO ()
+copyFile from to = Directory.copyFile from to `catch` (throwIO . WithCallStack @IOError callStack)
 
 removeFile :: HasCallStack => FilePath -> IO ()
 removeFile path = Directory.removeFile path `catch` (throwIO . WithCallStack @IOError callStack)
