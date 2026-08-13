@@ -315,12 +315,12 @@ stateResourceTypesTransactionView state =
       stateResourceTypes state
     Just transaction ->
       insertCreatedResourceTypes
-        (stateTransactionResourcesCreate $ stateTransactionResourceTypes transaction) $
-        modifyUpdatedResourceTypes
-          (stateTransactionResourcesUpdate $ stateTransactionResourceTypes transaction) $
-          removeDeletedResourceTypes
-            (stateTransactionResourcesDelete $ stateTransactionResourceTypes transaction) $
-            stateResourceTypes state
+        (stateTransactionResourcesCreate $ stateTransactionResourceTypes transaction)
+        $ modifyUpdatedResourceTypes
+          (stateTransactionResourcesUpdate $ stateTransactionResourceTypes transaction)
+        $ removeDeletedResourceTypes
+          (stateTransactionResourcesDelete $ stateTransactionResourceTypes transaction)
+        $ stateResourceTypes state
   where
     insertCreatedResourceTypes ::
       Map String StateResourceType ->

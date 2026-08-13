@@ -413,6 +413,12 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       b <- mb
       if b then pure True else orIO mbs
 
+    andIO :: [IO Bool] -> IO Bool
+    andIO [] = pure True
+    andIO (mb : mbs) = do
+      b <- mb
+      if b then andIO mbs else pure False
+
     orElseIO :: [IO (Maybe a)] -> IO (Maybe a)
     orElseIO [] = pure Nothing
     orElseIO (mma : mmas) = do
@@ -529,14 +535,16 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           | otherwise = do
               liftIO $ IO.createDirectoryIfMissing False (xactResTyDir change)
               metadata <- extractMetadata resTyName config resName body
-              updateMetadata change resName metadata
-              liftIO $ xactWriteFile (xactResTyDir change) resName body
+              updateMetadata resName metadata
+              liftIO $ xactWriteFile resTyName resName body
 
-    updateMetadata :: Change -> String -> Metadata -> m ()
-    updateMetadata change resName metadata = do
-      let propertiesDir = xactResTyDir change </> propertiesPart resName
+    updateMetadata :: String -> Metadata -> m ()
+    updateMetadata resName metadata = do
       liftIO $ do
-        xactWriteFile propertiesDir "metadata" (LazyByteString.fromStrict $ metadataSource metadata)
+        xactWriteFile
+          (resTyName </> propertiesPart resName)
+          "metadata"
+          (LazyByteString.fromStrict $ metadataSource metadata)
 
     readResourceMetadataImpl :: String -> m (Maybe LazyByteString)
     readResourceMetadataImpl resName =
@@ -668,7 +676,10 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         liftIO $
           orIO
             [ doesFileExist $ xactResTyDir Delete </> resNameSrc
-            , fmap not . doesFileExist $ baseResTyDir </> resNameSrc
+            , andIO
+                [ fmap not . doesFileExist $ xactResTyDir Create </> resNameSrc
+                , fmap not . doesFileExist $ baseResTyDir </> resNameSrc
+                ]
             ]
       if srcRemoved
         then
@@ -685,7 +696,10 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         liftIO $
           orIO
             [ doesFileExist $ xactResTyDir Delete </> resNameSrc
-            , fmap not . doesFileExist $ baseResTyDir </> resNameSrc
+            , andIO
+                [ fmap not . doesFileExist $ xactResTyDir Create </> resNameSrc
+                , fmap not . doesFileExist $ baseResTyDir </> resNameSrc
+                ]
             ]
       if tgtRemoved
         then

@@ -1,12 +1,18 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 
 module Blog.Rules (rules) where
 
 import Blog
-  ( MetadataValue
+  ( MetadataType (..)
+  , MetadataValue (..)
   , ResourceId (..)
+  , cfgMetadata
+  , metaCfgOptional
+  , metaCfgType
   , metadataValueString
   , renderResourceId
   , resourceIdParser
@@ -14,28 +20,25 @@ import Blog
 import Blog.Build ((*<))
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..))
-import Blog.Error (sageErrorReport, templeTypeErrorReport, tomlResult)
-import Blog.Metadata
-  ( Path
-  , PathItem (..)
-  , metadataValueToTempleExpr
-  , parseResourceMetadata
-  , pathItem
-  , pathUncons
-  , renderPath
-  )
+import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport, tomlResult)
+import Blog.Metadata (parseResourceMetadata)
+import Blog.Store (Store)
 import qualified Blog.Store as Store
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
 import Control.Applicative ((<|>))
-import Control.Monad.Error.Class (throwError)
-import Control.Monad.Except (runExceptT)
+import Control.Monad (unless)
+import Control.Monad.Error.Class (MonadError, throwError, tryError)
+import Control.Monad.Except (ExceptT (..), mapExceptT, runExceptT)
 import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, tell)
+import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
-import Data.Foldable (for_)
-import Data.List (sortOn)
-import Data.Map (Map)
+import Data.Foldable (fold, for_)
+import Data.List (find, intercalate, sortOn)
+import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
 import Data.Maybe (fromMaybe)
 import Data.Set (Set)
@@ -44,6 +47,7 @@ import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
+import Data.Text.Lazy.Builder (Builder)
 import qualified Data.Text.Lazy.Builder as Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime (..))
@@ -69,88 +73,98 @@ rules =
       articleAdjacency
     <> Build.rule
       "article-html"
-      ( (,,,)
-          <$> Build.iResource "config" (Build.iMatch "base-url")
-          <*> Build.iResource "template" (Build.iMatch "article.html.temple")
+      ( (,,)
+          <$> Build.iResource "template" (Build.iMatch "article.html.temple")
           <*> Build.iResource "article" (Build.iBind "name")
           <*> Build.iResource "adjacency" (Build.iMatch "article-" <> Build.iBind "name")
       )
       (Build.oResource "html" $ Build.oMatch "article-" *< Build.oBind "name")
       articleHtml
 
+-- TODO: expose in `temple`?
+getRecordFields :: Temple.Type -> ([(Text, Temple.Type)], Maybe (Temple.Type))
+getRecordFields Temple.TRowEnd =
+  ([], Nothing)
+getRecordFields ty'@Temple.TMeta{} =
+  ([], pure ty')
+getRecordFields ty'@Temple.TVar{} =
+  ([], pure ty')
+getRecordFields (Temple.TRecordField name ty' rest) =
+  first ((name, ty') :) $ getRecordFields rest
+getRecordFields ty' =
+  error $ "unexpected type in record:" ++ show ty'
+
 templateDependency ::
-  Monad m =>
+  forall m.
+  MonadIO m =>
   Build.ResourceInput m ->
   () ->
   Build.ActionT m ()
-templateDependency template () = do
-  let location = "(" ++ renderResourceId (Build.resourceInputId template) ++ ")"
+templateDependency iTemplate () = do
+  let location = "(" ++ renderResourceId (Build.resourceInputId iTemplate) ++ ")"
   template' <-
-    case Temple.parse (LazyByteString.toStrict $ Build.resourceInputContent template) of
+    case Temple.parse (LazyByteString.toStrict $ Build.resourceInputContent iTemplate) of
       Left err ->
         throwError $
           DiagnosticReports
             (fromString location)
-            (Build.resourceInputContent template)
+            (Build.resourceInputContent iTemplate)
             (sageErrorReport err)
       Right x -> pure x
-  let templateDependencies = getTemplateDependencies template'
-  Build.setDependencies (Build.resourceInputId template) templateDependencies
 
-getTemplateDependencies :: Temple.Template loc -> Set ResourceId
-getTemplateDependencies template =
-  case template of
-    Temple.TemplateBase parts ->
-      foldMap partDependencies parts
-    Temple.TemplateChild parent pragmas ->
-      let Temple.TemplateRef templateName = Temple.locatedVal parent
-      in Set.insert (ResourceId "template" templateName) $ foldMap pragmaDependencies pragmas
-  where
-    partDependencies :: Temple.Part loc -> Set ResourceId
-    partDependencies part =
-      case part of
-        Temple.PartText{} -> mempty
-        Temple.PartExpr expr -> exprDependencies $ Temple.locatedVal expr
-        Temple.PartExprStream expr -> exprDependencies $ Temple.locatedVal expr
-        Temple.PartInclude target bindings ->
-          let Temple.TemplateRef templateName = Temple.locatedVal target
-          in Set.insert (ResourceId "template" templateName) $
-               (foldMap . foldMap) (\(_name, expr) -> exprDependencies $ Temple.locatedVal expr) bindings
+  let
+    templateResourceType = resourceType $ Build.resourceInputId iTemplate
 
-    pragmaDependencies :: Temple.Pragma loc -> Set ResourceId
-    pragmaDependencies pragma =
-      case pragma of
-        Temple.PragmaBlock _name parts ->
-          foldMap partDependencies parts
-        Temple.PragmaWith bindings ->
-          foldMap (\(_name, expr) -> exprDependencies $ Temple.locatedVal expr) bindings
+  let
+    renderTemplateRef (Temple.TemplateRef name) =
+      "(" ++ renderResourceId (ResourceId templateResourceType name) ++ ")"
 
-    exprDependencies :: Temple.Expr loc -> Set ResourceId
-    exprDependencies expr =
-      case expr of
-        Temple.Var{} -> mempty
-        Temple.Bool{} -> mempty
-        Temple.String parts -> foldMap partDependencies parts
-        Temple.MultilineString parts -> foldMap partDependencies parts
-        Temple.Call _name args -> foldMap (exprDependencies . Temple.locatedVal) args
-        Temple.Record fields -> (foldMap . foldMap) (exprDependencies . Temple.locatedVal) fields
-        Temple.Field expr' field ->
-          exprDependencies (Temple.locatedVal expr')
-            <> case field of
-              Temple.FStatic{} -> mempty
-              Temple.FDynamic expr'' -> exprDependencies $ Temple.locatedVal expr''
-        Temple.Constructor _name args -> foldMap (exprDependencies . Temple.locatedVal) args
-        Temple.Match expr' branches ->
-          exprDependencies (Temple.locatedVal expr')
-            <> foldMap (\(Temple.Branch _pattern body) -> exprDependencies $ Temple.locatedVal body) branches
-        Temple.IfThenElse cond th el ->
-          exprDependencies (Temple.locatedVal cond)
-            <> exprDependencies (Temple.locatedVal th)
-            <> exprDependencies (Temple.locatedVal el)
-        Temple.Array items -> foldMap (exprDependencies . Temple.locatedVal) items
-        Temple.For _name items yield ->
-          exprDependencies (Temple.locatedVal items)
-            <> exprDependencies (Temple.locatedVal yield)
+    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
+    readTemplateRef (Temple.TemplateRef name) =
+      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+    getTemplateRef (Temple.TemplateRef name) =
+      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
+        <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+  let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+  (deps, bindings) <- do
+    result <- runExceptT $ Temple.inferBindings readTemplateRef ref template'
+    case result of
+      Right x -> pure x
+      Left err -> do
+        throwError
+          =<< DiagnosticReports
+            (fromString location)
+            (Build.resourceInputContent iTemplate)
+            <$> templeTypeErrorReport renderTemplateRef getTemplateRef err
+
+  {-
+  If a template statically depends on some resources, then we check that
+  those resources exist when the template is uploaded. These resources are
+  also registered as dependencies of the template.
+  -}
+  store <- Build.askStore
+  xactId <- Build.askTransactionId
+  mResources <-
+    for (find ((fromString "resource" ==) . Temple.bindingName) bindings) $ \binding -> do
+      let (bindingRef, _bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
+      (result, resources) <- runWriterT . runExceptT $ do
+        let path = pure $ Temple.bindingName binding
+        let readTemplateRef' = lift . lift . readTemplateRef
+        result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' bindingRef) Temple.emptyInferState $ do
+          ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+          resourceTypeProvider store xactId path ty
+        either (throwError . TypeError path) pure result
+      case result of
+        Right (_state, _value) -> pure resources
+        Left err -> throwError $ typeProviderErrorDiagnostic (Build.resourceInputId iTemplate) err
+
+  let
+    templateDependencies =
+      Set.map (\(Temple.TemplateRef r) -> ResourceId "template" r) (Map.keysSet deps)
+        <> fold mResources
+  Build.setDependencies (Build.resourceInputId iTemplate) templateDependencies
 
 articleAdjacency ::
   Monad m =>
@@ -241,22 +255,268 @@ makeAdjacencies xs =
           [] -> [Adjacency (Just current) next Nothing]
           next' : rest' -> go current next next' rest'
 
+mkOptional :: Temple.Type -> Temple.Type
+mkOptional t =
+  Temple.TSum $
+    Temple.TSumConstructor (fromString "Some") [t] $
+      Temple.TSumConstructor (fromString "None") [] $
+        Temple.TRowEnd
+
+mkRecord :: [(String, Temple.Type)] -> Temple.Type
+mkRecord = Temple.TRecord . foldr (\(name, ty) -> Temple.TRecordField (fromString name) ty) Temple.TRowEnd
+
+metaToTempleTy :: MetadataType -> Temple.Type
+metaToTempleTy TBool = Temple.TBool
+metaToTempleTy TString = Temple.TString
+metaToTempleTy (TList t) = Temple.TStream (metaToTempleTy t)
+
+metaToTempleValue :: MetadataValue -> Temple.Value
+metaToTempleValue (VString s) =
+  Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict s
+metaToTempleValue VTrue =
+  Temple.VTrue
+metaToTempleValue VFalse =
+  Temple.VFalse
+metaToTempleValue (VList xs) =
+  Temple.VStream (fmap metaToTempleValue xs)
+metaToTempleValue (VConstructor name args) =
+  Temple.VConstructor name (fmap metaToTempleValue args)
+
+type TypeProvider m =
+  [Text] -> Temple.Type -> Temple.InferT () (ExceptT TypeProviderError m) Temple.Value
+
+data TypeProviderError
+  = ExpectedRecord ![Text] !Temple.Type
+  | NotFound ![Text] !Text
+  | TypeError ![Text] (Temple.TypeError ())
+
+typeProviderErrorDiagnostic :: ResourceId -> TypeProviderError -> DiagnosticReports
+typeProviderErrorDiagnostic resId err =
+  -- TODO: point to the location in the template?
+  case err of
+    ExpectedRecord path ty ->
+      DiagnosticSimple $
+        renderTemplateId resId
+          ++ renderTypeProviderPath path
+          ++ "expected a record, got "
+          ++ Temple.renderType ty
+    NotFound path field ->
+      DiagnosticSimple $
+        renderTemplateId resId
+          ++ renderTypeProviderPath path
+          ++ "missing field '"
+          ++ Text.unpack field
+          ++ "'"
+    TypeError path err' ->
+      DiagnosticSimple $
+        renderTemplateId resId ++ renderTypeProviderPath path ++ templeTypeErrorMessage err'
+  where
+    renderTypeProviderPath [] = ""
+    renderTypeProviderPath xs@(_ : _) = intercalate "." (fmap Text.unpack xs) ++ ": "
+
+    renderTemplateId templateId = "(" ++ renderResourceId templateId ++ "): "
+
+requireRecord ::
+  MonadError TypeProviderError m =>
+  -- | Path to type
+  [Text] ->
+  -- | Type to examine
+  Temple.Type ->
+  -- | Record fields, record tail
+  m ([(Text, Temple.Type)], Maybe Temple.Type)
+requireRecord path ty =
+  case ty of
+    Temple.TRecord fields -> do
+      pure $ getRecordFields fields
+    _ ->
+      throwError $ ExpectedRecord path ty
+
+forRecord ::
+  MonadError TypeProviderError m =>
+  -- | Path
+  [Text] ->
+  -- | Record to process
+  Temple.Type ->
+  {-| How to process each record field
+
+  Arguments:
+
+  * Path
+  * Field name
+  * Field type
+  -}
+  ([Text] -> Text -> Temple.Type -> Temple.InferT loc m Temple.Value) ->
+  Temple.InferT loc m Temple.Value
+forRecord path ty f = do
+  (fields, _rest) <- lift $ requireRecord path ty
+  fmap (Temple.VRecord . Map.fromList) . for fields $ \(name, ty') -> do
+    value <- f (path <> pure name) name ty'
+    pure (name, value)
+
+unifyPropertyType ::
+  Monad m =>
+  -- | Path to type
+  [Text] ->
+  -- | Expected
+  Temple.Type ->
+  -- | Actual
+  Temple.Type ->
+  Temple.InferT () (ExceptT TypeProviderError m) ()
+unifyPropertyType path a b = do
+  result <- tryError $ Temple.unify () a b
+  case result of
+    Left err -> lift . throwError $ TypeError path err
+    Right x -> pure x
+
+resourceTypeProvider ::
+  MonadError DiagnosticReports m =>
+  Store m ->
+  Store.TransactionId ->
+  TypeProvider (WriterT (Set ResourceId) m)
+resourceTypeProvider store xactId path resourceTypesTy = do
+  forRecord path resourceTypesTy $ \path' resTyName resourcesTy -> do
+    mResTy <- lift . lift . lift . Store.lookupResourceType store xactId $ Text.unpack resTyName
+    resTy <- maybe (lift . throwError $ NotFound path resTyName) pure mResTy
+
+    forRecord path' resourcesTy $ \path'' resName propertiesTy -> do
+      exists <- lift . lift . lift . Store.doesResourceExist resTy $ Text.unpack resName
+      unless exists . lift . throwError $ NotFound (path <> pure resTyName) resName
+
+      lift . lift . tell . Set.singleton $ ResourceId (Text.unpack resTyName) (Text.unpack resName)
+
+      propertiesTypeProvider
+        (Store.hoistResourceType lift resTy)
+        resName
+        defaultPropertyTypeProvider
+        path''
+        propertiesTy
+
+propertiesTypeProvider ::
+  MonadError DiagnosticReports m =>
+  Store.ResourceType m ->
+  -- | Resource name
+  Text ->
+  (Store.ResourceType m -> Text -> Text -> Maybe (TypeProvider m)) ->
+  TypeProvider m
+propertiesTypeProvider resTy resName propProviders path selfTy = do
+  forRecord path selfTy $ \path' propName propTy ->
+    case propProviders resTy resName propName of
+      Just propProvider ->
+        propProvider (path' <> pure propName) propTy
+      Nothing ->
+        lift . throwError $ NotFound path' propName
+
+defaultPropertyTypeProvider ::
+  MonadError DiagnosticReports m =>
+  Store.ResourceType m ->
+  -- | Resource name
+  Text ->
+  -- | Property name
+  Text ->
+  Maybe (TypeProvider m)
+defaultPropertyTypeProvider resTy resName propName
+  | propName == fromString "metadata" =
+      Just $
+        \path propTy -> do
+          unifyPropertyType path propTy metadataTy
+
+          metadata <- do
+            mMetadata <- lift . lift . Store.readResourceMetadata resTy $ Text.unpack resName
+            case mMetadata of
+              Nothing ->
+                pure mempty
+              Just content ->
+                lift . lift $
+                  parseResourceMetadata
+                    (Store.resourceTypeConfig resTy)
+                    (Store.resourceTypeName resTy)
+                    (Text.unpack resName)
+                    content
+          pure $! Temple.VRecord (fmap metaToTempleValue metadata)
+  | propName == fromString "content" =
+      Just $
+        \_path _propTy -> do
+          let _contentTy = Temple.TString
+
+          -- `content` is always a string.
+          -- unifyPropertyType path propTy contentTy
+
+          mContent <- lift . lift . Store.readResource resTy $ Text.unpack resName
+          case mContent of
+            Nothing ->
+              pure $ Temple.VString mempty
+            Just content ->
+              pure $ Temple.VString content
+  | otherwise =
+      Nothing
+  where
+    metadataTy =
+      Temple.TRecord $
+        foldr
+          ( \(metaName, metaCfg) ->
+              Temple.TRecordField metaName $
+                if metaCfgOptional metaCfg
+                  then mkOptional . metaToTempleTy $ metaCfgType metaCfg
+                  else metaToTempleTy $ metaCfgType metaCfg
+          )
+          Temple.TRowEnd
+          (Map.toList . cfgMetadata $ Store.resourceTypeConfig resTy)
+
+articlePropertyTypeProvider ::
+  MonadError DiagnosticReports m =>
+  -- | Previous
+  Maybe [(Text, MetadataValue)] ->
+  -- | Next
+  Maybe [(Text, MetadataValue)] ->
+  -- | Rendered article content
+  Builder ->
+  -- | Property name
+  Text ->
+  Maybe (TypeProvider m)
+articlePropertyTypeProvider mPrev mNext content propName
+  | propName == fromString "previous" =
+      Just $
+        \path propTy -> do
+          unifyPropertyType path propTy $
+            mkOptional (mkRecord [("title", Temple.TString), ("url", Temple.TString)])
+
+          case mPrev of
+            Nothing ->
+              pure $ Temple.VConstructor (fromString "None") []
+            Just prev ->
+              -- TODO: guarantee that these values have the correct type
+              pure . Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue prev
+  | propName == fromString "next" =
+      Just $
+        \path propTy -> do
+          unifyPropertyType path propTy $
+            mkOptional (mkRecord [("title", Temple.TString), ("url", Temple.TString)])
+
+          case mNext of
+            Nothing ->
+              pure $ Temple.VConstructor (fromString "None") []
+            Just next ->
+              -- TODO: guarantee that these values have the correct type
+              pure . Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue next
+  | propName == fromString "content" =
+      Just $
+        \_path _propTy -> do
+          let _contentTy = Temple.TString
+
+          -- `content` is always a string.
+          -- unifyPropertyType path propTy contentTy
+
+          pure . Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ Builder.toLazyText content
+  | otherwise =
+      Nothing
+
 articleHtml ::
   forall m.
   MonadIO m =>
-  (Build.ResourceInput m, Build.ResourceInput m, Build.ResourceInput m, Build.ResourceInput m) ->
+  (Build.ResourceInput m, Build.ResourceInput m, Build.ResourceInput m) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
-articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
-  -- TODO: process baseUrl and template only once
-  -- TODO: push article/adjacency name matching into rule dependencies
-  let
-    baseUrl' =
-      LazyText.toStrict
-        . LazyText.strip
-        . Text.Lazy.Encoding.decodeUtf8
-        $ Build.resourceInputContent iBaseUrl
-
+articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
   let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
 
   let
@@ -346,128 +606,57 @@ articleHtml (iBaseUrl, iTemplate, iArticle, iAdjacency) oHtml = do
 
     pure (prev', next')
 
-  let
-    adjacencyExpr :: Path -> Maybe [(Text, MetadataValue)] -> Temple.LExpr Path
-    adjacencyExpr path adj =
-      Temple.Located path $
-        case adj of
-          Nothing ->
-            Temple.Constructor (fromString "None") []
-          Just fields ->
-            let path' = path <> pathItem (ConstructorArg (fromString "Some") 0)
-            in Temple.Constructor
-                 (fromString "Some")
-                 [ Temple.Located path' $
-                     Temple.Record $
-                       fmap
-                         ( \(key, value) ->
-                             let path'' = path' <> pathItem (RecordField key)
-                             in ( key
-                                , Temple.Located path'' $ metadataValueToTempleExpr path'' value
-                                )
-                         )
-                         fields
-                 ]
-
-    exprs :: Map Text (Temple.LExpr Path)
-    exprs =
-      let
-        path = mempty
-      in
-        Map.fromList
-          [
-            ( fromString "root"
-            , let path' = path <> pathItem (RecordField $ fromString "root")
-              in Temple.Located path' $
-                   Temple.String [Temple.PartText baseUrl']
-            )
-          ,
-            ( fromString "self"
-            , let path' = path <> pathItem (RecordField $ fromString "self")
-              in Temple.Located path' $
-                   Temple.Record
-                     [
-                       ( fromString "metadata"
-                       , let path'' = path' <> pathItem (RecordField $ fromString "metadata")
-                         in Temple.Located path''
-                              . Temple.Record
-                              . fmap
-                                ( \(key, value) ->
-                                    let path''' = path'' <> pathItem (RecordField key)
-                                    in (key, Temple.Located path''' $ metadataValueToTempleExpr path''' value)
-                                )
-                              . Map.toList
-                              $ Build.resourceInputMetadata iArticle
-                       )
-                     ,
-                       ( fromString "content"
-                       , let path'' = path' <> pathItem (RecordField $ fromString "content")
-                         in Temple.Located path'' $
-                              Temple.String [Temple.PartText . LazyText.toStrict $ Builder.toLazyText html]
-                       )
-                     ,
-                       ( fromString "previous"
-                       , let path'' = path' <> pathItem (RecordField $ fromString "previous")
-                         in adjacencyExpr path'' prev
-                       )
-                     ,
-                       ( fromString "next"
-                       , let path'' = path' <> pathItem (RecordField $ fromString "next")
-                         in adjacencyExpr path'' next
-                       )
-                     ]
-            )
-          ]
-
   bindings' <- for bindings $ \binding -> do
     let name = Temple.bindingName binding
     let tyScheme = Temple.bindingScheme binding
-    expr <-
-      case Map.lookup name exprs of
-        Nothing ->
-          throwError . DiagnosticSimple $
-            renderResourceId (Build.resourceInputId iTemplate)
-              ++ " has unsatisfied template parameter "
-              ++ Text.unpack name
-              ++ " : "
-              ++ Temple.renderTypeScheme tyScheme
-        Just x ->
-          pure x
 
+    let path = []
     result <-
-      Temple.runInferT
-        (Temple.emptyInferEnv readTemplateRef $ Temple.TemplateRef ".")
-        Temple.emptyInferState
-        $ do
-          ty <- Temple.instantiateTypeScheme tyScheme
-          Temple.checkExpr Temple.checkPartIncludeDisabled expr ty
+      runExceptT $
+        case Text.unpack name of
+          "resource" -> do
+            store <- lift Build.askStore
+            xactId <- lift Build.askTransactionId
 
-    case result of
-      Left err ->
-        case pathUncons $ Temple.typeErrorLoc err of
-          Just (RecordField field, rest) | field == fromString "self" ->
-            throwError . DiagnosticSimple $
-              case err of
-                Temple.MissingFields _ fields ->
-                  unlines $
-                    (renderResourceId (Build.resourceInputId iArticle) ++ " is missing fields:")
-                      : fmap (\(field', ty') -> "  " ++ Text.unpack field' ++ " : " ++ Temple.renderType ty') fields
-                Temple.TypeMismatch _ expected actual ->
-                  unlines
-                    [ renderResourceId (Build.resourceInputId iArticle)
-                        ++ " has a type error in "
-                        ++ renderPath rest
-                        ++ ":"
-                    , "  expected " ++ Temple.renderType expected ++ ", got " ++ Temple.renderType actual
-                    ]
-                _ ->
-                  error $ "type error (TODO): " ++ show err
+            (a, _deps) <- do
+              let
+                f :: (Either e a, w) -> Either e (a, w)
+                f (ea, w) = (,w) <$> ea
+
+              mapExceptT (fmap f . runWriterT) $ do
+                let readTemplateRef' = lift . lift . readTemplateRef
+                let currentTemplate = Temple.TemplateRef "."
+                let path' = pure $ Temple.bindingName binding
+                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                  ty <- Temple.instantiateTypeScheme tyScheme
+                  resourceTypeProvider store xactId path' ty
+                either (throwError . TypeError path') pure result
+
+            pure a
+          "self" -> do
+            let readTemplateRef' = lift . readTemplateRef
+            let currentTemplate = Temple.TemplateRef "."
+            let path' = pure $ Temple.bindingName binding
+            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+              ty <- Temple.instantiateTypeScheme tyScheme
+              propertiesTypeProvider
+                (Build.resourceInputType iArticle)
+                (fromString . resourceName $ Build.resourceInputId iArticle)
+                ( \resTy' resName' propName' ->
+                    articlePropertyTypeProvider prev next html propName'
+                      <|> defaultPropertyTypeProvider resTy' resName' propName'
+                )
+                path'
+                ty
+            either (throwError . TypeError path') pure result
           _ ->
-            error $ "type error (TODO): " ++ show err
-      Right (_s, ()) -> do
-        let env = Temple.defaultEvalEnv inputTemplateRef mempty
-        let !value = Temple.evalExpr env $ Temple.locatedVal expr
-        pure (name, value)
+            throwError . NotFound path $ Temple.bindingName binding
+    value <-
+      case result of
+        Right (_state, value) -> pure value
+        Left err -> throwError $ typeProviderErrorDiagnostic (Build.resourceInputId iTemplate) err
+
+    pure (name, value)
 
   let
     env = Temple.defaultEvalEnv (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate) deps

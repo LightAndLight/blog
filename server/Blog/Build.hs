@@ -748,8 +748,9 @@ evalRules ::
   m [Change]
 evalRules fTrace store transactionId (Rules rs) resId = do
   execWriterT . flip evalStateT mempty $ do
-    resTy <- Store.getResourceType (hoistStore (lift . lift) store) transactionId $ resourceType resId
-    dependents <- Store.listDependents resTy $ resourceName resId
+    dependents <- lift . lift $ do
+      resTy <- Store.getResourceType store transactionId $ resourceType resId
+      Store.listDependents resTy $ resourceName resId
     modify $ (Set.fromList dependents <>) . Set.insert resId
     go
   where
