@@ -288,7 +288,10 @@ type TypeProvider m =
 
 data TypeProviderError
   = ExpectedRecord ![Text] !Temple.Type
-  | NotFound ![Text] !Text
+  | ParameterNotFound ![Text] !Text
+  | ResourceTypeNotFound ![Text] !Text
+  | ResourceNotFound ![Text] !Text
+  | PropertyNotFound ![Text] !Text
   | TypeError ![Text] (Temple.TypeError ())
 
 typeProviderErrorDiagnostic :: ResourceId -> TypeProviderError -> DiagnosticReports
@@ -301,11 +304,32 @@ typeProviderErrorDiagnostic resId err =
           ++ renderTypeProviderPath path
           ++ "expected a record, got "
           ++ Temple.renderType ty
-    NotFound path field ->
+    ParameterNotFound path field ->
       DiagnosticSimple $
         renderTemplateId resId
           ++ renderTypeProviderPath path
-          ++ "missing field '"
+          ++ "not in scope '"
+          ++ Text.unpack field
+          ++ "'"
+    ResourceTypeNotFound path field ->
+      DiagnosticSimple $
+        renderTemplateId resId
+          ++ renderTypeProviderPath path
+          ++ "missing resource type '"
+          ++ Text.unpack field
+          ++ "'"
+    ResourceNotFound path field ->
+      DiagnosticSimple $
+        renderTemplateId resId
+          ++ renderTypeProviderPath path
+          ++ "missing resource '"
+          ++ Text.unpack field
+          ++ "'"
+    PropertyNotFound path field ->
+      DiagnosticSimple $
+        renderTemplateId resId
+          ++ renderTypeProviderPath path
+          ++ "missing property '"
           ++ Text.unpack field
           ++ "'"
     TypeError path err' ->
@@ -377,11 +401,11 @@ resourceTypeProvider ::
 resourceTypeProvider store xactId path resourceTypesTy = do
   forRecord path resourceTypesTy $ \path' resTyName resourcesTy -> do
     mResTy <- lift . lift . lift . Store.lookupResourceType store xactId $ Text.unpack resTyName
-    resTy <- maybe (lift . throwError $ NotFound path resTyName) pure mResTy
+    resTy <- maybe (lift . throwError $ ResourceTypeNotFound path resTyName) pure mResTy
 
     forRecord path' resourcesTy $ \path'' resName propertiesTy -> do
       exists <- lift . lift . lift . Store.doesResourceExist resTy $ Text.unpack resName
-      unless exists . lift . throwError $ NotFound (path <> pure resTyName) resName
+      unless exists . lift . throwError $ ResourceNotFound path' resName
 
       lift . lift . tell . Set.singleton $ ResourceId (Text.unpack resTyName) (Text.unpack resName)
 
@@ -410,7 +434,7 @@ propertiesTypeProvider resTy resName propProviders path selfTy = do
       Just propProvider ->
         propProvider path' propTy
       Nothing ->
-        lift . throwError $ NotFound path propName
+        lift . throwError $ PropertyNotFound path propName
 
 defaultPropertyTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -746,7 +770,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
                 ty
             either (throwError . TypeError path') pure result
           _ ->
-            throwError . NotFound path $ Temple.bindingName binding
+            throwError . ParameterNotFound path $ Temple.bindingName binding
     value <-
       case result of
         Right (_state, value) -> pure value
