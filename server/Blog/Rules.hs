@@ -32,15 +32,16 @@ import Control.Monad.Error.Class (MonadError, throwError, tryError)
 import Control.Monad.Except (ExceptT (..), mapExceptT, runExceptT)
 import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, tell)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
-import Data.Foldable (fold, for_)
+import Data.Foldable (fold, foldrM, for_)
 import Data.List (find, intercalate, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromJust, fromMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
@@ -387,7 +388,11 @@ resourceTypeProvider store xactId path resourceTypesTy = do
       propertiesTypeProvider
         (Store.hoistResourceType lift resTy)
         resName
-        defaultPropertyTypeProvider
+        ( \resTy' resName' propName' ->
+            runMaybeT $
+              MaybeT (defaultPropertyTypeProvider resTy' resName' propName')
+                <|> MaybeT (lookupPropertyTypeProvider resTy' resName' propName')
+        )
         path''
         propertiesTy
 
@@ -396,15 +401,16 @@ propertiesTypeProvider ::
   Store.ResourceType m ->
   -- | Resource name
   Text ->
-  (Store.ResourceType m -> Text -> Text -> Maybe (TypeProvider m)) ->
+  (Store.ResourceType m -> Text -> Text -> m (Maybe (TypeProvider m))) ->
   TypeProvider m
 propertiesTypeProvider resTy resName propProviders path selfTy = do
-  forRecord path selfTy $ \path' propName propTy ->
-    case propProviders resTy resName propName of
+  forRecord path selfTy $ \path' propName propTy -> do
+    mPropProvider <- lift . lift $ propProviders resTy resName propName
+    case mPropProvider of
       Just propProvider ->
-        propProvider (path' <> pure propName) propTy
+        propProvider path' propTy
       Nothing ->
-        lift . throwError $ NotFound path' propName
+        lift . throwError $ NotFound path propName
 
 defaultPropertyTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -413,10 +419,10 @@ defaultPropertyTypeProvider ::
   Text ->
   -- | Property name
   Text ->
-  Maybe (TypeProvider m)
+  m (Maybe (TypeProvider m))
 defaultPropertyTypeProvider resTy resName propName
   | propName == fromString "metadata" =
-      Just $
+      pure . Just $
         \path propTy -> do
           unifyPropertyType path propTy metadataTy
 
@@ -434,7 +440,7 @@ defaultPropertyTypeProvider resTy resName propName
                     content
           pure $! Temple.VRecord (fmap metaToTempleValue metadata)
   | propName == fromString "content" =
-      Just $
+      pure . Just $
         \_path _propTy -> do
           let _contentTy = Temple.TString
 
@@ -448,7 +454,7 @@ defaultPropertyTypeProvider resTy resName propName
             Just content ->
               pure $ Temple.VString content
   | otherwise =
-      Nothing
+      pure Nothing
   where
     metadataTy =
       Temple.TRecord $
@@ -462,6 +468,94 @@ defaultPropertyTypeProvider resTy resName propName
           Temple.TRowEnd
           (Map.toList . cfgMetadata $ Store.resourceTypeConfig resTy)
 
+lookupPropertyTypeProvider ::
+  MonadError DiagnosticReports m =>
+  Store.ResourceType m ->
+  -- | Resource name
+  Text ->
+  -- | Property name
+  Text ->
+  m (Maybe (TypeProvider m))
+lookupPropertyTypeProvider resTy resName propName = do
+  mValue <- Store.lookupProperty resTy (Text.unpack resName) (Text.unpack propName)
+  case mValue of
+    Nothing -> pure Nothing
+    Just value -> do
+      {- GRIPE: I don't like that I have to generalise and then
+      instantiate
+      here, but it's the best I can do right now.
+
+      Some unsatisfactory alternatives:
+
+      \* Infer `actualTy` here without generalising and allow any contained metas
+        to escape. Somehow ensure that the metas are in scope within the type
+        provider.
+
+      \* Move the inference of `actualTy` into the type provider. Doesn't work
+        because the type provider works with `Temple.TypeError ()`, but the
+        inference of `actualTy` works with `Temple.TypeError Temple.Offset`.
+      -}
+      actualTyScheme <- do
+        result <-
+          Temple.runInferT
+            (Temple.emptyInferEnv (const undefined) (Temple.TemplateRef "."))
+            Temple.emptyInferState
+            (Temple.generaliseType <$> inferTomlValueType value)
+        case result of
+          Right (_state, ty) -> pure ty
+          Left err -> do
+            let resId = ResourceId (Store.resourceTypeName resTy) (Text.unpack resName)
+            content <- fromJust <$> Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
+            throwError
+              . DiagnosticReports
+                (fromString $ "(" ++ renderResourceId resId ++ ")")
+                content
+              =<< templeTypeErrorReport (const undefined) (const undefined) err
+
+      pure . Just $ \path propTy -> do
+        actualTy <- Temple.instantiateTypeScheme actualTyScheme
+        unifyPropertyType path propTy actualTy
+
+        metadata <- do
+          mMetadata <- lift . lift . Store.readResourceMetadata resTy $ Text.unpack resName
+          case mMetadata of
+            Nothing ->
+              pure mempty
+            Just content ->
+              lift . lift $
+                parseResourceMetadata
+                  (Store.resourceTypeConfig resTy)
+                  (Store.resourceTypeName resTy)
+                  (Text.unpack resName)
+                  content
+        pure $! Temple.VRecord (fmap metaToTempleValue metadata)
+
+inferTomlValueType :: Monad m => Toml.TomlValue -> Temple.InferT Temple.Offset m Temple.Type
+inferTomlValueType Toml.VTrue =
+  pure Temple.TBool
+inferTomlValueType Toml.VFalse =
+  pure Temple.TBool
+inferTomlValueType Toml.VString{} =
+  pure Temple.TString
+inferTomlValueType Toml.VInt{} =
+  error "TODO: support TOML integers"
+inferTomlValueType (Toml.VArray items) = do
+  itemTy <- Temple.metavar Temple.KType
+  for_ items $ \item -> do
+    itemTy' <- inferTomlValueType $ Toml.locatedValue item
+    Temple.unify (Temple.Offset $ Toml.locatedOffset item) itemTy itemTy'
+  pure $ Temple.TStream itemTy
+inferTomlValueType (Toml.VRecord fields) =
+  Temple.TRecord
+    <$> foldrM
+      ( \(name, ty) rest ->
+          Temple.TRecordField (Toml.locatedValue name)
+            <$> inferTomlValueType (Toml.locatedValue ty)
+            <*> pure rest
+      )
+      Temple.TRowEnd
+      fields
+
 articlePropertyTypeProvider ::
   MonadError DiagnosticReports m =>
   -- | Previous
@@ -472,10 +566,10 @@ articlePropertyTypeProvider ::
   Builder ->
   -- | Property name
   Text ->
-  Maybe (TypeProvider m)
+  m (Maybe (TypeProvider m))
 articlePropertyTypeProvider mPrev mNext content propName
   | propName == fromString "previous" =
-      Just $
+      pure . Just $
         \path propTy -> do
           unifyPropertyType path propTy $
             mkOptional (mkRecord [("title", Temple.TString), ("url", Temple.TString)])
@@ -487,7 +581,7 @@ articlePropertyTypeProvider mPrev mNext content propName
               -- TODO: guarantee that these values have the correct type
               pure . Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue prev
   | propName == fromString "next" =
-      Just $
+      pure . Just $
         \path propTy -> do
           unifyPropertyType path propTy $
             mkOptional (mkRecord [("title", Temple.TString), ("url", Temple.TString)])
@@ -499,7 +593,7 @@ articlePropertyTypeProvider mPrev mNext content propName
               -- TODO: guarantee that these values have the correct type
               pure . Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue next
   | propName == fromString "content" =
-      Just $
+      pure . Just $
         \_path _propTy -> do
           let _contentTy = Temple.TString
 
@@ -508,7 +602,7 @@ articlePropertyTypeProvider mPrev mNext content propName
 
           pure . Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ Builder.toLazyText content
   | otherwise =
-      Nothing
+      pure Nothing
 
 articleHtml ::
   forall m.
@@ -643,8 +737,10 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
                 (Build.resourceInputType iArticle)
                 (fromString . resourceName $ Build.resourceInputId iArticle)
                 ( \resTy' resName' propName' ->
-                    articlePropertyTypeProvider prev next html propName'
-                      <|> defaultPropertyTypeProvider resTy' resName' propName'
+                    runMaybeT $
+                      MaybeT (articlePropertyTypeProvider prev next html propName')
+                        <|> MaybeT (defaultPropertyTypeProvider resTy' resName' propName')
+                        <|> MaybeT (lookupPropertyTypeProvider resTy' resName' propName')
                 )
                 path'
                 ty

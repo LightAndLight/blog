@@ -249,7 +249,7 @@ app cli request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                propNames <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+                (propNames, changes) <- handleExceptT . withTransaction store mXactId $ \xactId -> do
                   body <- liftIO $ Wai.consumeRequestBodyLazy request
                   Toml.Toml (Toml.Located _offset properties) nonKeys <-
                     case Toml.parse $ LazyByteString.toStrict body of
@@ -266,14 +266,22 @@ app cli request respond = do
                     "TODO: non-key-value properties: " ++ show nonKeys
 
                   resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-                  for properties $ \(name, Toml.TomlKeyEntry _offset (Toml.Located _offset' value)) -> do
-                    Store.setProperty resTy (Text.unpack resName) (Text.unpack name) value
+                  let resId = ResourceId (Text.unpack resTyName) (Text.unpack resName)
+                  names <- for properties $ \(name, Toml.TomlKeyEntry _offset (Toml.Located _offset' value)) -> do
+                    Store.setProperty resTy (resourceName resId) (Text.unpack name) value
                     pure name
+
+                  (,) names <$> Build.evalRules putStrLn store xactId Blog.Rules.rules resId
 
                 let
                   body =
                     fromString "updated properties:\n"
                       <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") propNames
+                      <> if null changes
+                        then mempty
+                        else
+                          fromString ("\nresource changes:\n")
+                            <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
                 pure $ Wai.responseLBS ok200 [] body
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       _ ->

@@ -91,6 +91,7 @@ executable blog-server
         http-types,
         mtl >=2.3.2,
         optparse-applicative,
+        sage,
         syb,
         temple,
         text >=2.0,

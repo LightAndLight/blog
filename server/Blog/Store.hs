@@ -34,7 +34,9 @@ module Blog.Store
   , doesResourceExist
   , readResource
   , writeResource
+  , lookupProperty
   , setProperty
+  , readProperty
   , listResource
   , readResourceMetadata
   , readResourceModificationTime
@@ -58,15 +60,15 @@ import Blog
   , resourceConfigDecoder
   )
 import Blog.Diagnostic (DiagnosticReports (..))
-import Blog.Error (tomlResult)
+import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (resourceMetadataDecoder)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
-import Control.Exception (catch, throwIO)
+import Control.Exception (throwIO)
 import Control.Monad (unless, when)
-import Control.Monad.Catch (ExitCase (..), MonadMask, generalBracket)
+import Control.Monad.Catch (ExitCase (..), MonadCatch, MonadMask, catch, generalBracket, throwM)
 import Control.Monad.Error.Class (MonadError, throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
@@ -99,6 +101,7 @@ import System.IO.Error (isDoesNotExistError)
 import Text.Pandoc.Builder (Blocks)
 import Text.Pandoc.Definition (Block (..))
 import Text.Pandoc.Walk (query)
+import qualified Text.Sage as Sage
 import qualified Toml
 
 data Store m
@@ -154,7 +157,7 @@ changePart Delete = ":delete"
 
 fromDirectory ::
   forall m.
-  (MonadError DiagnosticReports m, MonadIO m) =>
+  (MonadError DiagnosticReports m, MonadCatch m, MonadIO m) =>
   -- | Store directory
   FilePath ->
   IO (Store m)
@@ -368,6 +371,7 @@ data ResourceType m
   , doesResourceExistImpl :: !(String -> m Bool)
   , readResourceImpl :: !(String -> m (Maybe LazyByteString))
   , writeResourceImpl :: !(String -> LazyByteString -> m ())
+  , readPropertyImpl :: !(String -> String -> m (Maybe LazyByteString))
   , setPropertyImpl :: !(String -> String -> Toml.TomlValue -> m ())
   , listResourceImpl :: !(m [ResourceId])
   , readResourceMetadataImpl :: !(String -> m (Maybe LazyByteString))
@@ -379,25 +383,34 @@ data ResourceType m
   }
 
 hoistResourceType :: Functor m => (forall a. m a -> n a) -> ResourceType m -> ResourceType n
-hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13) =
+hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14) =
   ResourceType
     x1
     x2
     (fmap f x3)
     (fmap f x4)
     (fmap (fmap f) x5)
-    (fmap (fmap (fmap f)) x6)
-    (f x7)
-    (fmap f x8)
+    (fmap (fmap f) x6)
+    (fmap (fmap (fmap f)) x7)
+    (f x8)
     (fmap f x9)
     (fmap f x10)
     (fmap f x11)
-    (fmap (fmap f) x12)
+    (fmap f x12)
     (fmap (fmap f) x13)
+    (fmap (fmap f) x14)
+
+orElseM :: Monad m => [m (Maybe a)] -> m (Maybe a)
+orElseM [] = pure Nothing
+orElseM (mma : mmas) = do
+  ma <- mma
+  case ma of
+    Just{} -> pure ma
+    Nothing -> orElseM mmas
 
 resourceTypeFromDirectory ::
   forall m.
-  (MonadError DiagnosticReports m, MonadIO m) =>
+  (MonadError DiagnosticReports m, MonadCatch m, MonadIO m) =>
   -- | Store directory
   FilePath ->
   TransactionId ->
@@ -423,14 +436,6 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       b <- mb
       if b then andIO mbs else pure False
 
-    orElseIO :: [IO (Maybe a)] -> IO (Maybe a)
-    orElseIO [] = pure Nothing
-    orElseIO (mma : mmas) = do
-      ma <- mma
-      case ma of
-        Just{} -> pure ma
-        Nothing -> orElseIO mmas
-
     doesResourceExistImpl :: String -> m Bool
     doesResourceExistImpl resName =
       liftIO $ do
@@ -451,7 +456,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         if removed
           then pure Nothing
           else
-            orElseIO
+            orElseM
               [ doRead $ xactResTyDir Create </> resName
               , doRead $ xactResTyDir Update </> resName
               , doRead $ baseResTyDir </> resName
@@ -557,7 +562,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         if removed
           then pure Nothing
           else
-            orElseIO
+            orElseM
               [ doRead $ xactResTyDir Create </> propertiesPart resName </> "metadata"
               , doRead $ xactResTyDir Update </> propertiesPart resName </> "metadata"
               , doRead $ baseResTyDir </> propertiesPart resName </> "metadata"
@@ -566,6 +571,26 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         doRead path =
           fmap Just (IO.readFile path)
             `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
+
+    readPropertyImpl :: String -> String -> m (Maybe LazyByteString)
+    readPropertyImpl resName propName = do
+      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> propertiesPart resName </> propName
+      if removed
+        then pure Nothing
+        else
+          liftIO $
+            orElseM
+              [ doRead $ xactResTyDir Create </> propertiesPart resName </> propName
+              , doRead $ xactResTyDir Update </> propertiesPart resName </> propName
+              , doRead $ baseResTyDir </> propertiesPart resName </> propName
+              ]
+      where
+        doRead path =
+          fmap Just (IO.readFile path)
+            `catch` \(WithCallStack _cs err) ->
+              if isDoesNotExistError err
+                then pure Nothing
+                else throwM err
 
     setPropertyImpl :: String -> String -> Toml.TomlValue -> m ()
     setPropertyImpl resName key value = do
@@ -594,7 +619,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         if removed
           then pure Nothing
           else
-            orElseIO
+            orElseM
               [ doTime $ xactResTyDir Create </> resName
               , doTime $ xactResTyDir Update </> resName
               , doTime $ baseResTyDir </> resName
@@ -630,7 +655,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           then pure []
           else
             fromMaybe []
-              <$> orElseIO
+              <$> orElseM
                 [ doList $ xactResTyDir Create </> propertiesPart resName </> "dependencies"
                 , doList $ xactResTyDir Update </> propertiesPart resName </> "dependencies"
                 , doList $ baseResTyDir </> propertiesPart resName </> "dependencies"
@@ -649,7 +674,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           then pure []
           else
             fromMaybe []
-              <$> orElseIO
+              <$> orElseM
                 [ doList $ xactResTyDir Create </> propertiesPart resName </> "dependents"
                 , doList $ xactResTyDir Update </> propertiesPart resName </> "dependents"
                 , doList $ baseResTyDir </> propertiesPart resName </> "dependents"
@@ -757,6 +782,9 @@ readResource = readResourceImpl
 writeResource :: ResourceType m -> String -> LazyByteString -> m ()
 writeResource = writeResourceImpl
 
+readProperty :: ResourceType m -> String -> String -> m (Maybe LazyByteString)
+readProperty = readPropertyImpl
+
 setProperty :: ResourceType m -> String -> String -> Toml.TomlValue -> m ()
 setProperty = setPropertyImpl
 
@@ -786,6 +814,22 @@ createDependency = createDependencyImpl
 
 removeDependency :: ResourceType m -> String -> ResourceId -> m ()
 removeDependency = removeDependencyImpl
+
+lookupProperty ::
+  MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe Toml.TomlValue)
+lookupProperty resTy resName propName = do
+  mContent <- readProperty resTy resName propName
+  case mContent of
+    Nothing -> pure Nothing
+    Just content ->
+      case Sage.parse (Toml.valueParser Toml.TopLevel <* Sage.eof) (LazyByteString.toStrict content) of
+        Right x -> pure $ Just x
+        Left err ->
+          throwError $
+            DiagnosticReports
+              (fromString $ "(" ++ renderResourceId (ResourceId (resourceTypeName resTy) resName) ++ ")")
+              content
+              (sageErrorReport err)
 
 data Metadata
   = Metadata
