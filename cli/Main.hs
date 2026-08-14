@@ -1,7 +1,7 @@
 module Main (main) where
 
 import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
-import Control.Applicative (many, optional, (<**>))
+import Control.Applicative (many, optional, (<**>), (<|>))
 import Control.Exception (catch, finally, throwIO)
 import Control.Monad (when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
@@ -52,10 +52,15 @@ data Cli
   , cliCommand :: Command
   }
 
+data ViewTarget
+  = ViewMetadata
+  | ViewProperty String
+  | ViewContent
+
 data Command
   = View
-      -- | View metadata
-      Bool
+      -- | What to view
+      ViewTarget
       -- | ID of resource to view
       String
   | List
@@ -106,8 +111,12 @@ cliParser =
   where
     viewParser =
       View
-        <$> Options.switch
-          (Options.long "metadata" <> Options.help "View metadata only")
+        <$> ( Options.flag ViewContent ViewMetadata (Options.long "metadata" <> Options.help "View metadata only")
+                <|> ViewProperty
+                  <$> Options.strOption
+                    (Options.long "property" <> Options.metavar "NAME" <> Options.help "View a property only")
+                <|> pure ViewContent
+            )
         <*> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to view (format: `TYPE:NAME`)")
 
@@ -213,9 +222,9 @@ main = do
           Just store -> pure $ Just store
   let baseUrl = cliBaseUrl cli
   case cliCommand cli of
-    View metadata resourceId -> do
+    View viewTarget resourceId -> do
       resourceId' <- parseResourceId resourceId
-      view baseUrl mCertificateStore metadata resourceId'
+      view baseUrl mCertificateStore viewTarget resourceId'
     List resourceTyName ->
       list baseUrl mCertificateStore resourceTyName
     Create mSrcFile resourceId -> do
@@ -251,7 +260,7 @@ httpManager (Just caStore) =
     serverId = mempty
 
 data Response a
-  = NotFound
+  = NotFound a
   | PreconditionFailed
   | Conflict
   | Created a
@@ -276,14 +285,15 @@ http manager url method headers body = do
         , Http.requestBody = Http.RequestBodyLBS body
         }
   response <- Http.httpLbs request manager
+  let body' = Http.responseBody response
   case statusCode $ Http.responseStatus response of
-    404 -> pure (Http.responseHeaders response, NotFound)
+    404 -> pure (Http.responseHeaders response, NotFound body')
     409 -> pure (Http.responseHeaders response, Conflict)
     412 -> pure (Http.responseHeaders response, PreconditionFailed)
-    200 -> pure (Http.responseHeaders response, Ok $ Http.responseBody response)
-    201 -> pure (Http.responseHeaders response, Created $ Http.responseBody response)
+    200 -> pure (Http.responseHeaders response, Ok body')
+    201 -> pure (Http.responseHeaders response, Created body')
     _status -> do
-      putStrLn $ ByteString.Lazy.Char8.unpack (Http.responseBody response)
+      putStrLn $ ByteString.Lazy.Char8.unpack body'
       exitFailure
 
 httpGet ::
@@ -362,27 +372,31 @@ transactionIdHeaders xactId =
 view ::
   String ->
   Maybe CertificateStore ->
-  -- | View metadata only
-  Bool ->
+  ViewTarget ->
   ResourceId ->
   IO ()
-view baseUrl mCertificateStore metadata resourceId = do
+view baseUrl mCertificateStore viewTarget resourceId = do
   dataHome <- getDataHome
   pager <- getPager
 
   manager <- httpManager mCertificateStore
 
   let
-    resourceDirLocal
-      | metadata =
+    resourceDirLocal =
+      case viewTarget of
+        ViewMetadata ->
           dataHome </> "blog" </> resourceType resourceId </> propertiesPart (resourceName resourceId)
-      | otherwise = dataHome </> "blog" </> resourceType resourceId
+        ViewProperty _propName ->
+          dataHome </> "blog" </> resourceType resourceId </> propertiesPart (resourceName resourceId)
+        ViewContent -> dataHome </> "blog" </> resourceType resourceId
   createDirectoryIfMissing True resourceDirLocal
 
   let
-    resourcePathLocal
-      | metadata = resourceDirLocal </> "metadata"
-      | otherwise = resourceDirLocal </> resourceName resourceId
+    resourcePathLocal =
+      case viewTarget of
+        ViewMetadata -> resourceDirLocal </> "metadata"
+        ViewProperty propName -> resourceDirLocal </> propName
+        ViewContent -> resourceDirLocal </> resourceName resourceId
 
   (_responseHeaders, rBody) <- do
     mLocalModificationTime <-
@@ -400,11 +414,20 @@ view baseUrl mCertificateStore metadata resourceId = do
              | Just localModificationTime <- pure $ mLocalModificationTime
              ]
 
-      url
-        | metadata =
-            (baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId ++ "/metadata")
-        | otherwise =
-            (baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId)
+      url =
+        case viewTarget of
+          ViewMetadata ->
+            baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId ++ "/metadata"
+          ViewProperty propName ->
+            baseUrl
+              ++ "/.resource/"
+              ++ resourceType resourceId
+              ++ "/"
+              ++ resourceName resourceId
+              ++ "/property/"
+              ++ propName
+          ViewContent ->
+            baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId
 
     httpGet manager url headers
 
@@ -416,8 +439,8 @@ view baseUrl mCertificateStore metadata resourceId = do
     PreconditionFailed -> do
       putStrLn "error: the local copy of this resource is out of date"
       exitFailure
-    NotFound -> do
-      putStrLn $ "error: resource " ++ renderResourceId resourceId ++ " not found"
+    NotFound body -> do
+      ByteString.Lazy.Char8.putStrLn body
       exitFailure
     Ok body -> do
       LazyByteString.writeFile resourcePathLocal body
@@ -455,7 +478,7 @@ list baseUrl mCertificateStore resourceTyName = do
       error "impossible"
     PreconditionFailed -> do
       error "impossible"
-    NotFound -> do
+    NotFound{} -> do
       putStrLn $ "error: resource type " ++ resourceTyName ++ " not found"
       exitFailure
     Ok body -> do
@@ -487,7 +510,7 @@ create baseUrl mCertificateStore mXactId mSrcFile resourceId = do
   case response of
     PreconditionFailed ->
       error "impossible"
-    NotFound ->
+    NotFound{} ->
       error "impossible"
     Ok{} ->
       error "impossible"
@@ -510,7 +533,7 @@ begin baseUrl mCertificateStore = do
   case response of
     PreconditionFailed ->
       error "impossible"
-    NotFound ->
+    NotFound{} ->
       error "impossible"
     Created{} ->
       error "impossible"
@@ -534,7 +557,7 @@ commit baseUrl mCertificateStore xactId = do
   case response of
     PreconditionFailed ->
       error "impossible"
-    NotFound ->
+    NotFound{} ->
       error "impossible"
     Conflict ->
       error "impossible"
@@ -559,7 +582,7 @@ rollback baseUrl mCertificateStore xactId = do
   case response of
     PreconditionFailed ->
       error "impossible"
-    NotFound ->
+    NotFound{} ->
       error "impossible"
     Conflict ->
       error "impossible"
@@ -627,7 +650,7 @@ update baseUrl mCertificateStore mSrcFile properties resourceId = do
       case response of
         PreconditionFailed ->
           error "impossible"
-        NotFound ->
+        NotFound{} ->
           error "impossible"
         Created{} ->
           error "impossible"
@@ -649,7 +672,7 @@ update baseUrl mCertificateStore mSrcFile properties resourceId = do
       case response of
         PreconditionFailed ->
           error "impossible"
-        NotFound ->
+        NotFound{} ->
           error "impossible"
         Created{} ->
           error "impossible"
@@ -711,7 +734,7 @@ edit baseUrl mCertificateStore resourceId = do
       PreconditionFailed -> do
         putStrLn "error: the local copy of this resource is out of date"
         exitFailure
-      NotFound -> do
+      NotFound{} -> do
         when (isNothing mLocalModificationTime) $ writeFile resourcePathLocal ""
         pure False
       Ok body -> do
@@ -743,7 +766,7 @@ edit baseUrl mCertificateStore resourceId = do
   case response of
     Conflict ->
       error "impossible"
-    NotFound -> do
+    NotFound{} -> do
       error "impossible"
     PreconditionFailed -> do
       putStrLn "error: the server has a newer copy of the resource (update aborted)"

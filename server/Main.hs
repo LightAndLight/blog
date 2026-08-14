@@ -178,7 +178,7 @@ app cli request respond = do
 
                 case mItems of
                   Nothing ->
-                    pure $ Wai.responseLBS notFound404 [] (fromString "not found")
+                    pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
                   Just items ->
                     pure $
                       Wai.responseLBS
@@ -225,7 +225,7 @@ app cli request respond = do
                   MaybeT $ Store.readResource resTy (Text.unpack resName)
 
                 case mBody of
-                  Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+                  Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "resource not found")
                   Just body -> pure $ Wai.responseLBS ok200 [] body
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       [part, resTyName, resName, part']
@@ -240,7 +240,7 @@ app cli request respond = do
                   Store.readResourceMetadata resTy (Text.unpack resName)
 
                 case mBody of
-                  Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+                  Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "metadata not found")
                   Just body -> pure $ Wai.responseLBS ok200 [] body
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
         | part == fromString ".resource"
@@ -283,6 +283,23 @@ app cli request respond = do
                           fromString ("\nresource changes:\n")
                             <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
                 pure $ Wai.responseLBS ok200 [] body
+              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+      [part, resTyName, resName, part', propName]
+        | part == fromString ".resource"
+        , part' == fromString "property" -> do
+            if Wai.requestMethod request == fromString "GET"
+              then do
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+                mBody <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+                  resTy <- Store.getResourceType store xactId $ Text.unpack resTyName
+                  Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
+
+                case mBody of
+                  Nothing ->
+                    pure $ Wai.responseLBS notFound404 [] (fromString "property not found")
+                  Just body ->
+                    pure $ Wai.responseLBS ok200 [] body
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       _ ->
         throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
