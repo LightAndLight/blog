@@ -33,6 +33,6 @@ source-repository-package
 source-repository-package
   type: git
   location: https://github.com/LightAndLight/tomlin.git
-  tag: 52b51a75decb69d0793941309000b6fa92999fbc
+  tag: 63bf37e7996cd50d4c34240460447fc390fde410
 
 --- END HDEPS ---

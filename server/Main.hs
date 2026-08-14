@@ -8,10 +8,12 @@ module Main (main) where
 
 import Blog (ResourceId (..), renderResourceId)
 import qualified Blog.Build as Build
-import Blog.Diagnostic (DiagnosticReports, renderDiagnosticReports)
+import Blog.Diagnostic (DiagnosticReports (..), renderDiagnosticReports)
+import Blog.Error (tomlErrorReport)
 import qualified Blog.Rules
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Control.Monad (unless)
 import Control.Monad.Catch (MonadMask)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
@@ -20,11 +22,13 @@ import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
+import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.String (fromString)
 import qualified Data.Text as Text
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
+import Data.Traversable (for)
 import Network.HTTP.Types.Header (RequestHeaders, hLastModified)
 import Network.HTTP.Types.Status
   ( badRequest400
@@ -43,6 +47,7 @@ import System.Directory
   )
 import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
+import qualified Toml
 
 data Cli
   = Cli
@@ -237,6 +242,39 @@ app cli request respond = do
                 case mBody of
                   Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
                   Just body -> pure $ Wai.responseLBS ok200 [] body
+              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+        | part == fromString ".resource"
+        , part' == fromString "property" -> do
+            if Wai.requestMethod request == fromString "PATCH"
+              then do
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+                propNames <- handleExceptT . withTransaction store mXactId $ \xactId -> do
+                  body <- liftIO $ Wai.consumeRequestBodyLazy request
+                  Toml.Toml (Toml.Located _offset properties) nonKeys <-
+                    case Toml.parse $ LazyByteString.toStrict body of
+                      Left err -> do
+                        let resourceId = renderResourceId (ResourceId (Text.unpack resTyName) (Text.unpack resName))
+                        throwError
+                          . DiagnosticReports
+                            (fromString $ "(" ++ resourceId ++ ":properties)")
+                            body
+                          $ tomlErrorReport err
+                      Right x -> pure x
+
+                  unless (null nonKeys) . error $
+                    "TODO: non-key-value properties: " ++ show nonKeys
+
+                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+                  for properties $ \(name, Toml.TomlKeyEntry _offset (Toml.Located _offset' value)) -> do
+                    Store.setProperty resTy (Text.unpack resName) (Text.unpack name) value
+                    pure name
+
+                let
+                  body =
+                    fromString "updated properties:\n"
+                      <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") propNames
+                pure $ Wai.responseLBS ok200 [] body
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       _ ->
         throwError $ Wai.responseLBS notFound404 [] (fromString "not found")

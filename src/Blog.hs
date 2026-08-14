@@ -1,5 +1,6 @@
 module Blog
-  ( ResourceId (..)
+  ( nameParser
+  , ResourceId (..)
   , resourceTypeParser
   , resourceNameParser
   , resourceIdParser
@@ -34,12 +35,16 @@ data ResourceId
   }
   deriving (Show, Eq, Ord)
 
+nameParser :: Sage.Parser String
+nameParser =
+  some $ Sage.satisfy ((||) <$> Char.isAlphaNum <*> (`elem` "-_."))
+
 resourceTypeParser :: Sage.Parser String
 resourceTypeParser = some $ Sage.satisfy Char.isAlpha
 
 resourceNameParser :: Sage.Parser String
 resourceNameParser =
-  some $ Sage.satisfy ((||) <$> Char.isAlphaNum <*> (`elem` "-_."))
+  nameParser
 
 resourceIdParser :: Sage.Parser ResourceId
 resourceIdParser = ResourceId <$> resourceTypeParser <* Sage.char ':' <*> resourceNameParser

@@ -37,6 +37,8 @@ executable blog
         bytestring,
         crypton-connection,
         crypton-x509-store,
+        diagnostica,
+        diagnostica-sage,
         directory,
         exceptions,
         filepath,
@@ -46,7 +48,9 @@ executable blog
         optparse-applicative,
         process,
         sage,
+        text,
         time,
+        tomlin,
         tls
 
     hs-source-dirs:   cli

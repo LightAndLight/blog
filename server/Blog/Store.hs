@@ -34,6 +34,7 @@ module Blog.Store
   , doesResourceExist
   , readResource
   , writeResource
+  , setProperty
   , listResource
   , readResourceMetadata
   , readResourceModificationTime
@@ -80,6 +81,7 @@ import Data.Monoid (First (..))
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text.Lazy as LazyText
+import qualified Data.Text.Lazy.Builder as Text.Lazy.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime)
 import Data.Traversable (for)
@@ -366,6 +368,7 @@ data ResourceType m
   , doesResourceExistImpl :: !(String -> m Bool)
   , readResourceImpl :: !(String -> m (Maybe LazyByteString))
   , writeResourceImpl :: !(String -> LazyByteString -> m ())
+  , setPropertyImpl :: !(String -> String -> Toml.TomlValue -> m ())
   , listResourceImpl :: !(m [ResourceId])
   , readResourceMetadataImpl :: !(String -> m (Maybe LazyByteString))
   , readResourceModificationTimeImpl :: !(String -> m (Maybe UTCTime))
@@ -376,20 +379,21 @@ data ResourceType m
   }
 
 hoistResourceType :: Functor m => (forall a. m a -> n a) -> ResourceType m -> ResourceType n
-hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12) =
+hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13) =
   ResourceType
     x1
     x2
     (fmap f x3)
     (fmap f x4)
     (fmap (fmap f) x5)
-    (f x6)
-    (fmap f x7)
+    (fmap (fmap (fmap f)) x6)
+    (f x7)
     (fmap f x8)
     (fmap f x9)
     (fmap f x10)
-    (fmap (fmap f) x11)
+    (fmap f x11)
     (fmap (fmap f) x12)
+    (fmap (fmap f) x13)
 
 resourceTypeFromDirectory ::
   forall m.
@@ -563,6 +567,26 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           fmap Just (IO.readFile path)
             `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
 
+    setPropertyImpl :: String -> String -> Toml.TomlValue -> m ()
+    setPropertyImpl resName key value = do
+      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> propertiesPart resName </> key
+      if removed
+        then do
+          liftIO . IO.removeFile $ xactResTyDir Delete </> propertiesPart resName </> key
+          doWrite Update
+        else do
+          updated <- liftIO . doesFileExist $ baseResTyDir </> propertiesPart resName </> key
+          if updated
+            then
+              doWrite Update
+            else
+              doWrite Create
+      where
+        doWrite change = do
+          liftIO $ IO.createDirectoryIfMissing True (xactResTyDir change </> propertiesPart resName)
+          let content = Text.Lazy.Encoding.encodeUtf8 . Text.Lazy.Builder.toLazyText $ Toml.valuePrinter value
+          liftIO $ xactWriteFile (resTyName </> propertiesPart resName) key content
+
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
       liftIO $ do
@@ -732,6 +756,9 @@ readResource = readResourceImpl
 
 writeResource :: ResourceType m -> String -> LazyByteString -> m ()
 writeResource = writeResourceImpl
+
+setProperty :: ResourceType m -> String -> String -> Toml.TomlValue -> m ()
+setProperty = setPropertyImpl
 
 listResource :: ResourceType m -> m [ResourceId]
 listResource = listResourceImpl
