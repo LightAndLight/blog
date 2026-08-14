@@ -3,7 +3,7 @@ module Main (main) where
 import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
 import Control.Applicative (many, optional, (<**>), (<|>))
 import Control.Exception (catch, finally, throwIO)
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
@@ -69,6 +69,8 @@ data Command
   | Create
       -- | Source file
       (Maybe FilePath)
+      -- | Properties to create
+      [String]
       -- | ID of resource to create
       String
   | CreateAll
@@ -79,9 +81,9 @@ data Command
   | Update
       -- | Source file
       (Maybe FilePath)
-      -- | Properties to set
+      -- | Properties to update
       [String]
-      -- | ID of resource to create
+      -- | ID of resource to update
       String
   | Edit
       -- | ID of resource to edit
@@ -131,6 +133,13 @@ cliParser =
           ( Options.strOption $
               Options.long "from" <> Options.short 'f' <> Options.metavar "FILE" <> Options.help "Source file"
           )
+        <*> many
+          ( Options.strOption $
+              Options.long "property"
+                <> Options.short 'p'
+                <> Options.metavar "NAME=VALUE"
+                <> Options.help "Property to create"
+          )
         <*> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to create (format: `TYPE:NAME`)")
 
@@ -152,7 +161,7 @@ cliParser =
               Options.long "property"
                 <> Options.short 'p'
                 <> Options.metavar "NAME=VALUE"
-                <> Options.help "Property to set"
+                <> Options.help "Property to update"
           )
         <*> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to create (format: `TYPE:NAME`)")
@@ -227,9 +236,10 @@ main = do
       view baseUrl mCertificateStore viewTarget resourceId'
     List resourceTyName ->
       list baseUrl mCertificateStore resourceTyName
-    Create mSrcFile resourceId -> do
+    Create mSrcFile properties resourceId -> do
       resourceId' <- parseResourceId resourceId
-      create baseUrl mCertificateStore Nothing mSrcFile resourceId'
+      properties' <- parseProperties properties
+      create baseUrl mCertificateStore Nothing mSrcFile properties' resourceId'
     CreateAll srcDir resTy ->
       createAll baseUrl mCertificateStore srcDir resTy
     Update mSrcFile properties resourceId -> do
@@ -494,31 +504,61 @@ create ::
   Maybe ByteString ->
   -- | Source file
   Maybe FilePath ->
+  [Property] ->
   ResourceId ->
   IO ()
-create baseUrl mCertificateStore mXactId mSrcFile resourceId = do
+create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
   manager <- httpManager mCertificateStore
 
-  let headers = resourceIdHeaders resourceId ++ foldMap transactionIdHeaders mXactId
-  (_responseHeaders, response) <- do
-    body <-
-      case mSrcFile of
-        Nothing -> pure mempty
-        Just srcFile -> LazyByteString.readFile srcFile
-    httpPost manager (baseUrl ++ "/.resource") headers body
+  let
+    withTransaction' f
+      | isNothing mXactId && not (null properties) = withTransaction baseUrl mCertificateStore (f . Just)
+      | otherwise = f mXactId
 
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Ok{} ->
-      error "impossible"
-    Conflict -> do
-      putStrLn $ "error: " ++ renderResourceId resourceId ++ " already exists"
-      exitFailure
-    Created a -> do
-      ByteString.Lazy.Char8.putStrLn a
+  withTransaction' $ \mXactId' -> do
+    do
+      let headers = resourceIdHeaders resourceId ++ foldMap transactionIdHeaders mXactId'
+      (_responseHeaders, response) <- do
+        body <-
+          case mSrcFile of
+            Nothing -> pure mempty
+            Just srcFile -> LazyByteString.readFile srcFile
+        httpPost manager (baseUrl ++ "/.resource") headers body
+
+      case response of
+        PreconditionFailed ->
+          error "impossible"
+        NotFound{} ->
+          error "impossible"
+        Ok{} ->
+          error "impossible"
+        Conflict -> do
+          putStrLn $ "error: " ++ renderResourceId resourceId ++ " already exists"
+          exitFailure
+        Created a -> do
+          ByteString.Lazy.Char8.putStrLn a
+
+    unless (null properties) $ do
+      let headers = foldMap transactionIdHeaders mXactId'
+      (_responseHeaders, response) <- do
+        let body = renderProperties properties
+        httpPatch
+          manager
+          (baseUrl ++ "/.resource/" ++ resourceIdPath resourceId ++ "/property")
+          headers
+          body
+
+      case response of
+        PreconditionFailed ->
+          error "impossible"
+        NotFound{} ->
+          error "impossible"
+        Conflict{} ->
+          error "impossible"
+        Created{} -> do
+          error "impossible"
+        Ok a ->
+          ByteString.Lazy.Char8.putStrLn a
 
 begin ::
   String ->
@@ -623,7 +663,7 @@ createAll baseUrl mCertificateStore srcDir resTy = do
       if isFile
         then do
           let resourceId = ResourceId resTy entry
-          create baseUrl mCertificateStore (Just xactId) (Just path) resourceId
+          create baseUrl mCertificateStore (Just xactId) (Just path) [] resourceId
         else do
           putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
 
