@@ -11,6 +11,7 @@ import Blog
   , MetadataValue (..)
   , ResourceId (..)
   , cfgMetadata
+  , metaCfgDefault
   , metaCfgOptional
   , metaCfgType
   , metadataValueString
@@ -19,7 +20,7 @@ import Blog
   )
 import Blog.Build ((*<))
 import qualified Blog.Build as Build
-import Blog.Diagnostic (DiagnosticReports (..))
+import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
 import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport, tomlResult)
 import Blog.Metadata (parseResourceMetadata)
 import Blog.Store (Store)
@@ -36,12 +37,13 @@ import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, tell)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
-import Data.Foldable (fold, foldrM, for_)
+import Data.Foldable (fold, for_)
 import Data.List (find, intercalate, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
-import Data.Maybe (fromJust, fromMaybe)
+import Data.Maybe (fromJust, fromMaybe, isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
@@ -55,6 +57,7 @@ import Data.Time.Clock (UTCTime (..))
 import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
 import qualified Temple
+import qualified Text.Diagnostic as Diagnostic
 import Text.Pandoc.Builder (Blocks)
 import qualified Text.Pandoc.Builder as Blocks (toList)
 import qualified Text.Pandoc.Html as Html
@@ -159,7 +162,9 @@ templateDependency iTemplate () = do
         either (throwError . TypeError path) pure result
       case result of
         Right (_state, _value) -> pure resources
-        Left err -> throwError $ typeProviderErrorDiagnostic (Build.resourceInputId iTemplate) err
+        Left err ->
+          throwError
+            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
 
   let
     templateDependencies =
@@ -287,53 +292,68 @@ type TypeProvider m =
   [Text] -> Temple.Type -> Temple.InferT () (ExceptT TypeProviderError m) Temple.Value
 
 data TypeProviderError
-  = ExpectedRecord ![Text] !Temple.Type
-  | ParameterNotFound ![Text] !Text
+  = NotARecord
+      ![Text]
+      -- | Expected type
+      !Temple.Type
+  | ParameterNotFound Temple.TemplateRef Temple.Offset
   | ResourceTypeNotFound ![Text] !Text
   | ResourceNotFound ![Text] !Text
   | PropertyNotFound ![Text] !Text
   | TypeError ![Text] (Temple.TypeError ())
 
-typeProviderErrorDiagnostic :: ResourceId -> TypeProviderError -> DiagnosticReports
-typeProviderErrorDiagnostic resId err =
+typeProviderErrorDiagnostic ::
+  MonadIO m =>
+  (Temple.TemplateRef -> String) ->
+  (Temple.TemplateRef -> m LazyByteString) ->
+  ResourceId ->
+  TypeProviderError ->
+  m DiagnosticReports
+typeProviderErrorDiagnostic renderTemplateRef getTemplateRef resId err =
   -- TODO: point to the location in the template?
   case err of
-    ExpectedRecord path ty ->
-      DiagnosticSimple $
+    NotARecord path ty ->
+      pure . DiagnosticSimple $
         renderTemplateId resId
           ++ renderTypeProviderPath path
-          ++ "expected a record, got "
+          ++ "expected "
           ++ Temple.renderType ty
-    ParameterNotFound path field ->
-      DiagnosticSimple $
-        renderTemplateId resId
-          ++ renderTypeProviderPath path
-          ++ "not in scope '"
-          ++ Text.unpack field
-          ++ "'"
+          ++ ", got a record"
+    ParameterNotFound ref offset -> do
+      content <- getTemplateRef ref
+      pure $
+        DiagnosticReports
+          (fromString $ renderTemplateRef ref)
+          content
+          ( One $
+              Diagnostic.emit
+                (Diagnostic.Offset $ Temple.getOffset offset)
+                Diagnostic.Caret
+                (fromString "not in scope")
+          )
     ResourceTypeNotFound path field ->
-      DiagnosticSimple $
+      pure . DiagnosticSimple $
         renderTemplateId resId
           ++ renderTypeProviderPath path
           ++ "missing resource type '"
           ++ Text.unpack field
           ++ "'"
     ResourceNotFound path field ->
-      DiagnosticSimple $
+      pure . DiagnosticSimple $
         renderTemplateId resId
           ++ renderTypeProviderPath path
           ++ "missing resource '"
           ++ Text.unpack field
           ++ "'"
     PropertyNotFound path field ->
-      DiagnosticSimple $
+      pure . DiagnosticSimple $
         renderTemplateId resId
           ++ renderTypeProviderPath path
           ++ "missing property '"
           ++ Text.unpack field
           ++ "'"
     TypeError path err' ->
-      DiagnosticSimple $
+      pure . DiagnosticSimple $
         renderTemplateId resId ++ renderTypeProviderPath path ++ templeTypeErrorMessage err'
   where
     renderTypeProviderPath [] = ""
@@ -354,7 +374,7 @@ requireRecord path ty =
     Temple.TRecord fields -> do
       pure $ getRecordFields fields
     _ ->
-      throwError $ ExpectedRecord path ty
+      throwError $ NotARecord path ty
 
 forRecord ::
   MonadError TypeProviderError m =>
@@ -485,7 +505,7 @@ defaultPropertyTypeProvider resTy resName propName
         foldr
           ( \(metaName, metaCfg) ->
               Temple.TRecordField metaName $
-                if metaCfgOptional metaCfg
+                if metaCfgOptional metaCfg && isNothing (metaCfgDefault metaCfg)
                   then mkOptional . metaToTempleTy $ metaCfgType metaCfg
                   else metaToTempleTy $ metaCfgType metaCfg
           )
@@ -519,12 +539,15 @@ lookupPropertyTypeProvider resTy resName propName = do
         because the type provider works with `Temple.TypeError ()`, but the
         inference of `actualTy` works with `Temple.TypeError Temple.Offset`.
       -}
-      actualTyScheme <- do
+      (actualValue, actualTyScheme) <- do
         result <-
           Temple.runInferT
             (Temple.emptyInferEnv (const undefined) (Temple.TemplateRef "."))
             Temple.emptyInferState
-            (Temple.generaliseType <$> inferTomlValueType value)
+            ( do
+                (value', ty) <- inferTomlValueType value
+                pure (value', Temple.generaliseType ty)
+            )
         case result of
           Right (_state, ty) -> pure ty
           Left err -> do
@@ -540,45 +563,40 @@ lookupPropertyTypeProvider resTy resName propName = do
         actualTy <- Temple.instantiateTypeScheme actualTyScheme
         unifyPropertyType path propTy actualTy
 
-        metadata <- do
-          mMetadata <- lift . lift . Store.readResourceMetadata resTy $ Text.unpack resName
-          case mMetadata of
-            Nothing ->
-              pure mempty
-            Just content ->
-              lift . lift $
-                parseResourceMetadata
-                  (Store.resourceTypeConfig resTy)
-                  (Store.resourceTypeName resTy)
-                  (Text.unpack resName)
-                  content
-        pure $! Temple.VRecord (fmap metaToTempleValue metadata)
+        pure actualValue
 
-inferTomlValueType :: Monad m => Toml.TomlValue -> Temple.InferT Temple.Offset m Temple.Type
+inferTomlValueType ::
+  Monad m => Toml.TomlValue -> Temple.InferT Temple.Offset m (Temple.Value, Temple.Type)
 inferTomlValueType Toml.VTrue =
-  pure Temple.TBool
+  pure (Temple.VTrue, Temple.TBool)
 inferTomlValueType Toml.VFalse =
-  pure Temple.TBool
-inferTomlValueType Toml.VString{} =
-  pure Temple.TString
+  pure (Temple.VFalse, Temple.TBool)
+inferTomlValueType (Toml.VString s) =
+  pure (Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict s, Temple.TString)
 inferTomlValueType Toml.VInt{} =
   error "TODO: support TOML integers"
 inferTomlValueType (Toml.VArray items) = do
   itemTy <- Temple.metavar Temple.KType
-  for_ items $ \item -> do
-    itemTy' <- inferTomlValueType $ Toml.locatedValue item
+  items' <- for items $ \item -> do
+    (item', itemTy') <- inferTomlValueType $ Toml.locatedValue item
     Temple.unify (Temple.Offset $ Toml.locatedOffset item) itemTy itemTy'
-  pure $ Temple.TStream itemTy
-inferTomlValueType (Toml.VRecord fields) =
-  Temple.TRecord
-    <$> foldrM
-      ( \(name, ty) rest ->
-          Temple.TRecordField (Toml.locatedValue name)
-            <$> inferTomlValueType (Toml.locatedValue ty)
-            <*> pure rest
-      )
-      Temple.TRowEnd
-      fields
+    pure item'
+  pure (Temple.VStream items', Temple.TStream itemTy)
+inferTomlValueType (Toml.VRecord fields) = do
+  fields' <- for fields $ \(name, value) -> do
+    (value', ty) <- inferTomlValueType $ Toml.locatedValue value
+    pure (Toml.locatedValue name, (value', ty))
+  let !value = Temple.VRecord . Map.fromList $ (fmap . fmap) fst fields'
+  pure
+    ( value
+    , Temple.TRecord $
+        foldr
+          ( \(name, (_value, ty)) ->
+              Temple.TRecordField name ty
+          )
+          Temple.TRowEnd
+          fields'
+    )
 
 articlePropertyTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -603,7 +621,10 @@ articlePropertyTypeProvider mPrev mNext content propName
               pure $ Temple.VConstructor (fromString "None") []
             Just prev ->
               -- TODO: guarantee that these values have the correct type
-              pure . Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue prev
+              pure $
+                Temple.VConstructor
+                  (fromString "Some")
+                  [Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue prev]
   | propName == fromString "next" =
       pure . Just $
         \path propTy -> do
@@ -615,7 +636,10 @@ articlePropertyTypeProvider mPrev mNext content propName
               pure $ Temple.VConstructor (fromString "None") []
             Just next ->
               -- TODO: guarantee that these values have the correct type
-              pure . Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue next
+              pure $
+                Temple.VConstructor
+                  (fromString "Some")
+                  [Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue next]
   | propName == fromString "content" =
       pure . Just $
         \_path _propTy -> do
@@ -728,7 +752,6 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
     let name = Temple.bindingName binding
     let tyScheme = Temple.bindingScheme binding
 
-    let path = []
     result <-
       runExceptT $
         case Text.unpack name of
@@ -770,11 +793,18 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
                 ty
             either (throwError . TypeError path') pure result
           _ ->
-            throwError . ParameterNotFound path $ Temple.bindingName binding
+            throwError $ uncurry ParameterNotFound (NonEmpty.head $ Temple.bindingLocations binding)
     value <-
       case result of
         Right (_state, value) -> pure value
-        Left err -> throwError $ typeProviderErrorDiagnostic (Build.resourceInputId iTemplate) err
+        Left err -> do
+          let
+            getTemplateRef (Temple.TemplateRef name') =
+              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
+                <$> Store.readResource (Build.resourceInputType iTemplate) name'
+
+          throwError
+            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
 
     pure (name, value)
 

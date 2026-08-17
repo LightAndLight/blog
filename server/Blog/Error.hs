@@ -113,7 +113,7 @@ templeTypeErrorMessage err =
     Temple.NotInScope _loc ->
       "not in scope"
     Temple.TypeMismatch _loc expected actual ->
-      "expected '" ++ Temple.renderType expected ++ "', got '" ++ Temple.renderType actual ++ "'"
+      "expected " ++ Temple.renderType expected ++ ", got " ++ Temple.renderType actual
     Temple.UnexpectedFields _loc fields ->
       "unexpected fields: " ++ renderFields fields
     Temple.MissingFields _loc fields ->
@@ -125,11 +125,11 @@ templeTypeErrorMessage err =
     Temple.ArityMismatch _loc expected actual ->
       "expected " ++ show expected ++ plural expected " argument" ++ ", got " ++ show actual
     Temple.KindMismatch _loc expected actual ->
-      "expected kind '" ++ Temple.renderKind expected ++ "', got '" ++ Temple.renderKind actual ++ "'"
+      "expected kind " ++ Temple.renderKind expected ++ ", got " ++ Temple.renderKind actual
     Temple.NotRequirement _loc name ->
       "'" ++ Text.unpack name ++ "' is not a requirement"
     Temple.BlockBadRequirementType _loc ty ->
-      "block cannot satisfy requirement of type '" ++ Temple.renderType ty ++ "'"
+      "block cannot satisfy requirement of type " ++ Temple.renderType ty
     Temple.RequirementAlreadySatisfied _loc ->
       "requirement already satisfied"
     Temple.FileNotFound _loc ->
