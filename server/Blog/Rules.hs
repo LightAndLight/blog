@@ -39,6 +39,7 @@ import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
+import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
 import Data.List (find, intercalate, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -485,18 +486,30 @@ defaultPropertyTypeProvider resTy resName propName
           pure $! Temple.VRecord (fmap metaToTempleValue metadata)
   | propName == fromString "content" =
       pure . Just $
-        \_path _propTy -> do
-          let _contentTy = Temple.TString
+        \path propTy -> do
+          let contentTy = Temple.TString
 
-          -- `content` is always a string.
-          -- unifyPropertyType path propTy contentTy
+          unifyPropertyType path propTy contentTy
 
-          mContent <- lift . lift . Store.readResource resTy $ Text.unpack resName
+          (mFormat, mContent) <-
+            lift . lift $
+              (,)
+                <$> Store.lookupProperty resTy (Text.unpack resName) "content-format"
+                <*> Store.readResource resTy (Text.unpack resName)
+
+          let
+            format :: LazyByteString -> LazyByteString
+            format =
+              case mFormat of
+                Just (Toml.VString s) | s == fromString "text" -> id
+                Just (Toml.VString s) | s == fromString "line" -> \x -> ByteString.Lazy.Char8.dropWhileEnd (`elem` "\r\n") x
+                _ -> id
+
           case mContent of
             Nothing ->
               pure $ Temple.VString mempty
             Just content ->
-              pure $ Temple.VString content
+              pure . Temple.VString $ format content
   | otherwise =
       pure Nothing
   where
