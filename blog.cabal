@@ -65,6 +65,7 @@ executable blog-server
         Blog.Diagnostic
         Blog.Error
         Blog.Metadata
+        Blog.Route
         Blog.Rules
         Blog.Store
         IO
@@ -92,6 +93,7 @@ executable blog-server
         mtl >=2.3.2,
         optparse-applicative,
         sage,
+        stm,
         syb,
         temple,
         text >=2.0,

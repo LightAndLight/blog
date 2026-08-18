@@ -22,6 +22,7 @@ module Blog.Store
   , renderTransactionId
   , parseTransactionId
   , withTransaction
+  , bracketTransaction
   , beginTransaction
   , commitTransaction
   , rollbackTransaction
@@ -63,7 +64,7 @@ import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
-import Blog.Metadata (resourceMetadataDecoder)
+import Blog.Metadata (renderMetadataValueToml, resourceMetadataDecoder)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
 import Control.Exception (throwIO)
@@ -83,7 +84,6 @@ import Data.Monoid (First (..))
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text.Lazy as LazyText
-import qualified Data.Text.Lazy.Builder as Text.Lazy.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime)
 import Data.Traversable (for)
@@ -121,6 +121,7 @@ hoistStore f (Store x1 x2 x3 x4) =
     (fmap f x4)
 
 newtype TransactionId = TransactionId ID
+  deriving (Eq, Ord)
 
 renderTransactionId :: TransactionId -> String
 renderTransactionId (TransactionId xactId) = ID.toString xactId
@@ -346,14 +347,40 @@ getResourceType store xactId resTyName = do
       throwError . DiagnosticSimple $
         "resource type '" ++ resTyName ++ "' does not exist"
 
-withTransaction :: MonadMask m => Store m -> (TransactionId -> m a) -> m a
-withTransaction store f = do
-  (a, ()) <- generalBracket (beginTransaction store) exit f
+bracketTransaction ::
+  MonadMask m =>
+  -- | On begin
+  (TransactionId -> m ()) ->
+  -- | On commit
+  (TransactionId -> m ()) ->
+  -- | On rollback
+  (TransactionId -> m ()) ->
+  Store m ->
+  (TransactionId -> m a) ->
+  m a
+bracketTransaction onBegin onCommit onRollback store f = do
+  (a, ()) <-
+    generalBracket
+      ( do
+          xactId <- beginTransaction store
+          xactId <$ onBegin xactId
+      )
+      exit
+      f
   pure a
   where
-    exit xactId (ExitCaseSuccess _a) = commitTransaction store xactId
-    exit xactId (ExitCaseException _err) = rollbackTransaction store xactId
-    exit xactId ExitCaseAbort = rollbackTransaction store xactId
+    exit xactId (ExitCaseSuccess _a) = do
+      commitTransaction store xactId
+      onCommit xactId
+    exit xactId (ExitCaseException _err) = do
+      rollbackTransaction store xactId
+      onRollback xactId
+    exit xactId ExitCaseAbort = do
+      rollbackTransaction store xactId
+      onRollback xactId
+
+withTransaction :: MonadMask m => Store m -> (TransactionId -> m a) -> m a
+withTransaction = bracketTransaction (const $ pure ()) (const $ pure ()) (const $ pure ())
 
 beginTransaction :: Store m -> m TransactionId
 beginTransaction = beginTransactionImpl
@@ -372,7 +399,7 @@ data ResourceType m
   , readResourceImpl :: !(String -> m (Maybe LazyByteString))
   , writeResourceImpl :: !(String -> LazyByteString -> m ())
   , readPropertyImpl :: !(String -> String -> m (Maybe LazyByteString))
-  , setPropertyImpl :: !(String -> String -> Toml.TomlValue -> m ())
+  , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
   , listResourceImpl :: !(m [ResourceId])
   , readResourceMetadataImpl :: !(String -> m (Maybe LazyByteString))
   , readResourceModificationTimeImpl :: !(String -> m (Maybe UTCTime))
@@ -592,7 +619,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
                 then pure Nothing
                 else throwM err
 
-    setPropertyImpl :: String -> String -> Toml.TomlValue -> m ()
+    setPropertyImpl :: String -> String -> MetadataValue -> m ()
     setPropertyImpl resName key value = do
       removed <- liftIO . doesFileExist $ xactResTyDir Delete </> propertiesPart resName </> key
       if removed
@@ -609,7 +636,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       where
         doWrite change = do
           liftIO $ IO.createDirectoryIfMissing True (xactResTyDir change </> propertiesPart resName)
-          let content = Text.Lazy.Encoding.encodeUtf8 . Text.Lazy.Builder.toLazyText $ Toml.valuePrinter value
+          let content = renderMetadataValueToml value
           liftIO $ xactWriteFile (resTyName </> propertiesPart resName) key content
 
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
@@ -785,7 +812,7 @@ writeResource = writeResourceImpl
 readProperty :: ResourceType m -> String -> String -> m (Maybe LazyByteString)
 readProperty = readPropertyImpl
 
-setProperty :: ResourceType m -> String -> String -> Toml.TomlValue -> m ()
+setProperty :: ResourceType m -> String -> String -> MetadataValue -> m ()
 setProperty = setPropertyImpl
 
 listResource :: ResourceType m -> m [ResourceId]

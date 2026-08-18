@@ -18,6 +18,7 @@ import Numeric (readHex, showHex)
 import System.Entropy (getEntropy)
 
 data ID = ID !Word64 !Word64
+  deriving (Eq, Ord)
 
 instance Show ID where
   showsPrec d x = showParen (d > app_prec) $ showString "ID.fromString " . showString (toString x)

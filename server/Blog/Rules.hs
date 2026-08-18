@@ -23,6 +23,8 @@ import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
 import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport, tomlResult)
 import Blog.Metadata (parseResourceMetadata)
+import Blog.Route (RouteEntry (..), renderRouteEntry)
+import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
 import Commonmark.Pandoc (Cm, unCm)
@@ -50,6 +52,7 @@ import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
+import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import Data.Text.Lazy.Builder (Builder)
 import qualified Data.Text.Lazy.Builder as Builder
@@ -62,6 +65,7 @@ import qualified Text.Diagnostic as Diagnostic
 import Text.Pandoc.Builder (Blocks)
 import qualified Text.Pandoc.Builder as Blocks (toList)
 import qualified Text.Pandoc.Html as Html
+import qualified Text.Sage as Sage
 import qualified Toml
 
 rules :: MonadIO m => Build.Rules m
@@ -83,8 +87,13 @@ rules =
           <*> Build.iResource "article" (Build.iBind "name")
           <*> Build.iResource "adjacency" (Build.iMatch "article-" <> Build.iBind "name")
       )
-      (Build.oResource "html" $ Build.oMatch "article-" *< Build.oBind "name")
+      (Build.oResource "html" (Build.oMatch "article-" *< Build.oBind "name"))
       articleHtml
+    <> Build.rule
+      "html-route"
+      (Build.iResource "html" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "html-" *< Build.oBind "name"))
+      htmlRoute
 
 -- TODO: expose in `temple`?
 getRecordFields :: Temple.Type -> ([(Text, Temple.Type)], Maybe (Temple.Type))
@@ -829,3 +838,50 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
         template'
 
   Build.writeResource oHtml () output
+
+  let resId = Build.resourceInputId iArticle
+  mUrl <- do
+    let resTy = Build.resourceInputType iArticle
+    let resName = resourceName resId
+    mContent <- Store.readResourceMetadata resTy resName
+    content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
+    metadata <-
+      parseResourceMetadata
+        (Store.resourceTypeConfig resTy)
+        (Store.resourceTypeName resTy)
+        resName
+        content
+    pure $ Map.lookup (fromString "url") metadata
+  for_ mUrl $ \url -> do
+    Build.setResourceProperty oHtml () "url" url
+
+htmlRoute ::
+  forall m.
+  MonadIO m =>
+  Build.ResourceInput m ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+htmlRoute iHtml oRoute = do
+  let resId = Build.resourceInputId iHtml
+  let resTy = Build.resourceInputType iHtml
+  let resName = resourceName resId
+  mUrl <- Store.lookupProperty resTy resName "url"
+  for_ mUrl $ \url -> do
+    -- GRIPE: should we really have to parse out `path`, only to immediately print it via `renderRouteEntry`?
+    path <-
+      case url of
+        Toml.VString s -> do
+          let input = Text.Encoding.encodeUtf8 s
+          case Sage.parse (Routes.pathParser <* Sage.eof) input of
+            Right path ->
+              pure path
+            Left err ->
+              throwError $
+                DiagnosticReports
+                  (fromString $ "(" ++ renderResourceId resId ++ ":metadata:url)")
+                  (LazyByteString.fromStrict input)
+                  (sageErrorReport err)
+        _ ->
+          throwError . DiagnosticSimple $ "(" ++ renderResourceId resId ++ ":metadata:url): not a string"
+    Build.writeResource oRoute () $
+      renderRouteEntry (RouteEntry path (Build.resourceInputId iHtml))

@@ -21,6 +21,9 @@ cradle:
     - path: "./server/Blog/Metadata.hs"
       component: "blog:exe:blog-server"
 
+    - path: "./server/Blog/Route.hs"
+      component: "blog:exe:blog-server"
+
     - path: "./server/Blog/Rules.hs"
       component: "blog:exe:blog-server"
 

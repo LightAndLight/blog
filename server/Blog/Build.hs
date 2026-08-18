@@ -26,7 +26,9 @@ module Blog.Build
   , iAny
   , Output
   , ResourceOutput
+  , resourceOutputId
   , writeResource
+  , setResourceProperty
   , oResource
   , OutputResourceNamePattern
   , (>*<)
@@ -216,6 +218,25 @@ putResource resId@(ResourceId resTyName resName) content = do
       Store.writeResource resTy resName content
       let changes = [Change Created resId reasons]
       ActionT $ tell mempty{asChanges = changes}
+  ActionT $ tell mempty{asPending = [resId]}
+
+setProperty :: MonadIO m => ResourceId -> String -> MetadataValue -> ActionT m ()
+setProperty resId@(ResourceId resTyName resName) key value = do
+  store <- askStore
+  transactionId <- askTransactionId
+
+  reasons <- ActionT $ asks aeReasons
+
+  resTy <- Store.getResourceType store transactionId $ fromString resTyName
+  exists <- Store.doesResourceExist resTy resName
+  if exists
+    then do
+      Store.setProperty resTy resName key value
+      let changes = [Change Updated resId reasons]
+      ActionT $ tell mempty{asChanges = changes}
+    else do
+      throwError . DiagnosticSimple $
+        "can't set property '" ++ key ++ "' on missing resource " ++ renderResourceId resId
   ActionT $ tell mempty{asPending = [resId]}
 
 rule ::
@@ -589,9 +610,11 @@ instance Applicative (Output m) where
   pure = OPure
   (<*>) = OApply
 
-newtype ResourceOutput m a
+data ResourceOutput m a
   = ResourceOutput
-  { writeResource :: a -> LazyByteString -> ActionT m ()
+  { resourceOutputId :: a -> ResourceId
+  , writeResource :: a -> LazyByteString -> ActionT m ()
+  , setResourceProperty :: a -> String -> MetadataValue -> ActionT m ()
   }
 
 data OutputResourceNamePattern a where
@@ -667,11 +690,11 @@ makeOutput bindings = go
     go (OPure a) = a
     go (OApply a b) = go a (go b)
     go (OResourceType resTyName) =
-      ResourceOutput $
-        putResource . ResourceId resTyName
+      let mkResId = ResourceId resTyName
+      in ResourceOutput mkResId (putResource . mkResId) (setProperty . mkResId)
     go (OResource resTyName pat) =
-      ResourceOutput $
-        \resName -> putResource $ ResourceId resTyName (renderOutputResourceNamePattern bindings pat resName)
+      let mkResId = ResourceId resTyName . renderOutputResourceNamePattern bindings pat
+      in ResourceOutput mkResId (putResource . mkResId) (setProperty . mkResId)
 
 data Change
   = Change
