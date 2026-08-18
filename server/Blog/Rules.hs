@@ -93,7 +93,12 @@ rules =
       "html-route"
       (Build.iResource "html" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "html-" *< Build.oBind "name"))
-      htmlRoute
+      resourceRoute
+    <> Build.rule
+      "css-route"
+      (Build.iResource "css" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "css-" *< Build.oBind "name"))
+      resourceRoute
 
 -- TODO: expose in `temple`?
 getRecordFields :: Temple.Type -> ([(Text, Temple.Type)], Maybe (Temple.Type))
@@ -855,15 +860,15 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
   for_ mUrl $ \url -> do
     Build.setResourceProperty oHtml () "url" url
 
-htmlRoute ::
+resourceRoute ::
   forall m.
   MonadIO m =>
   Build.ResourceInput m ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
-htmlRoute iHtml oRoute = do
-  let resId = Build.resourceInputId iHtml
-  let resTy = Build.resourceInputType iHtml
+resourceRoute iContent oRoute = do
+  let resId = Build.resourceInputId iContent
+  let resTy = Build.resourceInputType iContent
   let resName = resourceName resId
   mUrl <- Store.lookupProperty resTy resName "url"
   for_ mUrl $ \url -> do
@@ -884,4 +889,4 @@ htmlRoute iHtml oRoute = do
         _ ->
           throwError . DiagnosticSimple $ "(" ++ renderResourceId resId ++ ":metadata:url): not a string"
     Build.writeResource oRoute () $
-      renderRouteEntry (RouteEntry path (Build.resourceInputId iHtml))
+      renderRouteEntry (RouteEntry path (Build.resourceInputId iContent))

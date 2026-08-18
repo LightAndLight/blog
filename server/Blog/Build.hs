@@ -83,6 +83,7 @@ import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
+import Data.Traversable (for)
 import Prelude hiding (any)
 
 newtype Rules m = Rules [Rule m]
@@ -766,15 +767,15 @@ evalRules ::
   Store m ->
   TransactionId ->
   Rules m ->
-  -- | The created/updated resource
-  ResourceId ->
+  -- | The created/updated resources
+  [ResourceId] ->
   m [Change]
-evalRules fTrace store transactionId (Rules rs) resId = do
-  execWriterT . flip evalStateT mempty $ do
-    dependents <- lift . lift $ do
+evalRules fTrace store transactionId (Rules rs) resIds = do
+  execWriterT . flip evalStateT (Set.fromList resIds) $ do
+    dependents <- lift . lift . for resIds $ \resId -> do
       resTy <- Store.getResourceType store transactionId $ resourceType resId
       Store.listDependents resTy $ resourceName resId
-    modify $ (Set.fromList dependents <>) . Set.insert resId
+    modify $ (foldMap Set.fromList dependents <>)
     go
   where
     (graph, fromVertex, _fromKey) =
@@ -801,12 +802,12 @@ evalRules fTrace store transactionId (Rules rs) resId = do
         lift . lift . runActionT fTrace store transactionId [] $
           runRule r changedResources
       dependents <-
-        concat
-          <$> traverse
-            ( \changed -> lift . lift $ do
+        lift . lift $
+          traverse
+            ( \changed -> do
                 resTy <- Store.getResourceType store transactionId $ resourceType changed
                 Store.listDependents resTy $ resourceName changed
             )
             changedResources'
-      modify $ (Set.fromList changedResources' <>) . (Set.fromList dependents <>)
+      modify $ (Set.fromList changedResources' <>) . (foldMap Set.fromList dependents <>)
       tell changes

@@ -88,6 +88,9 @@ data Command
   | Edit
       -- | ID of resource to edit
       String
+  | RefreshAll
+      -- | Resource type to refresh
+      String
 
 cliParser :: Options.Parser Cli
 cliParser =
@@ -109,6 +112,9 @@ cliParser =
             (Options.info createAllParser $ Options.progDesc "Create multiple resources")
           <> Options.command "update" (Options.info updateParser $ Options.progDesc "Update a resource")
           <> Options.command "edit" (Options.info editParser $ Options.progDesc "Edit a resource")
+          <> Options.command
+            "refresh-all"
+            (Options.info refreshAllParser $ Options.progDesc "Mark resources as changed")
       )
   where
     viewParser =
@@ -170,6 +176,11 @@ cliParser =
       Edit
         <$> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to edit (format: `TYPE:NAME`)")
+
+    refreshAllParser =
+      RefreshAll
+        <$> Options.strArgument
+          (Options.metavar "TYPE" <> Options.help "Type of resource to refresh")
 
 parseResourceId ::
   -- | Input
@@ -249,6 +260,8 @@ main = do
     Edit resourceId -> do
       resourceId' <- parseResourceId resourceId
       edit baseUrl mCertificateStore resourceId'
+    RefreshAll resTy ->
+      refreshAll baseUrl mCertificateStore resTy
 
 -- <https://stackoverflow.com/a/41816183>
 httpManager :: Maybe CertificateStore -> IO Http.Manager
@@ -340,6 +353,14 @@ httpPatch ::
   LazyByteString ->
   IO (ResponseHeaders, Response LazyByteString)
 httpPatch manager url = http manager url (fromString "PATCH")
+
+httpRefresh ::
+  Http.Manager ->
+  -- | URL
+  String ->
+  RequestHeaders ->
+  IO (ResponseHeaders, Response LazyByteString)
+httpRefresh manager url headers = http manager url (fromString "REFRESH") headers mempty
 
 requireEnv :: String -> IO String
 requireEnv key = do
@@ -817,3 +838,23 @@ edit baseUrl mCertificateStore resourceId = do
     Ok body -> do
       ByteString.Lazy.Char8.putStrLn body
       removeFile resourcePathLocal
+
+refreshAll :: String -> Maybe CertificateStore -> String -> IO ()
+refreshAll baseUrl mCertificateStore resTy = do
+  manager <- httpManager mCertificateStore
+
+  let headers = []
+  (_responseHeaders, response) <- do
+    httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
+
+  case response of
+    PreconditionFailed ->
+      error "impossible"
+    NotFound{} ->
+      error "impossible"
+    Conflict{} -> do
+      error "impossible"
+    Created{} -> do
+      error "impossible"
+    Ok a ->
+      ByteString.Lazy.Char8.putStrLn a

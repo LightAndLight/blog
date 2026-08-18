@@ -259,10 +259,10 @@ evalRules ::
   Store m ->
   Routes ->
   Store.TransactionId ->
-  ResourceId ->
+  [ResourceId] ->
   m [Build.Change]
-evalRules store routesVar xactId resId = do
-  changes <- Build.evalRules putStrLn store xactId Blog.Rules.rules resId
+evalRules store routesVar xactId resIds = do
+  changes <- Build.evalRules putStrLn store xactId Blog.Rules.rules resIds
   routeResTy <- Store.getResourceType store xactId "route"
   for_ changes $ \(Build.Change status changedId _reasons) ->
     case resourceType changedId of
@@ -314,7 +314,30 @@ app store routesVar request respond = do
                         ok200
                         []
                         (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
-              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+              else
+                if Wai.requestMethod request == fromString "REFRESH"
+                  then do
+                    mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+                    let store' = Store.hoistStore lift store
+                    mChanges <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId -> do
+                      resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
+                      entries <- lift $ Store.listResource resTy
+                      evalRules store' routesVar xactId entries
+
+                    case mChanges of
+                      Nothing ->
+                        pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
+                      Just changes ->
+                        pure $
+                          Wai.responseLBS
+                            ok200
+                            []
+                            ( ByteString.Lazy.Char8.unlines $
+                                fromString ("refreshed " ++ Text.unpack resTyName ++ ":*")
+                                  : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                            )
+                  else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       [part, action]
         | part == fromString ".transaction" ->
             if action == fromString "begin"
@@ -403,7 +426,7 @@ app store routesVar request respond = do
                     Store.setProperty resTy (resourceName resId) (Text.unpack name) (metadataValueFromToml value)
                     pure name
 
-                  (,) names <$> evalRules store routesVar xactId resId
+                  (,) names <$> evalRules store routesVar xactId [resId]
 
                 let
                   body =
@@ -503,7 +526,7 @@ httpResourcePost store routesVar request = do
         body <- liftIO $ Wai.consumeRequestBodyLazy request
         do
           Store.writeResource resTy resName body
-          Just <$> evalRules store routesVar xactId resId
+          Just <$> evalRules store routesVar xactId [resId]
   case mChanges of
     Nothing ->
       throwError $
@@ -563,7 +586,7 @@ httpResourcePut store routesVar request = do
             body <- liftIO $ Wai.consumeRequestBodyLazy request
             changes <- do
               Store.writeResource resTy resName body
-              Build.evalRules putStrLn store xactId Blog.Rules.rules resId
+              evalRules store routesVar xactId [resId]
             pure $ Right (responseHeaders, changes)
           else
             pure $ Left (preconditionFailed412, "the local copy of the resource is out of date")
