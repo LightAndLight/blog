@@ -26,6 +26,7 @@ module Blog.Store
   , beginTransaction
   , commitTransaction
   , rollbackTransaction
+  , listTransactions
 
     -- * Resource types
   , ResourceType
@@ -110,15 +111,17 @@ data Store m
   , beginTransactionImpl :: m TransactionId
   , commitTransactionImpl :: TransactionId -> m ()
   , rollbackTransactionImpl :: TransactionId -> m ()
+  , listTransactionsImpl :: m [TransactionId]
   }
 
 hoistStore :: Functor m => (forall a. m a -> n a) -> Store m -> Store n
-hoistStore f (Store x1 x2 x3 x4) =
+hoistStore f (Store x1 x2 x3 x4 x5) =
   Store
     (fmap (fmap (f . fmap (fmap (hoistResourceType f)))) x1)
     (f x2)
     (fmap f x3)
     (fmap f x4)
+    (f x5)
 
 newtype TransactionId = TransactionId ID
   deriving (Eq, Ord)
@@ -213,12 +216,16 @@ fromDirectory storeDir = do
       -- \* Clients can see the transaction in progress, e.g. the transaction
       --   creates 2 files but the first is visible and the second is not.
       -- \* If the server crashes mid-commit, then the store is in an invalid state.
-      liftIO $ do
-        let xactDir = getTransactionIdDir storeDir xactId
-        mergeDirectoryCreate (xactDir </> changePart Create) storeDir
-        mergeDirectoryUpdate (xactDir </> changePart Update) storeDir
-        subtractDirectory (xactDir </> changePart Delete) storeDir
-        removeDirectoryRecursive xactDir
+      let xactDir = getTransactionIdDir storeDir xactId
+      exists <- liftIO $ doesDirectoryExist xactDir
+      if exists
+        then liftIO $ do
+          mergeDirectoryCreate (xactDir </> changePart Create) storeDir
+          mergeDirectoryUpdate (xactDir </> changePart Update) storeDir
+          subtractDirectory (xactDir </> changePart Delete) storeDir
+          removeDirectoryRecursive xactDir
+        else
+          throwError . DiagnosticSimple $ "transaction not found: " ++ renderTransactionId xactId
 
     -- \| Recursively copy the contents of the source directory into the target directory.
     --
@@ -313,6 +320,17 @@ fromDirectory storeDir = do
         removeDirectoryRecursive (getTransactionDir storeDir </> ID.toString xactId)
           `catch` \err@(WithCallStack _cs err') -> unless (isDoesNotExistError err') $ throwIO err
 
+    listTransactionsImpl :: m [TransactionId]
+    listTransactionsImpl = do
+      liftIO $ do
+        entries <-
+          IO.listDirectory (getTransactionDir storeDir)
+            `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure [] else throwIO err
+        pure $
+          fmap
+            (\entry -> fromMaybe (error $ "invalid transaction ID: " ++ show entry) $ parseTransactionId entry)
+            entries
+
 parseResourceConfig ::
   MonadError DiagnosticReports m =>
   -- | Resource type name
@@ -390,6 +408,9 @@ commitTransaction = commitTransactionImpl
 
 rollbackTransaction :: Store m -> TransactionId -> m ()
 rollbackTransaction = rollbackTransactionImpl
+
+listTransactions :: Store m -> m [TransactionId]
+listTransactions = listTransactionsImpl
 
 data ResourceType m
   = ResourceType

@@ -338,6 +338,15 @@ app store routesVar request respond = do
                                   : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
                             )
                   else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+      [part]
+        | part == fromString ".transaction" ->
+            if Wai.requestMethod request == fromString "GET"
+              then do
+                xactIds <- handleExceptT $ Store.listTransactions store
+                pure . Wai.responseLBS ok200 [] . fromString $
+                  foldMap ((++ "\n") . Store.renderTransactionId) xactIds
+              else
+                throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part, action]
         | part == fromString ".transaction" ->
             if action == fromString "begin"

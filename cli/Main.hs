@@ -6,6 +6,7 @@ import Control.Exception (catch, finally, throwIO)
 import Control.Monad (unless, when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
@@ -58,7 +59,15 @@ data ViewTarget
   | ViewContent
 
 data Command
-  = View
+  = Begin
+  | Commit
+      -- | Transaction ID
+      String
+  | Rollback
+      -- | Transaction ID
+      String
+  | ListTransactions
+  | View
       -- | What to view
       ViewTarget
       -- | ID of resource to view
@@ -102,7 +111,15 @@ cliParser =
           Options.long "cacert" <> Options.metavar "FILE" <> Options.help "TLS CA certificate"
       )
     <*> Options.hsubparser
-      ( Options.command "view" (Options.info viewParser $ Options.progDesc "View a resource")
+      ( Options.command "begin" (Options.info beginParser $ Options.progDesc "Begin a transaction")
+          <> Options.command "commit" (Options.info commitParser $ Options.progDesc "Commit a transaction")
+          <> Options.command
+            "rollback"
+            (Options.info rollbackParser $ Options.progDesc "Roll back a transaction")
+          <> Options.command
+            "list-transactions"
+            (Options.info listTransactionsParser $ Options.progDesc "List uncommitted transactions")
+          <> Options.command "view" (Options.info viewParser $ Options.progDesc "View a resource")
           <> Options.command
             "list"
             (Options.info listParser $ Options.progDesc "List resources of a specific type")
@@ -117,6 +134,22 @@ cliParser =
             (Options.info refreshAllParser $ Options.progDesc "Mark resources as changed")
       )
   where
+    beginParser =
+      pure Begin
+
+    commitParser =
+      Commit
+        <$> Options.strArgument
+          (Options.metavar "ID" <> Options.help "ID of transaction to commit")
+
+    rollbackParser =
+      Rollback
+        <$> Options.strArgument
+          (Options.metavar "ID" <> Options.help "ID of transaction to roll back")
+
+    listTransactionsParser =
+      pure ListTransactions
+
     viewParser =
       View
         <$> ( Options.flag ViewContent ViewMetadata (Options.long "metadata" <> Options.help "View metadata only")
@@ -242,6 +275,14 @@ main = do
           Just store -> pure $ Just store
   let baseUrl = cliBaseUrl cli
   case cliCommand cli of
+    Begin ->
+      begin baseUrl mCertificateStore
+    Commit xactId ->
+      commit baseUrl mCertificateStore $ fromString xactId
+    Rollback xactId ->
+      rollback baseUrl mCertificateStore $ fromString xactId
+    ListTransactions ->
+      listTransactions baseUrl mCertificateStore
     View viewTarget resourceId -> do
       resourceId' <- parseResourceId resourceId
       view baseUrl mCertificateStore viewTarget resourceId'
@@ -399,6 +440,39 @@ transactionIdHeaders :: ByteString -> RequestHeaders
 transactionIdHeaders xactId =
   [ (fromString "X-Blog-TransactionId", xactId)
   ]
+
+begin :: String -> Maybe CertificateStore -> IO ()
+begin baseUrl mCertificateStore = do
+  xactId <- beginTransaction baseUrl mCertificateStore
+  ByteString.Char8.putStrLn $ fromString "began " <> xactId
+
+commit :: String -> Maybe CertificateStore -> ByteString -> IO ()
+commit baseUrl mCertificateStore xactId = do
+  commitTransaction baseUrl mCertificateStore xactId
+  ByteString.Char8.putStrLn $ fromString "committed " <> xactId
+
+rollback :: String -> Maybe CertificateStore -> ByteString -> IO ()
+rollback baseUrl mCertificateStore xactId = do
+  rollbackTransaction baseUrl mCertificateStore xactId
+  ByteString.Char8.putStrLn $ fromString "rolled back " <> xactId
+
+listTransactions :: String -> Maybe CertificateStore -> IO ()
+listTransactions baseUrl mCertificateStore = do
+  manager <- httpManager mCertificateStore
+
+  (_responseHeaders, response) <- httpGet manager (baseUrl ++ "/.transaction") []
+
+  case response of
+    PreconditionFailed ->
+      error "impossible"
+    NotFound{} ->
+      error "impossible"
+    Created{} ->
+      error "impossible"
+    Conflict ->
+      error "impossible"
+    Ok a -> do
+      ByteString.Lazy.Char8.putStr a
 
 view ::
   String ->
@@ -581,12 +655,12 @@ create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
         Ok a ->
           ByteString.Lazy.Char8.putStrLn a
 
-begin ::
+beginTransaction ::
   String ->
   Maybe CertificateStore ->
   -- | Transaction ID
   IO ByteString
-begin baseUrl mCertificateStore = do
+beginTransaction baseUrl mCertificateStore = do
   manager <- httpManager mCertificateStore
 
   (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") [] mempty
@@ -603,13 +677,13 @@ begin baseUrl mCertificateStore = do
     Ok a -> do
       pure $ LazyByteString.toStrict a
 
-commit ::
+commitTransaction ::
   String ->
   Maybe CertificateStore ->
   -- | Transaction ID
   ByteString ->
   IO ()
-commit baseUrl mCertificateStore xactId = do
+commitTransaction baseUrl mCertificateStore xactId = do
   manager <- httpManager mCertificateStore
 
   let headers = transactionIdHeaders xactId
@@ -627,13 +701,13 @@ commit baseUrl mCertificateStore xactId = do
     Ok _ ->
       pure ()
 
-rollback ::
+rollbackTransaction ::
   String ->
   Maybe CertificateStore ->
   -- | Transaction ID
   ByteString ->
   IO ()
-rollback baseUrl mCertificateStore xactId = do
+rollbackTransaction baseUrl mCertificateStore xactId = do
   manager <- httpManager mCertificateStore
 
   let headers = transactionIdHeaders xactId
@@ -664,12 +738,12 @@ withTransaction ::
   (ByteString -> IO b) ->
   IO b
 withTransaction baseUrl mCertificateStore f = do
-  (a, ()) <- generalBracket (begin baseUrl mCertificateStore) exit $ f
+  (a, ()) <- generalBracket (beginTransaction baseUrl mCertificateStore) exit $ f
   pure a
   where
-    exit xactId (ExitCaseSuccess _a) = commit baseUrl mCertificateStore xactId
-    exit xactId (ExitCaseException _err) = rollback baseUrl mCertificateStore xactId
-    exit xactId ExitCaseAbort = rollback baseUrl mCertificateStore xactId
+    exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl mCertificateStore xactId
+    exit xactId (ExitCaseException _err) = rollbackTransaction baseUrl mCertificateStore xactId
+    exit xactId ExitCaseAbort = rollbackTransaction baseUrl mCertificateStore xactId
 
 createAll :: String -> Maybe CertificateStore -> FilePath -> String -> IO ()
 createAll baseUrl mCertificateStore srcDir resTy = do
