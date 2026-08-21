@@ -1,3 +1,4 @@
+# Start the server
 run:
     cabal run blog:blog-server -- \
       --data .blog-data \
@@ -5,9 +6,11 @@ run:
       --key tls/localhost.key \
       --port 8080
 
+# Format project
 format:
     fd -e hs | xargs -n 1 -P $(nproc) fourmolu -i -q
 
+# Generate a certificate authority
 ca:
     @# https://learn.microsoft.com/en-us/azure/application-gateway/self-signed-certificates
     mkdir -p tls
@@ -31,6 +34,7 @@ ca:
         -signkey tls/root.key \
         -out tls/root.crt
 
+# Generate a self-signed certificate
 tls:
     @# https://learn.microsoft.com/en-us/azure/application-gateway/self-signed-certificates
     openssl ecparam \
