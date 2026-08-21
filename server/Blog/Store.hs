@@ -64,7 +64,7 @@ import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
-import Blog.Metadata (renderMetadataValueToml, resourceMetadataDecoder)
+import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
 import Control.Exception (throwIO)
@@ -843,14 +843,14 @@ removeDependency :: ResourceType m -> String -> ResourceId -> m ()
 removeDependency = removeDependencyImpl
 
 lookupProperty ::
-  MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe Toml.TomlValue)
+  MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe MetadataValue)
 lookupProperty resTy resName propName = do
   mContent <- readProperty resTy resName propName
   case mContent of
     Nothing -> pure Nothing
     Just content ->
       case Sage.parse (Toml.valueParser Toml.TopLevel <* Sage.eof) (LazyByteString.toStrict content) of
-        Right x -> pure $ Just x
+        Right x -> pure . Just $ metadataValueFromToml x
         Left err ->
           throwError $
             DiagnosticReports

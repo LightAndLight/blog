@@ -107,13 +107,16 @@ routeEntryParser =
 
 pathParser :: Sage.Parser [Text]
 pathParser =
-  some (Sage.char '/' *> partParser)
+  Sage.char '/' *> Sage.sepBy partParser (Sage.char '/')
   where
     partParser =
-      Text.pack <$> some (Sage.satisfy $ (||) <$> Char.isAlphaNum <*> (`elem` "-._~"))
+      Text.pack <$> some (Sage.satisfy $ (||) <$> Char.isAlphaNum <*> (`elem` "-._~")) Sage.<?> "url part"
 
 renderRouteEntry :: RouteEntry -> LazyByteString
 renderRouteEntry (RouteEntry path resId) =
   renderPath path <> fromString " -> " <> fromString (renderResourceId resId)
   where
-    renderPath = foldMap ((fromString "/" <>) . Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict)
+    renderPath [] =
+      fromString "/"
+    renderPath ps@(_ : _) =
+      foldMap ((fromString "/" <>) . Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict) ps

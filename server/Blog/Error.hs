@@ -156,7 +156,8 @@ templeTypeErrorMessage err =
 
     renderConstructors =
       intercalate ", "
-        . fmap (\(name, tys) -> unwords $ Text.unpack name : fmap Temple.renderType tys)
+        . fmap
+          (\(name, tys) -> Text.unpack name ++ "(" ++ intercalate ", " (fmap Temple.renderType tys) ++ ")")
 
 templeTypeErrorReport ::
   Monad m =>

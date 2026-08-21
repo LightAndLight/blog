@@ -272,6 +272,7 @@ data ResourceInput m
   { resourceInputId :: !ResourceId
   , resourceInputType :: !(Store.ResourceType (ActionT m))
   , resourceInputMetadata :: !(Map Text MetadataValue)
+  , resourceInputProperty :: String -> ActionT m (Maybe MetadataValue)
   , resourceInputContent :: LazyByteString
   }
 
@@ -493,6 +494,7 @@ makeResource resId@(ResourceId resTyName resName) = do
           { resourceInputId = resId
           , resourceInputType = resTy
           , resourceInputMetadata = metadata
+          , resourceInputProperty = Store.lookupProperty resTy resName
           , resourceInputContent = content
           }
 
