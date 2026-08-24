@@ -156,7 +156,7 @@ templateDependency iTemplate () = do
         <$> Store.readResource (Build.resourceInputType iTemplate) name
 
   let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
-  (deps, bindings) <- do
+  (deps, bindings, _template'') <- do
     result <- runExceptT $ Temple.inferBindings readTemplateRef ref template'
     case result of
       Right x -> pure x
@@ -300,24 +300,24 @@ metaToTempleTy TBool = Temple.TBool
 metaToTempleTy TString = Temple.TString
 metaToTempleTy (TList t) = Temple.TStream (metaToTempleTy t)
 
-metaToTempleValue :: MetadataValue -> Temple.Value
-metaToTempleValue (VString s) =
-  Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict s
-metaToTempleValue VTrue =
-  Temple.VTrue
-metaToTempleValue VFalse =
-  Temple.VFalse
-metaToTempleValue (VList xs) =
-  Temple.VStream (fmap metaToTempleValue xs)
-metaToTempleValue (VConstructor name args) =
-  Temple.VConstructor name (fmap metaToTempleValue args)
+metaToTempleCore :: MetadataValue -> Temple.Core
+metaToTempleCore (VString s) =
+  Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 s]
+metaToTempleCore VTrue =
+  Temple.CTrue
+metaToTempleCore VFalse =
+  Temple.CFalse
+metaToTempleCore (VList xs) =
+  Temple.CArray (fmap metaToTempleCore xs)
+metaToTempleCore (VConstructor name args) =
+  Temple.CConstructor name (fmap metaToTempleCore args)
 
 data Part
   = PField Text
   | PIndex Int
 
 type TypeProvider m =
-  [Part] -> Temple.Type -> Temple.InferT () (ExceptT TypeProviderError m) Temple.Value
+  [Part] -> Temple.Type -> Temple.InferT () (ExceptT TypeProviderError m) Temple.Core
 
 data TypeProviderError
   = NotARecord
@@ -431,11 +431,11 @@ forRecord ::
   * Field name
   * Field type
   -}
-  ([Part] -> Text -> Temple.Type -> Temple.InferT loc m Temple.Value) ->
-  Temple.InferT loc m Temple.Value
+  ([Part] -> Text -> Temple.Type -> Temple.InferT loc m Temple.Core) ->
+  Temple.InferT loc m Temple.Core
 forRecord path ty f = do
   (fields, _rest) <- lift $ requireRecord path ty
-  fmap (Temple.VRecord . Map.fromList) . for fields $ \(name, ty') -> do
+  fmap Temple.CRecord . for fields $ \(name, ty') -> do
     value <- f (path <> pure (PField name)) name ty'
     pure (name, value)
 
@@ -527,7 +527,7 @@ nestedPropertyTypeProvider propName provider =
 constantPropertyTypeProvider ::
   MonadError DiagnosticReports m =>
   Text ->
-  (Temple.Value, Temple.Type) ->
+  (Temple.Core, Temple.Type) ->
   PropertyTypeProvider m
 constantPropertyTypeProvider propName (value, valueTy) =
   PropertyTypeProvider $
@@ -565,7 +565,7 @@ metadataPropertyTypeProvider =
                 if metaCfgOptional metaCfg && isNothing (metaCfgDefault metaCfg)
                   then mkOptional . metaToTempleTy $ metaCfgType metaCfg
                   else metaToTempleTy $ metaCfgType metaCfg
-              metadataValue = metaToTempleValue . fromJust $ Map.lookup propName metadata
+              metadataValue = metaToTempleCore . fromJust $ Map.lookup propName metadata
 
             unifyPropertyType path propTy metadataType
 
@@ -601,9 +601,9 @@ defaultPropertyTypeProvider =
 
                 case mContent of
                   Nothing ->
-                    pure $ Temple.VString mempty
+                    pure $ Temple.CString mempty
                   Just content ->
-                    pure . Temple.VString $ format content
+                    pure $ Temple.CString [Temple.CPartText . LazyByteString.toStrict $ format content]
             else
               pure Nothing
       )
@@ -668,20 +668,20 @@ listTypeProvider items path ty = do
   itemTy' <- Temple.zonkNoDefault itemTy
   items' <- for (zip [0 ..] items) $ \(ix, item) -> do
     item (path <> pure (PIndex ix)) itemTy'
-  pure $ Temple.VStream items'
+  pure $ Temple.CArray items'
 
 inferMetadataValueType ::
-  Monad m => MetadataValue -> Temple.InferT Temple.Offset m (Temple.Value, Temple.Type)
+  Monad m => MetadataValue -> Temple.InferT Temple.Offset m (Temple.Core, Temple.Type)
 inferMetadataValueType VTrue =
-  pure (Temple.VTrue, Temple.TBool)
+  pure (Temple.CTrue, Temple.TBool)
 inferMetadataValueType VFalse =
-  pure (Temple.VFalse, Temple.TBool)
+  pure (Temple.CFalse, Temple.TBool)
 inferMetadataValueType (VString s) =
-  pure (Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict s, Temple.TString)
+  pure (Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 s], Temple.TString)
 inferMetadataValueType (VConstructor name args) = do
   rest <- Temple.metavar Temple.KRow
   (args', argTys) <- unzip <$> traverse inferMetadataValueType args
-  pure (Temple.VConstructor name args', Temple.TSum (Temple.TSumConstructor name argTys rest))
+  pure (Temple.CConstructor name args', Temple.TSum (Temple.TSumConstructor name argTys rest))
 inferMetadataValueType (VList items) = do
   itemTy <- Temple.metavar Temple.KType
   items' <- for items $ \item -> do
@@ -689,7 +689,7 @@ inferMetadataValueType (VList items) = do
     -- TODO: the fact that I have to write `Offset 0` means that something's wrong.
     Temple.unify (Temple.Offset 0) itemTy itemTy'
     pure item'
-  pure (Temple.VStream items', Temple.TStream itemTy)
+  pure (Temple.CArray items', Temple.TStream itemTy)
 
 articlePropertyTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -710,13 +710,13 @@ articlePropertyTypeProvider mPrev mNext content =
 
           case mPrev of
             Nothing ->
-              pure $ Temple.VConstructor (fromString "None") []
+              pure $ Temple.CConstructor (fromString "None") []
             Just prev ->
               -- TODO: guarantee that these values have the correct type
               pure $
-                Temple.VConstructor
+                Temple.CConstructor
                   (fromString "Some")
-                  [Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue prev]
+                  [Temple.CRecord $ (fmap . fmap) metaToTempleCore prev]
       else
         if propName == fromString "next"
           then pure . Just $
@@ -726,13 +726,13 @@ articlePropertyTypeProvider mPrev mNext content =
 
               case mNext of
                 Nothing ->
-                  pure $ Temple.VConstructor (fromString "None") []
+                  pure $ Temple.CConstructor (fromString "None") []
                 Just next ->
                   -- TODO: guarantee that these values have the correct type
                   pure $
-                    Temple.VConstructor
+                    Temple.CConstructor
                       (fromString "Some")
-                      [Temple.VRecord . Map.fromList $ (fmap . fmap) metaToTempleValue next]
+                      [Temple.CRecord $ (fmap . fmap) metaToTempleCore next]
           else
             if propName == fromString "content"
               then pure . Just $
@@ -742,7 +742,11 @@ articlePropertyTypeProvider mPrev mNext content =
                   -- `content` is always a string.
                   -- unifyPropertyType path propTy contentTy
 
-                  pure . Temple.VString . Text.Lazy.Encoding.encodeUtf8 $ Builder.toLazyText content
+                  pure $
+                    Temple.CString
+                      [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $
+                          Builder.toLazyText content
+                      ]
               else
                 pure Nothing
 
@@ -776,7 +780,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
             templateContent
             (sageErrorReport err)
       Right x -> pure x
-  (deps, bindings) <- do
+  (deps, bindings, template'') <- do
     result <- do
       let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
       runExceptT $ Temple.inferBindings readTemplateRef ref template'
@@ -905,12 +909,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
 
     pure (name, value)
 
-  let
-    env = Temple.defaultEvalEnv (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate) deps
-    output =
-      Temple.evalTemplate
-        env{Temple.eeScope = Map.fromList bindings' <> Temple.eeScope env}
-        template'
+  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
 
   Build.writeResource oHtml () output
 
@@ -959,7 +958,8 @@ indexHtml (iTemplate, iArticles) oHtml = do
             templateContent
             (sageErrorReport err)
       Right x -> pure x
-  (deps, bindings) <- do
+
+  (deps, bindings, template'') <- do
     result <- do
       let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
       runExceptT $ Temple.inferBindings readTemplateRef ref template'
@@ -1015,16 +1015,18 @@ indexHtml (iTemplate, iArticles) oHtml = do
                 (fromString . resourceName $ Build.resourceInputId iTemplate)
                 ( nestedPropertyTypeProvider
                     (fromString "metadata")
-                    ( constantPropertyTypeProvider (fromString "url") (Temple.VString $ fromString "/", Temple.TString)
+                    ( constantPropertyTypeProvider
+                        (fromString "url")
+                        (Temple.CString [Temple.CPartText $ fromString "/"], Temple.TString)
                         <> constantPropertyTypeProvider
                           (fromString "title")
-                          (Temple.VString $ fromString "blog.ielliott.io", Temple.TString)
+                          (Temple.CString [Temple.CPartText $ fromString "blog.ielliott.io"], Temple.TString)
                         <> constantPropertyTypeProvider
                           (fromString "description")
-                          (Temple.VString $ fromString "Isaac Elliott's personal blog.", Temple.TString)
-                        <> constantPropertyTypeProvider (fromString "math") (Temple.VFalse, Temple.TBool)
-                        <> constantPropertyTypeProvider (fromString "chinese") (Temple.VFalse, Temple.TBool)
-                        <> constantPropertyTypeProvider (fromString "asciinema") (Temple.VFalse, Temple.TBool)
+                          (Temple.CString [Temple.CPartText $ fromString "Isaac Elliott's personal blog."], Temple.TString)
+                        <> constantPropertyTypeProvider (fromString "math") (Temple.CFalse, Temple.TBool)
+                        <> constantPropertyTypeProvider (fromString "chinese") (Temple.CFalse, Temple.TBool)
+                        <> constantPropertyTypeProvider (fromString "asciinema") (Temple.CFalse, Temple.TBool)
                     )
                     <> defaultPropertyTypeProvider
                     <> lookupPropertyTypeProvider
@@ -1042,7 +1044,7 @@ indexHtml (iTemplate, iArticles) oHtml = do
               let actualTy = mkOptional Temple.TString
               unifyPropertyType path' ty actualTy
 
-              pure $ Temple.VConstructor (fromString "None") []
+              pure $ Temple.CConstructor (fromString "None") []
             either (throwError . TypeError path') (pure . snd) result
           "posts" -> do
             let readTemplateRef' = lift . readTemplateRef
@@ -1081,7 +1083,7 @@ indexHtml (iTemplate, iArticles) oHtml = do
                           ( nestedPropertyTypeProvider (fromString "metadata") $
                               constantPropertyTypeProvider
                                 (fromString "type")
-                                ( Temple.VConstructor (fromString "Article") []
+                                ( Temple.CConstructor (fromString "Article") []
                                 , Temple.TSum $
                                     foldr
                                       (uncurry Temple.TSumConstructor)
@@ -1139,12 +1141,7 @@ indexHtml (iTemplate, iArticles) oHtml = do
 
     pure (name, value)
 
-  let
-    env = Temple.defaultEvalEnv (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate) deps
-    output =
-      Temple.evalTemplate
-        env{Temple.eeScope = Map.fromList bindings' <> Temple.eeScope env}
-        template'
+  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
 
   Build.writeResource oHtml () output
 
