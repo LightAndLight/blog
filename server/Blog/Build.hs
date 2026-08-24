@@ -98,14 +98,13 @@ runRule ::
   Set ResourceId ->
   ActionT m ()
 runRule (Rule name inputs outputs f) changes = do
-  InputTuples _olds news <- queryInputs inputs changes
+  InputTuples headers _olds news <- queryInputs inputs changes
   unless (null news) $ do
     trace $ "begin " ++ name
     traverse_
       ( \tuple -> do
           let age = inputTupleAge tuple
           let reasons = inputTupleReasons tuple
-          let headers = inputTupleHeaders tuple
           let bindings = inputTupleBindings tuple
           let input' = inputTupleValue tuple
 
@@ -313,7 +312,6 @@ data InputTuple a
   = InputTuple
   { inputTupleAge :: !Age
   , inputTupleReasons :: ![Reason]
-  , inputTupleHeaders :: ![ResourceId]
   , inputTupleBindings :: !(Map String String)
   , inputTupleValue :: !a
   }
@@ -321,6 +319,8 @@ data InputTuple a
 
 data InputTuples a
   = InputTuples
+      -- | Headers
+      [String]
       -- | Olds
       [InputTuple a]
       -- | News
@@ -345,7 +345,6 @@ inputTupleJoin t1 t2 = do
     InputTuple
       { inputTupleAge = inputTupleAge t1 <> inputTupleAge t2
       , inputTupleReasons = inputTupleReasons t1 <> inputTupleReasons t2
-      , inputTupleHeaders = inputTupleHeaders t1 <> inputTupleHeaders t2
       , inputTupleBindings = left <> right <> common'
       , inputTupleValue = inputTupleValue t1 (inputTupleValue t2)
       }
@@ -353,17 +352,18 @@ inputTupleJoin t1 t2 = do
 instance Applicative InputTuples where
   pure a =
     InputTuples
+      ["it"]
       [ InputTuple
           { inputTupleAge = Old
           , inputTupleReasons = []
-          , inputTupleHeaders = []
           , inputTupleBindings = mempty
           , inputTupleValue = a
           }
       ]
       []
-  (<*>) (InputTuples old1 new1) (InputTuples old2 new2) =
+  (<*>) (InputTuples headers1 old1 new1) (InputTuples headers2 old2 new2) =
     InputTuples
+      (headers1 ++ headers2)
       [z | x <- old1, y <- old2, Just z <- [inputTupleJoin x y]]
       ( [z | x <- new1, y <- old2 ++ new2, Just z <- [inputTupleJoin x y]]
           ++ [z | x <- old1, y <- new2, Just z <- [inputTupleJoin x y]]
@@ -400,7 +400,7 @@ queryInputs i = go i
           -- TODO: not sure if this is the best way to handle missing resource types,
           -- but right now anything stricter stops me from state-machine-testing the
           -- system due to the built-in rules.
-          pure $ InputTuples [] []
+          pure $ InputTuples [] [] []
         Just resTy -> do
           resources <- Store.listResource resTy
 
@@ -419,7 +419,6 @@ queryInputs i = go i
                                 InputTuple
                                   { inputTupleAge = New
                                   , inputTupleReasons = [Reason Updated resId]
-                                  , inputTupleHeaders = [resId]
                                   , inputTupleBindings = bindings
                                   , inputTupleValue = value
                                   }
@@ -430,7 +429,6 @@ queryInputs i = go i
                                 InputTuple
                                   { inputTupleAge = Old
                                   , inputTupleReasons = []
-                                  , inputTupleHeaders = [resId]
                                   , inputTupleBindings = bindings
                                   , inputTupleValue = value
                                   }
@@ -443,16 +441,16 @@ queryInputs i = go i
 
           case quant of
             IAny ->
-              pure $ InputTuples olds news
+              pure $ InputTuples [resTyName ++ ":*"] olds news
             IAll ->
               if null news
                 then
                   pure $
                     InputTuples
+                      ["all(" ++ resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
                       [ InputTuple
                           { inputTupleAge = Old
                           , inputTupleReasons = []
-                          , inputTupleHeaders = [ResourceId resTyName "*"]
                           , inputTupleBindings = mempty
                           , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
                           }
@@ -462,11 +460,11 @@ queryInputs i = go i
                   let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
                   pure $
                     InputTuples
+                      ["all(" ++ resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
                       []
                       [ InputTuple
                           { inputTupleAge = New
                           , inputTupleReasons = reasons
-                          , inputTupleHeaders = [ResourceId resTyName "*"]
                           , inputTupleBindings = mempty
                           , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
                           }
@@ -501,6 +499,13 @@ makeResource resId@(ResourceId resTyName resName) = do
 newtype ResourceNamePattern
   = ResourceNamePattern [ResourceNamePatternPart]
   deriving (Show, Eq, Semigroup)
+
+renderResourceNamePattern :: ResourceNamePattern -> String
+renderResourceNamePattern (ResourceNamePattern parts) = foldMap renderResourceNamePatternPart parts
+  where
+    renderResourceNamePatternPart PAny = "*"
+    renderResourceNamePatternPart (PExact s) = s
+    renderResourceNamePatternPart (PBind s) = "{" ++ s ++ "}"
 
 data ResourceNamePatternPart
   = PAny
