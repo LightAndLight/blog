@@ -1,8 +1,10 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE TypeApplications #-}
 
 module Blog.Rules (rules) where
 
@@ -47,6 +49,7 @@ import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import qualified Data.Map as Map
 import Data.Maybe (fromJust, fromMaybe, isNothing)
+import Data.Monoid (First (..), getFirst)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -63,9 +66,11 @@ import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
-import Text.Pandoc.Builder (Blocks)
+import Text.Pandoc.Builder (Block, Blocks)
 import qualified Text.Pandoc.Builder as Blocks (toList)
+import Text.Pandoc.Definition (Block (..))
 import qualified Text.Pandoc.Html as Html
+import Text.Pandoc.Walk (query, walk)
 import qualified Text.Sage as Sage
 import qualified Toml
 
@@ -88,13 +93,20 @@ rules =
           <*> Build.iResource "article" (Build.iBind "name")
           <*> Build.iResource "adjacency" (Build.iMatch "article-" <> Build.iBind "name")
       )
-      (Build.oResource "html" (Build.oMatch "article-" *< Build.oBind "name"))
+      ( (,)
+          <$> Build.oResource "excerpt" (Build.oMatch "article-" *< Build.oBind "name")
+          <*> Build.oResource "html" (Build.oMatch "article-" *< Build.oBind "name")
+      )
       articleHtml
     <> Build.rule
       "index-html"
       ( (,)
           <$> Build.iResource "template" (Build.iMatch "post-list.html.temple")
-          <*> Build.iResourceAll "article" Build.iAny
+          <*> Build.iAll
+            ( (,)
+                <$> Build.iResource "article" (Build.iBind "name")
+                <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+            )
       )
       (Build.oResource "html" (Build.oMatch "index"))
       indexHtml
@@ -473,7 +485,10 @@ resourceTypeProvider store xactId path resourceTypesTy = do
       propertiesTypeProvider
         (Store.hoistResourceType lift resTy)
         resName
-        (defaultPropertyTypeProvider <> lookupPropertyTypeProvider)
+        ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+            <> contentPropertyTypeProvider
+            <> lookupPropertyTypeProvider
+        )
         path''
         propertiesTy
 
@@ -511,6 +526,9 @@ instance Monad m => Semigroup (PropertyTypeProvider m) where
         runMaybeT $
           MaybeT (a resTy resName propName)
             <|> MaybeT (b resTy resName propName)
+
+instance Monad m => Monoid (PropertyTypeProvider m) where
+  mempty = PropertyTypeProvider $ \_resTy _resName _propName -> pure Nothing
 
 nestedPropertyTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -571,42 +589,39 @@ metadataPropertyTypeProvider =
 
             pure metadataValue
 
-defaultPropertyTypeProvider ::
-  MonadError DiagnosticReports m =>
-  PropertyTypeProvider m
-defaultPropertyTypeProvider =
-  nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
-    <> PropertyTypeProvider
-      ( \resTy resName propName ->
-          if propName == fromString "content"
-            then pure . Just $
-              \path propTy -> do
-                let contentTy = Temple.TString
+contentPropertyTypeProvider :: MonadError DiagnosticReports m => PropertyTypeProvider m
+contentPropertyTypeProvider =
+  PropertyTypeProvider
+    ( \resTy resName propName ->
+        if propName == fromString "content"
+          then pure . Just $
+            \path propTy -> do
+              let contentTy = Temple.TString
 
-                unifyPropertyType path propTy contentTy
+              unifyPropertyType path propTy contentTy
 
-                (mFormat, mContent) <-
-                  lift . lift $
-                    (,)
-                      <$> Store.lookupProperty resTy (Text.unpack resName) "content-format"
-                      <*> Store.readResource resTy (Text.unpack resName)
+              (mFormat, mContent) <-
+                lift . lift $
+                  (,)
+                    <$> Store.lookupProperty resTy (Text.unpack resName) "content-format"
+                    <*> Store.readResource resTy (Text.unpack resName)
 
-                let
-                  format :: LazyByteString -> LazyByteString
-                  format =
-                    case mFormat of
-                      Just (VString s) | s == fromString "text" -> id
-                      Just (VString s) | s == fromString "line" -> \x -> ByteString.Lazy.Char8.dropWhileEnd (`elem` "\r\n") x
-                      _ -> id
+              let
+                format :: LazyByteString -> LazyByteString
+                format =
+                  case mFormat of
+                    Just (VString s) | s == fromString "text" -> id
+                    Just (VString s) | s == fromString "line" -> \x -> ByteString.Lazy.Char8.dropWhileEnd (`elem` "\r\n") x
+                    _ -> id
 
-                case mContent of
-                  Nothing ->
-                    pure $ Temple.CString mempty
-                  Just content ->
-                    pure $ Temple.CString [Temple.CPartText . LazyByteString.toStrict $ format content]
-            else
-              pure Nothing
-      )
+              case mContent of
+                Nothing ->
+                  pure $ Temple.CString mempty
+                Just content ->
+                  pure $ Temple.CString [Temple.CPartText . LazyByteString.toStrict $ format content]
+          else
+            pure Nothing
+    )
 
 lookupPropertyTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -757,9 +772,9 @@ articleHtml ::
   , Build.ResourceInput m LazyByteString
   , Build.ResourceInput m LazyByteString
   ) ->
-  Build.ResourceOutput m () ->
+  (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
   Build.ActionT m ()
-articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
+articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
   let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
 
   let
@@ -802,17 +817,35 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
             reports
       Right x -> pure x
 
-  html <- do
+  (mExcerpt, html) <- do
     let articleContent = Build.resourceInputContent iArticle
     articleContent' <-
       case Text.Lazy.Encoding.decodeUtf8' articleContent of
         Left err -> error $ "TODO: " ++ show err
         Right x -> pure $! LazyText.toStrict x
-    markdown <-
+    (mExcerpt, markdown) <-
       case commonmark ("(" ++ renderResourceId (Build.resourceInputId iArticle) ++ ")") articleContent' of
         Left err -> error $ "TODO: " ++ show err
-        Right x -> pure $ unCm (x :: Cm () Blocks)
-    Html.runRenderT Html.emptyNotesState . Html.renderBlocks $ Blocks.toList markdown
+        Right x -> do
+          let
+            document =
+              walk
+                @[Block]
+                ( filter $
+                    \case
+                      CodeBlock (_ident, classes, _kvs) _content ->
+                        not $ fromString "toml+blog-metadata" `elem` classes
+                      _ ->
+                        True
+                )
+                $ Blocks.toList
+                $ unCm (x :: Cm () Blocks)
+          pure (getFirst $ query @Block (First . Just) document, document)
+    (,)
+      <$> traverse (Html.runRenderT Html.emptyNotesState . Html.renderBlock) mExcerpt
+      <*> Html.runRenderT Html.emptyNotesState (Html.renderBlocks markdown)
+
+  for_ mExcerpt $ Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . Builder.toLazyText
 
   (prev, next) <- do
     let adjacencyFile = fromString $ "(" ++ renderResourceId (Build.resourceInputId iAdjacency) ++ ")"
@@ -885,7 +918,8 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
                 (Build.resourceInputType iArticle)
                 (fromString . resourceName $ Build.resourceInputId iArticle)
                 ( articlePropertyTypeProvider prev next html
-                    <> defaultPropertyTypeProvider
+                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                    <> contentPropertyTypeProvider
                     <> lookupPropertyTypeProvider
                 )
                 path'
@@ -935,10 +969,12 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
 indexHtml ::
   forall m.
   MonadIO m =>
-  (Build.ResourceInput m LazyByteString, Build.ResourceInputs m LazyByteString) ->
+  ( Build.ResourceInput m LazyByteString
+  , [(Build.ResourceInput m LazyByteString, Maybe (Build.ResourceInput m LazyByteString))]
+  ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
-indexHtml (iTemplate, iArticles) oHtml = do
+indexHtml (iTemplate, iArticlesWithExcerpts) oHtml = do
   let
     inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
 
@@ -1031,7 +1067,8 @@ indexHtml (iTemplate, iArticles) oHtml = do
                         <> constantPropertyTypeProvider (fromString "chinese") (Temple.CFalse, Temple.TBool)
                         <> constantPropertyTypeProvider (fromString "asciinema") (Temple.CFalse, Temple.TBool)
                     )
-                    <> defaultPropertyTypeProvider
+                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                    <> contentPropertyTypeProvider
                     <> lookupPropertyTypeProvider
                 )
                 path'
@@ -1056,9 +1093,9 @@ indexHtml (iTemplate, iArticles) oHtml = do
             sortedArticles <-
               fmap snd . sortOn (Down . fst)
                 <$> for
-                  (zip [0 ..] $ Build.resourceInputs iArticles)
-                  ( \(ix, res) -> do
-                      let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata res)
+                  (zip [0 ..] iArticlesWithExcerpts)
+                  ( \(ix, (iArticle, miExcerpt)) -> do
+                      let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata iArticle)
                       published <-
                         case mPublished of
                           Nothing ->
@@ -1069,17 +1106,17 @@ indexHtml (iTemplate, iArticles) oHtml = do
                           Just published
                             | VString s <- published -> pure s
                             | otherwise -> error "TODO: published not a string"
-                      pure (published, res)
+                      pure (published, (iArticle, miExcerpt))
                   )
 
             result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
               ty <- Temple.instantiateTypeScheme tyScheme
               listTypeProvider
                 ( fmap
-                    ( \res ->
+                    ( \(iArticle, miExcerpt) ->
                         propertiesTypeProvider
-                          (Build.resourceInputType res)
-                          (fromString . resourceName $ Build.resourceInputId res)
+                          (Build.resourceInputType iArticle)
+                          (fromString . resourceName $ Build.resourceInputId iArticle)
                           -- TODO: this property should come from metadata.
                           --
                           -- Currently blocked on having a good syntax for sum types in metadata.
@@ -1115,6 +1152,15 @@ indexHtml (iTemplate, iArticles) oHtml = do
                                         )
                                       ]
                                 )
+                                <> foldMap
+                                  ( \iExcerpt ->
+                                      constantPropertyTypeProvider
+                                        (fromString "excerpt")
+                                        ( Temple.CString [Temple.CPartText . LazyByteString.toStrict $ Build.resourceInputContent iExcerpt]
+                                        , Temple.TString
+                                        )
+                                  )
+                                  miExcerpt
                                 <> metadataPropertyTypeProvider
                           )
                     )
