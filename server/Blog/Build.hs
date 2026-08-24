@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DeriveFunctor #-}
+{-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GADTs #-}
@@ -19,7 +20,9 @@ module Blog.Build
   , ResourceInput (..)
   , ResourceInputs (..)
   , iResource
+  , iResourceOptional
   , iResourceAll
+  , iAll
   , ResourceNamePattern
   , iMatch
   , iBind
@@ -79,6 +82,7 @@ import Data.Kind (Type)
 import Data.List (intercalate, nub, stripPrefix)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String (fromString)
@@ -254,6 +258,7 @@ data Input m :: Type -> Type where
   IPure :: a -> Input m a
   IApply :: Input m (a -> b) -> Input m a -> Input m b
   IResource :: InputQuantifier m a -> String -> ResourceNamePattern -> Input m a
+  IMany :: Input m a -> Input m [a]
 
 instance Functor (Input m) where
   fmap = IFmap
@@ -262,23 +267,24 @@ instance Applicative (Input m) where
   pure = IPure
   (<*>) = IApply
 
-data InputQuantifier m a where
-  IAny :: InputQuantifier m (ResourceInput m)
-  IAll :: InputQuantifier m (ResourceInputs m)
+data InputQuantifier m :: Type -> Type where
+  IAny :: InputQuantifier m (ResourceInput m LazyByteString)
+  IOptional :: InputQuantifier m (Maybe (ResourceInput m LazyByteString))
+  IAll :: InputQuantifier m (ResourceInputs m LazyByteString)
 
-data ResourceInput m
+data ResourceInput m a
   = ResourceInput
   { resourceInputId :: !ResourceId
   , resourceInputType :: !(Store.ResourceType (ActionT m))
   , resourceInputMetadata :: !(Map Text MetadataValue)
   , resourceInputProperty :: String -> ActionT m (Maybe MetadataValue)
-  , resourceInputContent :: LazyByteString
+  , resourceInputContent :: a
   }
 
-data ResourceInputs m
+data ResourceInputs m a
   = ResourceInputs
   { resourceInputsType :: !String
-  , resourceInputs :: ![ResourceInput m]
+  , resourceInputs :: ![ResourceInput m a]
   }
 
 {-
@@ -315,7 +321,7 @@ data InputTuple a
   , inputTupleBindings :: !(Map String String)
   , inputTupleValue :: !a
   }
-  deriving (Functor)
+  deriving (Functor, Foldable, Traversable)
 
 data InputTuples a
   = InputTuples
@@ -441,7 +447,17 @@ queryInputs i = go i
 
           case quant of
             IAny ->
-              pure $ InputTuples [resTyName ++ ":*"] olds news
+              pure $
+                InputTuples
+                  [resTyName ++ ":" ++ renderResourceNamePattern resNamePat]
+                  (mapMaybe sequence olds)
+                  (mapMaybe sequence news)
+            IOptional ->
+              pure $
+                InputTuples
+                  ["optional(" ++ resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
+                  olds
+                  news
             IAll ->
               if null news
                 then
@@ -452,7 +468,7 @@ queryInputs i = go i
                           { inputTupleAge = Old
                           , inputTupleReasons = []
                           , inputTupleBindings = mempty
-                          , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
+                          , inputTupleValue = ResourceInputs resTyName . mapMaybe inputTupleValue $ news ++ olds
                           }
                       ]
                       []
@@ -466,11 +482,40 @@ queryInputs i = go i
                           { inputTupleAge = New
                           , inputTupleReasons = reasons
                           , inputTupleBindings = mempty
-                          , inputTupleValue = ResourceInputs resTyName . fmap inputTupleValue $ news ++ olds
+                          , inputTupleValue = ResourceInputs resTyName . mapMaybe inputTupleValue $ news ++ olds
                           }
                       ]
+    go (IMany input) changes = do
+      tuples <- go input changes
+      let InputTuples headers olds news = tuples
+      if null news
+        then
+          pure $
+            InputTuples
+              ["all(" ++ intercalate ", " headers ++ ")"]
+              [ InputTuple
+                  { inputTupleAge = Old
+                  , inputTupleReasons = []
+                  , inputTupleBindings = mempty
+                  , inputTupleValue = fmap inputTupleValue $ news ++ olds
+                  }
+              ]
+              []
+        else do
+          let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
+          pure $
+            InputTuples
+              ["all(" ++ intercalate ", " headers ++ ")"]
+              []
+              [ InputTuple
+                  { inputTupleAge = New
+                  , inputTupleReasons = reasons
+                  , inputTupleBindings = mempty
+                  , inputTupleValue = fmap inputTupleValue $ news ++ olds
+                  }
+              ]
 
-makeResource :: Monad m => ResourceId -> ActionT m (ResourceInput m)
+makeResource :: Monad m => ResourceId -> ActionT m (Maybe (ResourceInput m LazyByteString))
 makeResource resId@(ResourceId resTyName resName) = do
   store <- askStore
   transactionId <- askTransactionId
@@ -479,7 +524,7 @@ makeResource resId@(ResourceId resTyName resName) = do
   mContent <- Store.readResource resTy resName
   case mContent of
     Nothing ->
-      error $ "resource " ++ renderResourceId resId ++ " does not exist"
+      pure Nothing
     Just content -> do
       metadata <- do
         mMetadataContent <- Store.readResourceMetadata resTy resName
@@ -487,14 +532,15 @@ makeResource resId@(ResourceId resTyName resName) = do
           (pure mempty)
           (parseResourceMetadata (Store.resourceTypeConfig resTy) resTyName resName)
           mMetadataContent
-      pure
-        ResourceInput
-          { resourceInputId = resId
-          , resourceInputType = resTy
-          , resourceInputMetadata = metadata
-          , resourceInputProperty = Store.lookupProperty resTy resName
-          , resourceInputContent = content
-          }
+      pure $
+        Just
+          ResourceInput
+            { resourceInputId = resId
+            , resourceInputType = resTy
+            , resourceInputMetadata = metadata
+            , resourceInputProperty = Store.lookupProperty resTy resName
+            , resourceInputContent = content
+            }
 
 newtype ResourceNamePattern
   = ResourceNamePattern [ResourceNamePatternPart]
@@ -589,8 +635,16 @@ iResource ::
   String ->
   -- | Resource name
   ResourceNamePattern ->
-  Input m (ResourceInput m)
+  Input m (ResourceInput m LazyByteString)
 iResource resTyName = IResource IAny resTyName
+
+iResourceOptional ::
+  -- | Resource type
+  String ->
+  -- | Resource name
+  ResourceNamePattern ->
+  Input m (Maybe (ResourceInput m LazyByteString))
+iResourceOptional = IResource IOptional
 
 {-| Declare a bulk input of a particular resource type, matching the given pattern.
 
@@ -601,8 +655,11 @@ iResourceAll ::
   String ->
   -- | Resource name
   ResourceNamePattern ->
-  Input m (ResourceInputs m)
+  Input m (ResourceInputs m LazyByteString)
 iResourceAll = IResource IAll
+
+iAll :: Input m a -> Input m [a]
+iAll = IMany
 
 data Output m :: Type -> Type where
   OFmap :: (a -> b) -> Output m a -> Output m b
@@ -753,6 +810,7 @@ inputResourceIdPatterns (IFmap _f a) = inputResourceIdPatterns a
 inputResourceIdPatterns (IPure _a) = []
 inputResourceIdPatterns (IApply a b) = inputResourceIdPatterns a ++ inputResourceIdPatterns b
 inputResourceIdPatterns (IResource _quant resTyName resNamePat) = [ResourceIdPattern resTyName resNamePat]
+inputResourceIdPatterns (IMany a) = inputResourceIdPatterns a
 
 outputResourceIdPatterns :: Output m a -> [ResourceIdPattern]
 outputResourceIdPatterns (OFmap _f a) = outputResourceIdPatterns a

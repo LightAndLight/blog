@@ -125,7 +125,7 @@ getRecordFields ty' =
 templateDependency ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m ->
+  Build.ResourceInput m LazyByteString ->
   () ->
   Build.ActionT m ()
 templateDependency iTemplate () = do
@@ -198,7 +198,7 @@ templateDependency iTemplate () = do
 
 articleAdjacency ::
   Monad m =>
-  Build.ResourceInputs m ->
+  Build.ResourceInputs m LazyByteString ->
   Build.ResourceOutput m String ->
   Build.ActionT m ()
 articleAdjacency iArticles oAdjacency = do
@@ -753,7 +753,10 @@ articlePropertyTypeProvider mPrev mNext content =
 articleHtml ::
   forall m.
   MonadIO m =>
-  (Build.ResourceInput m, Build.ResourceInput m, Build.ResourceInput m) ->
+  ( Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
@@ -932,7 +935,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) oHtml = do
 indexHtml ::
   forall m.
   MonadIO m =>
-  (Build.ResourceInput m, Build.ResourceInputs m) ->
+  (Build.ResourceInput m LazyByteString, Build.ResourceInputs m LazyByteString) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 indexHtml (iTemplate, iArticles) oHtml = do
@@ -1150,7 +1153,7 @@ indexHtml (iTemplate, iArticles) oHtml = do
 resourceRoute ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m ->
+  Build.ResourceInput m LazyByteString ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 resourceRoute iContent oRoute = do
