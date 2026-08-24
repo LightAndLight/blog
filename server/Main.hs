@@ -20,7 +20,7 @@ import qualified Blog.Store as Store
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
 import Control.Monad (unless)
-import Control.Monad.Catch (MonadMask)
+import Control.Monad.Catch (MonadMask, onException)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -30,9 +30,11 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
+import qualified Data.Char as Char
 import Data.Foldable (for_)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (fromMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -40,6 +42,7 @@ import qualified Data.Text.Encoding as Text.Encoding
 import Data.Time.Clock (UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
 import Data.Traversable (for)
+import GHC.Stack (HasCallStack)
 import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified)
 import Network.HTTP.Types.Status
   ( badRequest400
@@ -125,7 +128,7 @@ initRoutes :: Store (ExceptT DiagnosticReports IO) -> IO Routes
 initRoutes store = do
   routesVar <- atomically $ Routes <$> newTVar Routes.empty <*> newTVar mempty
 
-  result <- runExceptT . withTransaction store routesVar Nothing $ \xactId -> do
+  result <- runExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
     mResTy <- Store.lookupResourceType store xactId "route"
     case mResTy of
       Nothing -> do
@@ -185,6 +188,15 @@ handleT ::
   (Wai.Response -> IO Wai.ResponseReceived) -> HandlerT m Wai.Response -> m Wai.ResponseReceived
 handleT respond (HandlerT ma) = liftIO . either respond respond =<< runExceptT ma
 
+handleExceptT :: Monad m => ExceptT DiagnosticReports m a -> HandlerT m a
+handleExceptT ma = do
+  result <- lift $ runExceptT ma
+  case result of
+    Left err ->
+      throwError $ Wai.responseLBS badRequest400 [] (renderDiagnosticReports err)
+    Right a ->
+      pure a
+
 requireHeader :: (MonadError Wai.Response m, MonadIO m) => RequestHeaders -> String -> m ByteString
 requireHeader headers headerName = do
   case lookup (fromString headerName) headers of
@@ -196,15 +208,6 @@ requireHeader headers headerName = do
           (fromString $ "missing header: " ++ headerName)
     Just headerValue ->
       pure headerValue
-
-handleExceptT :: Monad m => ExceptT DiagnosticReports m a -> HandlerT m a
-handleExceptT ma = do
-  result <- lift $ runExceptT ma
-  case result of
-    Left err ->
-      throwError $ Wai.responseLBS badRequest400 [] (renderDiagnosticReports err)
-    Right a ->
-      pure a
 
 optionalTransactionIdHeader ::
   MonadError Wai.Response m => RequestHeaders -> m (Maybe Store.TransactionId)
@@ -224,11 +227,12 @@ parseTransactionId value =
     Just x -> pure x
 
 withTransaction ::
+  HasCallStack =>
   (MonadMask m, MonadIO m) =>
   Store m ->
   Routes ->
   Maybe Store.TransactionId ->
-  (Store.TransactionId -> m a) ->
+  (Store.TransactionId -> Bool -> m a) ->
   m a
 withTransaction store routes Nothing f =
   Store.bracketTransaction
@@ -236,8 +240,13 @@ withTransaction store routes Nothing f =
     (liftIO . commitRoutes routes)
     (liftIO . rollbackRoutes routes)
     store
-    f
-withTransaction _store _routes (Just xactId) f = f xactId
+    False
+    (\xactId -> f xactId False)
+withTransaction store _routes (Just xactId) f = do
+  transaction <-
+    fromMaybe (error $ "transaction not found: " ++ Store.renderTransactionId xactId)
+      <$> Store.lookupTransaction store xactId
+  f xactId $ Store.xactDefer transaction
 
 getRouteEntry ::
   MonadError DiagnosticReports m => Store.ResourceType m -> ResourceId -> m Blog.Route.RouteEntry
@@ -301,7 +310,8 @@ app store routesVar request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                mItems <- handleExceptT . runMaybeT . withTransaction (Store.hoistStore lift store) routesVar mXactId $ \xactId -> do
+                let store' = Store.hoistStore lift store
+                mItems <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
                   resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
                   lift $ Store.listResource resTy
 
@@ -319,24 +329,24 @@ app store routesVar request respond = do
                   then do
                     mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                    let store' = Store.hoistStore lift store
-                    mChanges <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId -> do
-                      resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
-                      entries <- lift $ Store.listResource resTy
-                      evalRules store' routesVar xactId entries
+                    handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+                      mResTy <- Store.lookupResourceType store xactId (Text.unpack resTyName)
+                      case mResTy of
+                        Nothing ->
+                          pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
+                        Just resTy -> do
+                          entries <- Store.listResource resTy
+                          changes <- evalRules store routesVar xactId entries
 
-                    case mChanges of
-                      Nothing ->
-                        pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
-                      Just changes ->
-                        pure $
-                          Wai.responseLBS
-                            ok200
-                            []
-                            ( ByteString.Lazy.Char8.unlines $
-                                fromString ("refreshed " ++ Text.unpack resTyName ++ ":*")
-                                  : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
-                            )
+                          pure $
+                            Wai.responseLBS
+                              ok200
+                              []
+                              ( ByteString.Lazy.Char8.unlines $
+                                  fromString
+                                    ("refreshed " ++ Text.unpack resTyName ++ ":*" ++ if defer then " (ignoring defer)" else "")
+                                    : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                              )
                   else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       [part]
         | part == fromString ".transaction" ->
@@ -351,7 +361,19 @@ app store routesVar request respond = do
         | part == fromString ".transaction" ->
             if action == fromString "begin"
               then do
-                xactId <- handleExceptT $ Store.beginTransaction store
+                defer <-
+                  case lookup (fromString "X-Blog-Transaction-Defer") (Wai.requestHeaders request) of
+                    Nothing -> pure False
+                    Just value -> do
+                      case fmap Char.toLower $ ByteString.Char8.unpack value of
+                        "true" -> pure True
+                        "false" -> pure False
+                        _ ->
+                          throwError
+                            . Wai.responseLBS badRequest400 []
+                            $ fromString "invalid X-Blog-Transaction-Defer value: " <> LazyByteString.fromStrict value
+
+                xactId <- handleExceptT $ Store.beginTransaction store defer
                 liftIO $ beginRoutes routesVar xactId
                 pure $ Wai.responseLBS ok200 [] (fromString $ Store.renderTransactionId xactId)
               else
@@ -361,9 +383,28 @@ app store routesVar request respond = do
                     xactId <- do
                       value <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-TransactionId"
                       parseTransactionId value
-                    handleExceptT $ Store.commitTransaction store xactId
-                    liftIO $ commitRoutes routesVar xactId
-                    pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
+                    handleExceptT $ do
+                      transaction <-
+                        maybe (throwError $ DiagnosticSimple "transaction not found") pure
+                          =<< Store.lookupTransaction store xactId
+                      let
+                        commit = do
+                          Store.commitTransaction store xactId
+                          liftIO $ commitRoutes routesVar xactId
+                      if Store.xactDefer transaction
+                        then do
+                          changes <- do
+                            let resIds = fmap Store.xactChangeId (Store.xactChanges transaction)
+                            Store.saveDeferred store xactId
+                            evalRules store routesVar xactId resIds `onException` Store.restoreDeferred store xactId
+                          commit
+                          pure . Wai.responseLBS ok200 [] $
+                            fromString "resource changes:\n"
+                              <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
+                              <> fromString ("\ncommitted " ++ Store.renderTransactionId xactId)
+                        else do
+                          commit
+                          pure . Wai.responseLBS ok200 [] . fromString $ "committed " ++ Store.renderTransactionId xactId
                   else
                     if action == fromString "rollback"
                       then do
@@ -384,7 +425,8 @@ app store routesVar request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                mBody <- handleExceptT . runMaybeT . withTransaction (Store.hoistStore lift store) routesVar mXactId $ \xactId -> do
+                let store' = Store.hoistStore lift store
+                mBody <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
                   resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
                   MaybeT $ Store.readResource resTy (Text.unpack resName)
 
@@ -399,7 +441,7 @@ app store routesVar request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+                mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
                   resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
                   Store.readResourceMetadata resTy (Text.unpack resName)
 
@@ -413,7 +455,7 @@ app store routesVar request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                (propNames, changes) <- handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+                handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
                   body <- liftIO $ Wai.consumeRequestBodyLazy request
                   Toml.Toml (Toml.Located _offset properties) nonKeys <-
                     case Toml.parse $ LazyByteString.toStrict body of
@@ -435,18 +477,29 @@ app store routesVar request respond = do
                     Store.setProperty resTy (resourceName resId) (Text.unpack name) (metadataValueFromToml value)
                     pure name
 
-                  (,) names <$> evalRules store routesVar xactId [resId]
+                  if defer
+                    then do
+                      let
+                        response =
+                          fromString "updated properties:\n"
+                            <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
+                            <> fromString "(rules deferred)"
 
-                let
-                  body =
-                    fromString "updated properties:\n"
-                      <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") propNames
-                      <> if null changes
-                        then mempty
-                        else
-                          fromString ("\nresource changes:\n")
-                            <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
-                pure $ Wai.responseLBS ok200 [] body
+                      pure $ Wai.responseLBS ok200 [] response
+                    else do
+                      changes <- evalRules store routesVar xactId [resId]
+
+                      let
+                        response =
+                          fromString "updated properties:\n"
+                            <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
+                            <> if null changes
+                              then mempty
+                              else
+                                fromString ("\nresource changes:\n")
+                                  <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
+
+                      pure $ Wai.responseLBS ok200 [] response
               else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
       [part, resTyName, resName, part', propName]
         | part == fromString ".resource"
@@ -455,7 +508,7 @@ app store routesVar request respond = do
               then do
                 mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-                mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+                mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
                   resTy <- Store.getResourceType store xactId $ Text.unpack resTyName
                   Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
 
@@ -468,7 +521,7 @@ app store routesVar request respond = do
       path -> do
         mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-        handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+        handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
           routes <- liftIO $ readActiveRoutes routesVar
           case Routes.lookup path routes of
             Nothing ->
@@ -498,7 +551,7 @@ httpResourceGet store routesVar request = do
   resName <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-ResourceName"
   mXactId <- optionalTransactionIdHeader headers
 
-  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
     resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
     Store.readResource resTy resName
   case mBody of
@@ -526,32 +579,35 @@ httpResourcePost store routesVar request = do
   let resId = ResourceId resTyName resName
   mXactId <- optionalTransactionIdHeader headers
 
-  mChanges <- handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
     resTy <- Store.getResourceType store xactId (fromString resTyName)
     exists <- Store.doesResourceExist resTy resName
     if exists
-      then pure Nothing
+      then throwError . DiagnosticSimple $ "resource " ++ resTyName ++ ":" ++ resName ++ " already exists"
       else do
         body <- liftIO $ Wai.consumeRequestBodyLazy request
-        do
-          Store.writeResource resTy resName body
-          Just <$> evalRules store routesVar xactId [resId]
-  case mChanges of
-    Nothing ->
-      throwError $
-        Wai.responseLBS
-          badRequest400
-          []
-          (fromString $ "resource " ++ resTyName ++ ":" ++ resName ++ " already exists")
-    Just changes ->
-      pure $
-        Wai.responseLBS
-          created201
-          []
-          ( ByteString.Lazy.Char8.unlines $
-              fromString ("created " ++ resTyName ++ ":" ++ resName)
-                : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
-          )
+        Store.writeResource resTy resName body
+        if defer
+          then
+            pure $
+              Wai.responseLBS
+                created201
+                []
+                ( ByteString.Lazy.Char8.unlines
+                    [ fromString ("created " ++ resTyName ++ ":" ++ resName)
+                    , fromString "(rules deferred)"
+                    ]
+                )
+          else do
+            changes <- evalRules store routesVar xactId [resId]
+            pure $
+              Wai.responseLBS
+                created201
+                []
+                ( ByteString.Lazy.Char8.unlines $
+                    fromString ("created " ++ resTyName ++ ":" ++ resName)
+                      : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                )
 
 httpResourcePut ::
   (MonadMask m, MonadIO m) =>
@@ -581,7 +637,7 @@ httpResourcePut store routesVar request = do
                 (fromString "If-Unmodified-Since: invalid date format")
           Just x -> pure $ Just (x :: UTCTime)
 
-  eChanges <- handleExceptT . withTransaction store routesVar mXactId $ \xactId -> do
+  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
     resTy <- Store.getResourceType store xactId resTyName
     mServerModificationTime <- Store.readResourceModificationTime resTy resName
     case mServerModificationTime of
@@ -593,23 +649,32 @@ httpResourcePut store routesVar request = do
         if maybe True (serverModificationTime <=) mLocalModificationTime
           then do
             body <- liftIO $ Wai.consumeRequestBodyLazy request
-            changes <- do
-              Store.writeResource resTy resName body
-              evalRules store routesVar xactId [resId]
-            pure $ Right (responseHeaders, changes)
+            Store.writeResource resTy resName body
+
+            if defer
+              then
+                pure $
+                  Wai.responseLBS
+                    ok200
+                    responseHeaders
+                    ( ByteString.Lazy.Char8.unlines
+                        [ fromString ("updated " ++ resTyName ++ ":" ++ resName)
+                        , fromString "(rules deferred)"
+                        ]
+                    )
+              else do
+                changes <- evalRules store routesVar xactId [resId]
+                pure $
+                  Wai.responseLBS
+                    ok200
+                    responseHeaders
+                    ( ByteString.Lazy.Char8.unlines $
+                        fromString ("updated " ++ resTyName ++ ":" ++ resName)
+                          : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                    )
           else
-            pure $ Left (preconditionFailed412, "the local copy of the resource is out of date")
+            pure . Wai.responseLBS preconditionFailed412 [] . fromString $
+              "the local copy of the resource is out of date"
       Nothing ->
-        pure $ Left (badRequest400, "resource " ++ resTyName ++ ":" ++ resName ++ " does not exist")
-  case eChanges of
-    Left (status, err) ->
-      pure $ Wai.responseLBS status [] (fromString err)
-    Right (responseHeaders, changes) ->
-      pure $
-        Wai.responseLBS
-          ok200
-          responseHeaders
-          ( ByteString.Lazy.Char8.unlines $
-              fromString ("updated " ++ resTyName ++ ":" ++ resName)
-                : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
-          )
+        pure . Wai.responseLBS badRequest400 [] . fromString $
+          "resource " ++ resTyName ++ ":" ++ resName ++ " does not exist"

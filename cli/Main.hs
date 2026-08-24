@@ -60,6 +60,8 @@ data ViewTarget
 
 data Command
   = Begin
+      -- | Defer rules until commit
+      Bool
   | Commit
       -- | Transaction ID
       String
@@ -88,6 +90,8 @@ data Command
       -- | Resource type to create
       String
   | Update
+      -- | Transaction ID
+      (Maybe String)
       -- | Source file
       (Maybe FilePath)
       -- | Properties to update
@@ -135,7 +139,8 @@ cliParser =
       )
   where
     beginParser =
-      pure Begin
+      Begin
+        <$> Options.switch (Options.long "defer" <> Options.help "Defer rules until commit")
 
     commitParser =
       Commit
@@ -192,6 +197,10 @@ cliParser =
     updateParser =
       Update
         <$> optional
+          ( Options.strOption $
+              Options.long "transaction-id" <> Options.metavar "ID" <> Options.help "ID of transaction to update"
+          )
+        <*> optional
           ( Options.strOption $
               Options.long "from" <> Options.short 'f' <> Options.metavar "FILE" <> Options.help "Source file"
           )
@@ -275,8 +284,8 @@ main = do
           Just store -> pure $ Just store
   let baseUrl = cliBaseUrl cli
   case cliCommand cli of
-    Begin ->
-      begin baseUrl mCertificateStore
+    Begin defer ->
+      begin baseUrl mCertificateStore defer
     Commit xactId ->
       commit baseUrl mCertificateStore $ fromString xactId
     Rollback xactId ->
@@ -294,10 +303,11 @@ main = do
       create baseUrl mCertificateStore Nothing mSrcFile properties' resourceId'
     CreateAll srcDir resTy ->
       createAll baseUrl mCertificateStore srcDir resTy
-    Update mSrcFile properties resourceId -> do
+    Update mXactId mSrcFile properties resourceId -> do
+      let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
-      update baseUrl mCertificateStore mSrcFile properties' resourceId'
+      update baseUrl mCertificateStore mXactId' mSrcFile properties' resourceId'
     Edit resourceId -> do
       resourceId' <- parseResourceId resourceId
       edit baseUrl mCertificateStore resourceId'
@@ -441,9 +451,9 @@ transactionIdHeaders xactId =
   [ (fromString "X-Blog-TransactionId", xactId)
   ]
 
-begin :: String -> Maybe CertificateStore -> IO ()
-begin baseUrl mCertificateStore = do
-  xactId <- beginTransaction baseUrl mCertificateStore
+begin :: String -> Maybe CertificateStore -> Bool -> IO ()
+begin baseUrl mCertificateStore defer = do
+  xactId <- beginTransaction baseUrl mCertificateStore defer
   ByteString.Char8.putStrLn $ fromString "began " <> xactId
 
 commit :: String -> Maybe CertificateStore -> ByteString -> IO ()
@@ -658,12 +668,15 @@ create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
 beginTransaction ::
   String ->
   Maybe CertificateStore ->
+  -- | Defer rules until commit
+  Bool ->
   -- | Transaction ID
   IO ByteString
-beginTransaction baseUrl mCertificateStore = do
+beginTransaction baseUrl mCertificateStore defer = do
   manager <- httpManager mCertificateStore
 
-  (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") [] mempty
+  let headers = [(fromString "X-Blog-Transaction-Defer", fromString "true") | defer]
+  (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") headers mempty
 
   case response of
     PreconditionFailed ->
@@ -738,7 +751,7 @@ withTransaction ::
   (ByteString -> IO b) ->
   IO b
 withTransaction baseUrl mCertificateStore f = do
-  (a, ()) <- generalBracket (beginTransaction baseUrl mCertificateStore) exit $ f
+  (a, ()) <- generalBracket (beginTransaction baseUrl mCertificateStore False) exit $ f
   pure a
   where
     exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl mCertificateStore xactId
@@ -766,20 +779,22 @@ update ::
   -- | Base URL
   String ->
   Maybe CertificateStore ->
+  -- | Transaction ID
+  Maybe ByteString ->
   -- | Source file
   Maybe FilePath ->
   -- | Properties to set
   [Property] ->
   ResourceId ->
   IO ()
-update baseUrl mCertificateStore mSrcFile properties resourceId = do
+update baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
   manager <- httpManager mCertificateStore
 
   let
-    doBody mXactId srcFile = do
+    doBody mXactId' srcFile = do
       (_responseHeaders, response) <- do
         body <- LazyByteString.readFile srcFile
-        let headers = foldMap transactionIdHeaders mXactId ++ resourceIdHeaders resourceId
+        let headers = foldMap transactionIdHeaders mXactId' ++ resourceIdHeaders resourceId
         httpPut manager (baseUrl ++ "/.resource") headers body
 
       case response of
@@ -794,10 +809,10 @@ update baseUrl mCertificateStore mSrcFile properties resourceId = do
         Ok body -> do
           ByteString.Lazy.Char8.putStrLn body
 
-    doProperties mXactId ps = do
+    doProperties mXactId' ps = do
       (_responseHeaders, response) <- do
         let body = renderProperties ps
-        let headers = foldMap transactionIdHeaders mXactId ++ resourceIdHeaders resourceId
+        let headers = foldMap transactionIdHeaders mXactId' ++ resourceIdHeaders resourceId
         httpPatch
           manager
           (baseUrl ++ "/.resource/" ++ resourceIdPath resourceId ++ "/property")
@@ -816,15 +831,21 @@ update baseUrl mCertificateStore mSrcFile properties resourceId = do
         Ok body -> do
           ByteString.Lazy.Char8.putStrLn body
 
+  let
+    withTransaction' mXactId' f =
+      case mXactId' of
+        Nothing -> withTransaction baseUrl mCertificateStore f
+        Just xactId -> f xactId
+
   case (mSrcFile, properties) of
     (Nothing, []) -> do
       putStrLn "nothing to do"
     (Nothing, _ : _) -> do
-      doProperties Nothing properties
+      doProperties mXactId properties
     (Just srcFile, []) -> do
-      doBody Nothing srcFile
+      doBody mXactId srcFile
     (Just srcFile, _ : _) ->
-      withTransaction baseUrl mCertificateStore $ \xactId -> do
+      withTransaction' mXactId $ \xactId -> do
         doBody (Just xactId) srcFile
         doProperties (Just xactId) properties
 

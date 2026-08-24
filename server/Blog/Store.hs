@@ -19,6 +19,9 @@ module Blog.Store
   , lookupResourceType
   , getResourceType
   , TransactionId
+  , Transaction (..)
+  , Change (..)
+  , TransactionChange (..)
   , renderTransactionId
   , parseTransactionId
   , withTransaction
@@ -27,6 +30,9 @@ module Blog.Store
   , commitTransaction
   , rollbackTransaction
   , listTransactions
+  , lookupTransaction
+  , saveDeferred
+  , restoreDeferred
 
     -- * Resource types
   , ResourceType
@@ -82,6 +88,7 @@ import Data.List ((\\))
 import Data.Map (Map)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Monoid (First (..))
+import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text.Lazy as LazyText
@@ -96,6 +103,7 @@ import System.Directory
   , doesDirectoryExist
   , doesFileExist
   , removeDirectoryRecursive
+  , renameDirectory
   )
 import System.FilePath (takeDirectory, (</>))
 import System.IO.Error (isDoesNotExistError)
@@ -108,20 +116,26 @@ import qualified Toml
 data Store m
   = Store
   { lookupResourceTypeImpl :: !(TransactionId -> String -> m (Maybe (ResourceType m)))
-  , beginTransactionImpl :: m TransactionId
+  , beginTransactionImpl :: Bool -> m TransactionId
   , commitTransactionImpl :: TransactionId -> m ()
   , rollbackTransactionImpl :: TransactionId -> m ()
   , listTransactionsImpl :: m [TransactionId]
+  , lookupTransactionImpl :: TransactionId -> m (Maybe Transaction)
+  , saveDeferredImpl :: TransactionId -> m ()
+  , restoreDeferredImpl :: TransactionId -> m ()
   }
 
 hoistStore :: Functor m => (forall a. m a -> n a) -> Store m -> Store n
-hoistStore f (Store x1 x2 x3 x4 x5) =
+hoistStore f (Store x1 x2 x3 x4 x5 x6 x7 x8) =
   Store
     (fmap (fmap (f . fmap (fmap (hoistResourceType f)))) x1)
-    (f x2)
+    (fmap f x2)
     (fmap f x3)
     (fmap f x4)
     (f x5)
+    (fmap f x6)
+    (fmap f x7)
+    (fmap f x8)
 
 newtype TransactionId = TransactionId ID
   deriving (Eq, Ord)
@@ -131,6 +145,19 @@ renderTransactionId (TransactionId xactId) = ID.toString xactId
 
 parseTransactionId :: String -> Maybe TransactionId
 parseTransactionId = fmap TransactionId . ID.fromString
+
+data Transaction
+  = Transaction
+  { xactDefer :: Bool
+  -- ^ Defer rules until commit
+  , xactChanges :: [TransactionChange]
+  }
+
+data TransactionChange
+  = TransactionChange
+  { xactChange :: Change
+  , xactChangeId :: ResourceId
+  }
 
 getSystemDir ::
   -- | Store directory
@@ -158,6 +185,9 @@ changePart :: Change -> String
 changePart Create = ":create"
 changePart Update = ":update"
 changePart Delete = ":delete"
+
+deferPart :: String
+deferPart = ":defer"
 
 fromDirectory ::
   forall m.
@@ -200,13 +230,18 @@ fromDirectory storeDir = do
                   liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
                 else pure Nothing
 
-    beginTransactionImpl :: m TransactionId
-    beginTransactionImpl = do
+    beginTransactionImpl :: Bool -> m TransactionId
+    beginTransactionImpl defer = do
       xactId <- liftIO $ TransactionId <$> ID.generate
       liftIO $ do
         let xactDir = getTransactionIdDir storeDir xactId
         createDirectory xactDir
         traverse_ (\change -> createDirectory $ xactDir </> changePart change) [Create, Update, Delete]
+
+        when defer $ do
+          let deferDir = xactDir </> deferPart
+          createDirectory deferDir
+
       pure xactId
 
     commitTransactionImpl :: TransactionId -> m ()
@@ -331,6 +366,72 @@ fromDirectory storeDir = do
             (\entry -> fromMaybe (error $ "invalid transaction ID: " ++ show entry) $ parseTransactionId entry)
             entries
 
+    lookupTransactionImpl :: TransactionId -> m (Maybe Transaction)
+    lookupTransactionImpl xactId =
+      liftIO $ do
+        let xactDir = getTransactionIdDir storeDir xactId
+        exists <- doesDirectoryExist xactDir
+        if exists
+          then do
+            defer <- doesDirectoryExist $ xactDir </> deferPart
+            let
+              getResourceIds change = do
+                resTyNames <- IO.listDirectory $ xactDir </> changePart change
+                fmap (foldMap Set.toList) . for resTyNames $ \resTyName -> do
+                  let resTyDir = xactDir </> changePart change </> resTyName
+                  entries <- IO.listDirectory resTyDir
+                  fmap Set.fromList . for entries $ \entry -> do
+                    isDir <- doesDirectoryExist entry
+                    if isDir
+                      then do
+                        -- `name:properties` directory
+                        let (prefix, suffix) = break (== ':') entry
+                        when (suffix /= ":properties") . error $
+                          "unexpected resource directory: " ++ show (resTyDir </> entry)
+                        pure $ ResourceId resTyName prefix
+                      else pure $ ResourceId resTyName entry
+
+            creates <- getResourceIds Create
+            updates <- getResourceIds Update
+            deletes <- getResourceIds Delete
+            pure $
+              Just
+                Transaction
+                  { xactDefer = defer
+                  , xactChanges =
+                      fmap (TransactionChange Create) creates
+                        ++ fmap (TransactionChange Update) updates
+                        ++ fmap (TransactionChange Delete) deletes
+                  }
+          else pure Nothing
+
+    copyDirectory :: FilePath -> FilePath -> IO ()
+    copyDirectory src tgt = do
+      createDirectory tgt
+      entries <- IO.listDirectory src
+      for_ entries $ \entry -> do
+        let srcPath = src </> entry
+        let dstPath = tgt </> entry
+        isDir <- doesDirectoryExist srcPath
+        if isDir
+          then copyDirectory srcPath dstPath
+          else IO.copyFile srcPath dstPath
+
+    saveDeferredImpl :: TransactionId -> m ()
+    saveDeferredImpl xactId = do
+      let xactDir = getTransactionIdDir storeDir xactId
+      liftIO . for_ [Create, Update, Delete] $ \change -> do
+        removeDirectoryRecursive (xactDir </> deferPart </> changePart change)
+          `catch` \err -> unless (isDoesNotExistError err) $ throwIO err
+        copyDirectory (xactDir </> changePart change) (xactDir </> deferPart </> changePart change)
+
+    restoreDeferredImpl :: TransactionId -> m ()
+    restoreDeferredImpl xactId = do
+      let xactDir = getTransactionIdDir storeDir xactId
+      liftIO . for_ [Create, Update, Delete] $ \change -> do
+        removeDirectoryRecursive (xactDir </> changePart change)
+        renameDirectory (xactDir </> deferPart </> changePart change) (xactDir </> changePart change)
+
 parseResourceConfig ::
   MonadError DiagnosticReports m =>
   -- | Resource type name
@@ -374,13 +475,15 @@ bracketTransaction ::
   -- | On rollback
   (TransactionId -> m ()) ->
   Store m ->
+  -- | Defer rules until commit
+  Bool ->
   (TransactionId -> m a) ->
   m a
-bracketTransaction onBegin onCommit onRollback store f = do
+bracketTransaction onBegin onCommit onRollback store defer f = do
   (a, ()) <-
     generalBracket
       ( do
-          xactId <- beginTransaction store
+          xactId <- beginTransaction store defer
           xactId <$ onBegin xactId
       )
       exit
@@ -397,10 +500,20 @@ bracketTransaction onBegin onCommit onRollback store f = do
       rollbackTransaction store xactId
       onRollback xactId
 
-withTransaction :: MonadMask m => Store m -> (TransactionId -> m a) -> m a
+withTransaction ::
+  MonadMask m =>
+  Store m ->
+  -- | Defer rules until commit
+  Bool ->
+  (TransactionId -> m a) ->
+  m a
 withTransaction = bracketTransaction (const $ pure ()) (const $ pure ()) (const $ pure ())
 
-beginTransaction :: Store m -> m TransactionId
+beginTransaction ::
+  Store m ->
+  -- | Defer rules until commit
+  Bool ->
+  m TransactionId
 beginTransaction = beginTransactionImpl
 
 commitTransaction :: Store m -> TransactionId -> m ()
@@ -411,6 +524,15 @@ rollbackTransaction = rollbackTransactionImpl
 
 listTransactions :: Store m -> m [TransactionId]
 listTransactions = listTransactionsImpl
+
+lookupTransaction :: Store m -> TransactionId -> m (Maybe Transaction)
+lookupTransaction = lookupTransactionImpl
+
+saveDeferred :: Store m -> TransactionId -> m ()
+saveDeferred = saveDeferredImpl
+
+restoreDeferred :: Store m -> TransactionId -> m ()
+restoreDeferred = restoreDeferredImpl
 
 data ResourceType m
   = ResourceType
