@@ -29,8 +29,10 @@ import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Commonmark.Extensions.Wikilinks (TitlePosition (..), wikilinksSpec)
 import Commonmark.Pandoc (Cm, unCm)
-import Commonmark.Parser (commonmark)
+import Commonmark.Parser (commonmarkWith)
+import Commonmark.Syntax (defaultSyntaxSpec)
 import Control.Applicative ((<|>))
 import Control.Monad (guard, unless)
 import Control.Monad.Error.Class (MonadError, throwError, tryError)
@@ -47,6 +49,7 @@ import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
 import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
+import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (fromJust, fromMaybe, isNothing)
 import Data.Monoid (First (..), getFirst)
@@ -64,13 +67,14 @@ import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime (..))
 import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
+import qualified Data.Tuple as Tuple
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
 import Text.Pandoc.Builder (Block, Blocks)
 import qualified Text.Pandoc.Builder as Blocks (toList)
-import Text.Pandoc.Definition (Block (..))
+import Text.Pandoc.Definition (Block (..), Inline (..))
 import qualified Text.Pandoc.Html as Html
-import Text.Pandoc.Walk (query, walk)
+import Text.Pandoc.Walk (query, walk, walkM)
 import qualified Text.Sage as Sage
 import qualified Toml
 
@@ -87,6 +91,11 @@ rules =
       (Build.oResource "adjacency" $ Build.oMatch "article-" *< Build.oAny)
       articleAdjacency
     <> Build.rule
+      "article-dependency"
+      (Build.iResource "article" Build.iAny)
+      (pure ())
+      articleDependency
+    <> Build.rule
       "article-html"
       ( (,,)
           <$> Build.iResource "template" (Build.iMatch "article.html.temple")
@@ -98,6 +107,19 @@ rules =
           <*> Build.oResource "html" (Build.oMatch "article-" *< Build.oBind "name")
       )
       articleHtml
+    <> Build.rule
+      "page-dependency"
+      (Build.iResource "page" Build.iAny)
+      (pure ())
+      pageDependency
+    <> Build.rule
+      "page-html"
+      ( (,)
+          <$> Build.iResource "template" (Build.iMatch "page.html.temple")
+          <*> Build.iResource "page" (Build.iBind "name")
+      )
+      (Build.oResource "html" (Build.oMatch "page-" *< Build.oBind "name"))
+      pageHtml
     <> Build.rule
       "index-html"
       ( (,)
@@ -119,6 +141,11 @@ rules =
       "css-route"
       (Build.iResource "css" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "css-" *< Build.oBind "name"))
+      resourceRoute
+    <> Build.rule
+      "pdf-route"
+      (Build.iResource "pdf" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "pdf-" *< Build.oBind "name"))
       resourceRoute
 
 -- TODO: expose in `temple`?
@@ -252,7 +279,7 @@ articleAdjacency iArticles oAdjacency = do
       case parseDateTime input' <|> parseDate input' of
         Nothing ->
           throwError . DiagnosticSimple $
-            renderResourceId article ++ "'s metadata an invalid 'published' field: " ++ Text.unpack input'
+            renderResourceId article ++ "'s metadata has an invalid 'published' field: " ++ Text.unpack input'
         Just x -> pure (x :: UTCTime)
     pure (article, published)
 
@@ -765,28 +792,18 @@ articlePropertyTypeProvider mPrev mNext content =
               else
                 pure Nothing
 
-articleHtml ::
+loadTemplate ::
   forall m.
   MonadIO m =>
-  ( Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
-  ) ->
-  (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
-  Build.ActionT m ()
-articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
+  (Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)) ->
+  (Temple.TemplateRef -> String) ->
+  Build.ResourceInput m LazyByteString ->
+  Build.ActionT
+    m
+    (Map.Map Temple.TemplateRef Temple.Core, [Temple.Binding], Temple.Core)
+loadTemplate readTemplateRef renderTemplateRef iTemplate = do
   let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
-
-  let
-    templateResourceType = resourceType $ Build.resourceInputId iTemplate
-
-  let
-    renderTemplateRef (Temple.TemplateRef name) =
-      renderResourceId (ResourceId templateResourceType name)
-
-    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
-    readTemplateRef (Temple.TemplateRef name) =
-      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+  let templateResourceType = resourceType $ Build.resourceInputId iTemplate
 
   let templateContent = Build.resourceInputContent iTemplate
   template' <-
@@ -798,52 +815,203 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
             templateContent
             (sageErrorReport err)
       Right x -> pure x
-  (deps, bindings, template'') <- do
-    result <- do
-      let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
-      runExceptT $ Temple.inferBindings readTemplateRef ref template'
-    case result of
-      Left err -> do
-        let
-          getTemplateRef (Temple.TemplateRef name) =
-            fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-              <$> Store.readResource (Build.resourceInputType iTemplate) name
 
-        reports <- templeTypeErrorReport renderTemplateRef getTemplateRef err
-        throwError $
-          DiagnosticReports
-            (fromString $ renderTemplateRef inputTemplateRef)
-            (Build.resourceInputContent iTemplate)
-            reports
-      Right x -> pure x
+  result <- do
+    let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+    runExceptT $ Temple.inferBindings readTemplateRef ref template'
+
+  case result of
+    Left err -> do
+      let
+        getTemplateRef (Temple.TemplateRef name) =
+          fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
+            <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+      reports <- templeTypeErrorReport renderTemplateRef getTemplateRef err
+      throwError $
+        DiagnosticReports
+          (fromString $ renderTemplateRef inputTemplateRef)
+          (Build.resourceInputContent iTemplate)
+          reports
+    Right x -> pure x
+
+loadMarkdown ::
+  forall m.
+  MonadIO m =>
+  Build.ResourceInput m LazyByteString ->
+  Build.ActionT m (Set ResourceId, [Block])
+loadMarkdown input = do
+  content <-
+    case Text.Lazy.Encoding.decodeUtf8' $ Build.resourceInputContent input of
+      Left err -> error $ "TODO: " ++ show err
+      Right x -> pure $! LazyText.toStrict x
+
+  result <-
+    commonmarkWith
+      (defaultSyntaxSpec <> wikilinksSpec TitleBeforePipe)
+      ("(" ++ renderResourceId (Build.resourceInputId input) ++ ")")
+      content
+  case result of
+    Left err ->
+      error $ "TODO: " ++ show err
+    Right x -> do
+      let blocks = Blocks.toList $ unCm (x :: Cm () Blocks)
+      (deps, blocks') <- fmap Tuple.swap . runWriterT $ resolveResourceReferences blocks
+      pure (deps, removeMetadata blocks')
+  where
+    wikilinkUrlName =
+      "(wikilink in " ++ renderResourceId (Build.resourceInputId input) ++ ")"
+
+    resolveResourceReferences :: [Block] -> WriterT (Set ResourceId) (Build.ActionT m) [Block]
+    resolveResourceReferences =
+      walkM
+        @Inline
+        ( \case
+            Link (ident, classes, kvs) alts (url, title) | fromString "wikilink" `elem` classes -> do
+              let urlInput = Text.Encoding.encodeUtf8 url
+              parsed <-
+                case Sage.parse Temple.exprParser urlInput of
+                  Left err ->
+                    throwError $
+                      DiagnosticReports
+                        (fromString wikilinkUrlName)
+                        (LazyByteString.fromStrict urlInput)
+                        (sageErrorReport err)
+                  Right x -> pure x
+              resolved <- resolveResourceReference urlInput parsed
+              pure $ Link (ident, classes, kvs) alts (resolved, title)
+            x ->
+              pure x
+        )
+
+    resolveResourceReference ::
+      ByteString -> Temple.LExpr Temple.Offset -> WriterT (Set ResourceId) (Build.ActionT m) Text
+    resolveResourceReference urlInput expr = do
+      let currentTemplateRef = Temple.TemplateRef $ "(" ++ renderResourceId (Build.resourceInputId input) ++ ")"
+
+      let readTemplateRef = const $ error "impossible readTemplateRef"
+      let renderTemplateRef = const $ error "impossible renderTemplateRef"
+      let getTemplateRef = const $ error "impossible getTemplateRef"
+
+      (deps, bindings, core) <- do
+        result <-
+          runExceptT $
+            Temple.inferBindings readTemplateRef currentTemplateRef (Temple.TemplateBase [Temple.PartExpr expr])
+        case result of
+          Left err -> do
+            throwError
+              . DiagnosticReports
+                (fromString wikilinkUrlName)
+                (LazyByteString.fromStrict urlInput)
+              =<< templeTypeErrorReport renderTemplateRef getTemplateRef err
+          Right x ->
+            pure x
+
+      for_ bindings $ \binding -> do
+        unless (Temple.bindingName binding == fromString "resource") $ do
+          let (_ref, offset) = NonEmpty.head $ Temple.bindingLocations binding
+          throwError $
+            DiagnosticReports
+              (fromString wikilinkUrlName)
+              (LazyByteString.fromStrict urlInput)
+              ( One $
+                  Diagnostic.emit
+                    (Diagnostic.Offset $ Temple.getOffset offset)
+                    Diagnostic.Caret
+                    (fromString "not in scope")
+              )
+
+      case find ((fromString "resource" ==) . Temple.bindingName) bindings of
+        Nothing ->
+          pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
+            Temple.evalCore (Temple.defaultEvalEnv deps) core
+        Just binding -> do
+          store <- lift Build.askStore
+          xactId <- lift Build.askTransactionId
+          let path = [PField $ Temple.bindingName binding]
+          result <- runExceptT $ do
+            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef currentTemplateRef) Temple.emptyInferState $ do
+              ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+              resourceTypeProvider store xactId path ty
+            either (throwError . TypeError path) pure result
+
+          bindingValue <-
+            case result of
+              Left err ->
+                throwError
+                  =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId input) err
+              Right (_state, providedCore) ->
+                pure providedCore
+
+          let env = Temple.defaultEvalEnv deps
+          pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
+            Temple.evalCore env (Temple.CApp core [(fromString "resource", bindingValue)])
+
+    removeMetadata :: [Block] -> [Block]
+    removeMetadata =
+      walk
+        @[Block]
+        ( filter $
+            \case
+              CodeBlock (_ident, classes, _kvs) _content ->
+                not $ fromString "toml+blog-metadata" `elem` classes
+              _ ->
+                True
+        )
+
+loadMetadata :: Monad m => Build.ResourceInput m a -> Build.ActionT m (Map Text MetadataValue)
+loadMetadata input = do
+  let resId = Build.resourceInputId input
+  let resTy = Build.resourceInputType input
+  let resName = resourceName resId
+  mContent <- Store.readResourceMetadata resTy resName
+  content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
+  parseResourceMetadata
+    (Store.resourceTypeConfig resTy)
+    (Store.resourceTypeName resTy)
+    resName
+    content
+
+-- TODO: should this be a separate rule? Is there a way to maintain dependencies inside `articleHtml`?
+articleDependency ::
+  forall m.
+  MonadIO m =>
+  Build.ResourceInput m LazyByteString ->
+  () ->
+  Build.ActionT m ()
+articleDependency iArticle () = do
+  (deps, _markdown) <- loadMarkdown iArticle
+  Build.setDependencies (Build.resourceInputId iArticle) deps
+
+articleHtml ::
+  forall m.
+  MonadIO m =>
+  ( Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  ) ->
+  (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
+  Build.ActionT m ()
+articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
+  let templateResourceType = resourceType $ Build.resourceInputId iTemplate
+
+  let
+    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
+    readTemplateRef (Temple.TemplateRef name) =
+      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+  let
+    renderTemplateRef (Temple.TemplateRef name) =
+      renderResourceId (ResourceId templateResourceType name)
+
+  (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
 
   (mExcerpt, html) <- do
-    let articleContent = Build.resourceInputContent iArticle
-    articleContent' <-
-      case Text.Lazy.Encoding.decodeUtf8' articleContent of
-        Left err -> error $ "TODO: " ++ show err
-        Right x -> pure $! LazyText.toStrict x
-    (mExcerpt, markdown) <-
-      case commonmark ("(" ++ renderResourceId (Build.resourceInputId iArticle) ++ ")") articleContent' of
-        Left err -> error $ "TODO: " ++ show err
-        Right x -> do
-          let
-            document =
-              walk
-                @[Block]
-                ( filter $
-                    \case
-                      CodeBlock (_ident, classes, _kvs) _content ->
-                        not $ fromString "toml+blog-metadata" `elem` classes
-                      _ ->
-                        True
-                )
-                $ Blocks.toList
-                $ unCm (x :: Cm () Blocks)
-          pure (getFirst $ query @Block (First . Just) document, document)
+    (_deps, document) <- loadMarkdown iArticle
+    let mExcerpt = getFirst $ query @Block (First . Just) document
     (,)
       <$> traverse (Html.runRenderT Html.emptyNotesState . Html.renderBlock) mExcerpt
-      <*> Html.runRenderT Html.emptyNotesState (Html.renderBlocks markdown)
+      <*> Html.runRenderT Html.emptyNotesState (Html.renderBlocks document)
 
   for_ mExcerpt $ Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . Builder.toLazyText
 
@@ -927,6 +1095,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
             either (throwError . TypeError path') pure result
           _ -> do
             let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
+            let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
             throwError $
               ParameterNotFound
                 (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
@@ -950,21 +1119,124 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   Build.writeResource oHtml () output
 
-  let resId = Build.resourceInputId iArticle
-  mUrl <- do
-    let resTy = Build.resourceInputType iArticle
-    let resName = resourceName resId
-    mContent <- Store.readResourceMetadata resTy resName
-    content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
-    metadata <-
-      parseResourceMetadata
-        (Store.resourceTypeConfig resTy)
-        (Store.resourceTypeName resTy)
-        resName
-        content
-    pure $ Map.lookup (fromString "url") metadata
-  for_ mUrl $ \url -> do
-    Build.setResourceProperty oHtml () "url" url
+  metadata <- loadMetadata iArticle
+  let mUrl = Map.lookup (fromString "url") metadata
+  for_ mUrl $ Build.setResourceProperty oHtml () "url"
+
+pageDependency ::
+  forall m.
+  MonadIO m =>
+  Build.ResourceInput m LazyByteString ->
+  () ->
+  Build.ActionT m ()
+pageDependency iPage () = do
+  (deps, _markdown) <- loadMarkdown iPage
+  Build.setDependencies (Build.resourceInputId iPage) deps
+
+pageHtml ::
+  forall m.
+  MonadIO m =>
+  ( Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  ) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+pageHtml (iTemplate, iPage) oHtml = do
+  let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+
+  let
+    templateResourceType = resourceType $ Build.resourceInputId iTemplate
+
+  let
+    renderTemplateRef (Temple.TemplateRef name) =
+      renderResourceId (ResourceId templateResourceType name)
+
+    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
+    readTemplateRef (Temple.TemplateRef name) =
+      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+  (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
+
+  html <- do
+    (_deps, markdown) <- loadMarkdown iPage
+    Html.runRenderT Html.emptyNotesState (Html.renderBlocks markdown)
+
+  bindings' <- for bindings $ \binding -> do
+    let name = Temple.bindingName binding
+    let tyScheme = Temple.bindingScheme binding
+
+    result <-
+      runExceptT $
+        case Text.unpack name of
+          "resource" -> do
+            store <- lift Build.askStore
+            xactId <- lift Build.askTransactionId
+
+            (a, _deps) <- do
+              let
+                f :: (Either e a, w) -> Either e (a, w)
+                f (ea, w) = (,w) <$> ea
+
+              mapExceptT (fmap f . runWriterT) $ do
+                let readTemplateRef' = lift . lift . readTemplateRef
+                let currentTemplate = Temple.TemplateRef "."
+                let path' = pure . PField $ Temple.bindingName binding
+                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                  ty <- Temple.instantiateTypeScheme tyScheme
+                  resourceTypeProvider store xactId path' ty
+                either (throwError . TypeError path') pure result
+
+            pure a
+          "self" -> do
+            let readTemplateRef' = lift . readTemplateRef
+            let currentTemplate = Temple.TemplateRef "."
+            let path' = pure . PField $ Temple.bindingName binding
+            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+              ty <- Temple.instantiateTypeScheme tyScheme
+              propertiesTypeProvider
+                (Build.resourceInputType iPage)
+                (fromString . resourceName $ Build.resourceInputId iPage)
+                ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                    <> constantPropertyTypeProvider
+                      (fromString "content")
+                      ( Temple.CString
+                          [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $ Builder.toLazyText html
+                          ]
+                      , Temple.TString
+                      )
+                    <> lookupPropertyTypeProvider
+                )
+                path'
+                ty
+            either (throwError . TypeError path') pure result
+          _ -> do
+            let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
+            throwError $
+              ParameterNotFound
+                (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
+                bindingRef
+                bindingOffset
+    value <-
+      case result of
+        Right (_state, value) -> pure value
+        Left err -> do
+          let
+            getTemplateRef (Temple.TemplateRef name') =
+              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
+                <$> Store.readResource (Build.resourceInputType iTemplate) name'
+
+          throwError
+            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+
+    pure (name, value)
+
+  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+
+  Build.writeResource oHtml () output
+
+  metadata <- loadMetadata iPage
+  let mUrl = Map.lookup (fromString "url") metadata
+  for_ mUrl $ Build.setResourceProperty oHtml () "url"
 
 indexHtml ::
   forall m.
