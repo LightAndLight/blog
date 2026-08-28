@@ -87,6 +87,8 @@ data Command
       -- | ID of resource to create
       String
   | CreateAll
+      -- | Transaction ID
+      (Maybe String)
       -- | Source directory
       FilePath
       -- | Resource type to create
@@ -195,7 +197,11 @@ cliParser =
 
     createAllParser =
       CreateAll
-        <$> Options.strOption
+        <$> optional
+          ( Options.strOption $
+              Options.long "transaction-id" <> Options.metavar "ID" <> Options.help "ID of transaction to update"
+          )
+        <*> Options.strOption
           (Options.long "from" <> Options.short 'f' <> Options.metavar "DIR" <> Options.help "Source directory")
         <*> Options.strArgument
           (Options.metavar "TYPE" <> Options.help "Type of resource to create")
@@ -308,8 +314,9 @@ main = do
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
       create baseUrl mCertificateStore mXactId' mSrcFile properties' resourceId'
-    CreateAll srcDir resTy ->
-      createAll baseUrl mCertificateStore srcDir resTy
+    CreateAll mXactId srcDir resTy -> do
+      let mXactId' = fmap fromString mXactId
+      createAll baseUrl mCertificateStore mXactId' srcDir resTy
     Update mXactId mSrcFile properties resourceId -> do
       let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
@@ -765,13 +772,25 @@ withTransaction baseUrl mCertificateStore f = do
     exit xactId (ExitCaseException _err) = rollbackTransaction baseUrl mCertificateStore xactId
     exit xactId ExitCaseAbort = rollbackTransaction baseUrl mCertificateStore xactId
 
-createAll :: String -> Maybe CertificateStore -> FilePath -> String -> IO ()
-createAll baseUrl mCertificateStore srcDir resTy = do
+createAll ::
+  String ->
+  Maybe CertificateStore ->
+  -- | Transaction ID
+  Maybe ByteString ->
+  FilePath ->
+  String ->
+  IO ()
+createAll baseUrl mCertificateStore mXactId srcDir resTy = do
   entries <- listDirectory srcDir
   when (null entries) $ do
     putStrLn $ "error: " ++ srcDir ++ " is empty"
     exitFailure
-  withTransaction baseUrl mCertificateStore $ \xactId ->
+
+  let
+    withTransaction' Nothing f = withTransaction baseUrl mCertificateStore f
+    withTransaction' (Just xactId) f = f xactId
+
+  withTransaction' mXactId $ \xactId ->
     for_ entries $ \entry -> do
       let path = srcDir </> entry
       isFile <- doesFileExist path
