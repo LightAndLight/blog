@@ -78,6 +78,8 @@ data Command
       -- | Resource type
       String
   | Create
+      -- | Transaction ID
+      (Maybe String)
       -- | Source file
       (Maybe FilePath)
       -- | Properties to create
@@ -174,6 +176,10 @@ cliParser =
     createParser =
       Create
         <$> optional
+          ( Options.strOption $
+              Options.long "transaction-id" <> Options.metavar "ID" <> Options.help "ID of transaction to update"
+          )
+        <*> optional
           ( Options.strOption $
               Options.long "from" <> Options.short 'f' <> Options.metavar "FILE" <> Options.help "Source file"
           )
@@ -297,10 +303,11 @@ main = do
       view baseUrl mCertificateStore viewTarget resourceId'
     List resourceTyName ->
       list baseUrl mCertificateStore resourceTyName
-    Create mSrcFile properties resourceId -> do
+    Create mXactId mSrcFile properties resourceId -> do
+      let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
-      create baseUrl mCertificateStore Nothing mSrcFile properties' resourceId'
+      create baseUrl mCertificateStore mXactId' mSrcFile properties' resourceId'
     CreateAll srcDir resTy ->
       createAll baseUrl mCertificateStore srcDir resTy
     Update mXactId mSrcFile properties resourceId -> do
