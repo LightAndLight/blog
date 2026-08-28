@@ -47,7 +47,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
-import Data.List (find, sortOn)
+import Data.List (find, sortOn, delete)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -879,7 +879,7 @@ loadMarkdown input = do
                         (sageErrorReport err)
                   Right x -> pure x
               resolved <- resolveResourceReference urlInput parsed
-              pure $ Link (ident, classes, kvs) alts (resolved, title)
+              pure $ Link (ident, delete (fromString "wikilink") classes, kvs) alts (resolved, title)
             x ->
               pure x
         )
