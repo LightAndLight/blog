@@ -64,6 +64,7 @@ import Commonmark.Types as C
 import Data.Char (isSpace)
 import Data.Coerce (coerce)
 import Data.Maybe (fromMaybe)
+import Data.String (fromString)
 import qualified Data.Text as T
 import qualified Data.Text.Read as TR
 import qualified Text.Pandoc.Builder as B
@@ -293,9 +294,48 @@ instance
   (Rangeable (Cm a B.Inlines), Rangeable (Cm a B.Blocks)) =>
   HasFootnote (Cm a B.Inlines) (Cm a B.Blocks)
   where
-  footnote _num _lab _x = mempty
-  footnoteList _xs = mempty
-  footnoteRef _num _lab contents = B.note . walk deNote <$> contents
+  footnote num _lab (Cm x) =
+    Cm $
+      B.fromList
+        [ Div
+            ("fn-" <> fromString (show num), ["footnote"], [])
+            ( appendToLastBlock
+                (B.toList x)
+                (Link ("", [], []) [Str "↩︎"] ("#fnref-" <> fromString (show num), ""))
+            )
+        ]
+    where
+      appendToLastBlock :: [Block] -> Inline -> [Block]
+      appendToLastBlock [] il = [Plain [il]]
+      appendToLastBlock [bl] il =
+        case bl of
+          Plain ils -> [Plain (ils ++ [il])]
+          Para ils -> [Para (ils ++ [il])]
+          LineBlock ilss -> [LineBlock (ilss ++ [[il]])]
+          CodeBlock{} -> [bl, Plain [il]]
+          RawBlock{} -> [bl, Plain [il]]
+          BlockQuote{} -> [bl, Plain [il]]
+          Text.Pandoc.Definition.OrderedList{} -> [bl, Plain [il]]
+          Text.Pandoc.Definition.BulletList{} -> [bl, Plain [il]]
+          DefinitionList{} -> [bl, Plain [il]]
+          Header{} -> [bl, Plain [il]]
+          HorizontalRule{} -> [bl, Plain [il]]
+          Table{} -> [bl, Plain [il]]
+          Figure{} -> [bl, Plain [il]]
+          Div{} -> [bl, Plain [il]]
+      appendToLastBlock (bl : bls@(_ : _)) il = bl : appendToLastBlock bls il
+
+  footnoteList xs =
+    Cm $
+      B.fromList
+        [ HorizontalRule
+        , Text.Pandoc.Definition.OrderedList (1, DefaultStyle, DefaultDelim) (fmap (B.toList . unCm) xs)
+        ]
+
+  footnoteRef num _lab _contents =
+    Cm $
+      B.fromList
+        [Superscript [Link ("fnref-" <> num, ["footnote-ref"], []) [Str num] ("#fn-" <> num, "")]]
 
 illegalCodePoint :: T.Text -> Bool
 illegalCodePoint t =

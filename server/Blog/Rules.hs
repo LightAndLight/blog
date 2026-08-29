@@ -29,6 +29,7 @@ import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Commonmark.Extensions.Footnote (footnoteSpec)
 import Commonmark.Extensions.Wikilinks (TitlePosition (..), wikilinksSpec)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmarkWith)
@@ -47,6 +48,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
+import Data.Functor.Identity (runIdentity)
 import Data.List (delete, find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
@@ -846,11 +848,13 @@ loadMarkdown input = do
       Left err -> error $ "TODO: " ++ show err
       Right x -> pure $! LazyText.toStrict x
 
-  result <-
-    commonmarkWith
-      (defaultSyntaxSpec <> wikilinksSpec TitleBeforePipe)
-      ("(" ++ renderResourceId (Build.resourceInputId input) ++ ")")
-      content
+  let
+    result =
+      runIdentity $
+        commonmarkWith
+          (defaultSyntaxSpec <> wikilinksSpec TitleBeforePipe <> footnoteSpec)
+          ("(" ++ renderResourceId (Build.resourceInputId input) ++ ")")
+          content
   case result of
     Left err ->
       error $ "TODO: " ++ show err
