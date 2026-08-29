@@ -47,7 +47,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
-import Data.List (find, sortOn, delete)
+import Data.List (delete, find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -1008,7 +1008,13 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   (mExcerpt, html) <- do
     (_deps, document) <- loadMarkdown iArticle
-    let mExcerpt = getFirst $ query @Block (First . Just) document
+
+    let
+      isComment (RawBlock format value) = format == fromString "html" && fromString "<!--" `Text.isPrefixOf` value
+      isComment _ = False
+
+      mExcerpt = getFirst $ query @Block (\block -> First $ block <$ guard (not $ isComment block)) document
+
     (,)
       <$> traverse (Html.runRenderT Html.emptyNotesState . Html.renderBlock) mExcerpt
       <*> Html.runRenderT Html.emptyNotesState (Html.renderBlocks document)
