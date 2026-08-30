@@ -84,7 +84,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Foldable (for_, traverse_)
 import Data.Functor (void)
-import Data.List ((\\))
+import Data.List (union, (\\))
 import Data.Map (Map)
 import Data.Maybe (catMaybes, fromMaybe)
 import Data.Monoid (First (..))
@@ -543,6 +543,7 @@ data ResourceType m
   , writeResourceImpl :: !(String -> LazyByteString -> m ())
   , readPropertyImpl :: !(String -> String -> m (Maybe LazyByteString))
   , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
+  , listPropertiesImpl :: !(String -> m [String])
   , listResourceImpl :: !(m [ResourceId])
   , readResourceMetadataImpl :: !(String -> m (Maybe LazyByteString))
   , readResourceModificationTimeImpl :: !(String -> m (Maybe UTCTime))
@@ -553,7 +554,7 @@ data ResourceType m
   }
 
 hoistResourceType :: Functor m => (forall a. m a -> n a) -> ResourceType m -> ResourceType n
-hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14) =
+hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15) =
   ResourceType
     x1
     x2
@@ -562,13 +563,14 @@ hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14
     (fmap (fmap f) x5)
     (fmap (fmap f) x6)
     (fmap (fmap (fmap f)) x7)
-    (f x8)
-    (fmap f x9)
+    (fmap f x8)
+    (f x9)
     (fmap f x10)
     (fmap f x11)
     (fmap f x12)
-    (fmap (fmap f) x13)
+    (fmap f x13)
     (fmap (fmap f) x14)
+    (fmap (fmap f) x15)
 
 orElseM :: Monad m => [m (Maybe a)] -> m (Maybe a)
 orElseM [] = pure Nothing
@@ -782,6 +784,24 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           let content = renderMetadataValueToml value
           liftIO $ xactWriteFile (resTyName </> propertiesPart resName) key content
 
+    listPropertiesImpl :: String -> m [String]
+    listPropertiesImpl resName = do
+      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> resName
+      if removed
+        then pure []
+        else liftIO $ do
+          deleted <- doList $ xactResTyDir Delete </> propertiesPart resName
+          created <- doList $ xactResTyDir Create </> propertiesPart resName
+          existing <- doList $ baseResTyDir </> propertiesPart resName
+          pure $ (existing \\ (["dependencies", "dependents"] ++ deleted)) `union` created
+      where
+        doList path =
+          IO.listDirectory path
+            `catch` \(WithCallStack _cs err) ->
+              if isDoesNotExistError err
+                then pure []
+                else throwM err
+
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
       liftIO $ do
@@ -957,6 +977,9 @@ readProperty = readPropertyImpl
 
 setProperty :: ResourceType m -> String -> String -> MetadataValue -> m ()
 setProperty = setPropertyImpl
+
+listProperties :: ResourceType m -> String -> m [String]
+listProperties = listPropertiesImpl
 
 listResource :: ResourceType m -> m [ResourceId]
 listResource = listResourceImpl
