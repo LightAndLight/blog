@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -34,6 +35,7 @@ module Blog.Store
   , saveDeferred
   , restoreDeferred
   , export
+  , import_
 
     -- * Resource types
   , ResourceType
@@ -74,7 +76,7 @@ import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
 import qualified Codec.Archive.Tar as Tar
-import qualified Codec.Archive.Tar.Entry as Tar (fileEntry)
+import qualified Codec.Archive.Tar.Entry as Tar (entryTarPath, fileEntry)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
 import Control.Exception (throwIO)
@@ -108,7 +110,7 @@ import System.Directory
   , removeDirectoryRecursive
   , renameDirectory
   )
-import System.FilePath (takeDirectory, (</>))
+import System.FilePath (splitDirectories, takeDirectory, (</>))
 import System.IO.Error (isDoesNotExistError)
 import Text.Pandoc.Builder (Blocks)
 import Text.Pandoc.Definition (Block (..))
@@ -559,11 +561,16 @@ export store xactId = do
       let contentEntry = Tar.fileEntry (resTyName </> resName) content
 
       properties <- listProperties resTy resName
-      propertyEntries <- for properties $ \propName -> do
-        propValue <-
-          fromMaybe (error $ renderResourceId resId ++ ":" ++ propName ++ " does not exist")
-            <$> readProperty resTy resName propName
-        pure $ Tar.fileEntry (resTyName </> propertiesPart resName </> propName) propValue
+      propertyEntries <- fmap catMaybes . for properties $ \propName -> do
+        if propName == "metadata"
+          then
+            -- metadata is set on resource creation
+            pure Nothing
+          else do
+            propValue <-
+              fromMaybe (error $ renderResourceId resId ++ ":" ++ propName ++ " does not exist")
+                <$> readProperty resTy resName propName
+            pure . Just $ Tar.fileEntry (resTyName </> propertiesPart resName </> propName) propValue
 
       dependencies <- listDependencies resTy resName
       dependencyEntries <- for dependencies $ \dependency -> do
@@ -572,16 +579,86 @@ export store xactId = do
             (resTyName </> propertiesPart resName </> "dependencies" </> renderResourceId dependency)
             mempty
 
-      dependents <- listDependents resTy resName
-      dependentEntries <- for dependents $ \dependent -> do
-        pure $
-          Tar.fileEntry
-            (resTyName </> propertiesPart resName </> "dependents" </> renderResourceId dependent)
-            mempty
-
-      pure $ contentEntry : propertyEntries ++ dependencyEntries ++ dependentEntries
+      pure $ contentEntry : propertyEntries ++ dependencyEntries
 
   pure $ Tar.write $ foldMap Tar.encodeLongNames (resourceEntries ++ concat entries)
+
+import_ ::
+  (MonadError DiagnosticReports m, MonadIO m) =>
+  Store m ->
+  TransactionId ->
+  LazyByteString ->
+  m [ResourceId]
+import_ store xactId archive = do
+  let entries = Tar.decodeLongNames $ Tar.read archive
+  Tar.foldEntries
+    ( \entry rest -> do
+        let path = Tar.entryTarPath entry
+        content <-
+          case Tar.entryContent entry of
+            Tar.NormalFile content' _fileSize ->
+              pure content'
+            _ ->
+              throwError . DiagnosticSimple $
+                "archive entry "
+                  ++ path
+                  ++ " should be a file, got "
+                  ++ case Tar.entryContent entry of
+                    Tar.Directory -> "a directory"
+                    Tar.SymbolicLink{} -> "a symbolic link"
+                    Tar.HardLink{} -> "a hard link"
+                    Tar.CharacterDevice{} -> "a character device"
+                    Tar.BlockDevice{} -> "a block device"
+                    Tar.NamedPipe -> "a named pipe"
+                    Tar.OtherEntryType{} -> "an unknown entry type"
+
+        mResourceId <-
+          case splitDirectories path of
+            [] -> undefined
+            [resTyName, resName] -> do
+              resTy <- getResourceType store xactId resTyName
+              writeResource resTy resName content
+              pure . Just $ ResourceId resTyName resName
+            [resTyName, part, propName] | (resName, ":properties") <- break (== ':') part -> do
+              resTy <- getResourceType store xactId resTyName
+
+              -- metadata is set on resource creation
+              unless (propName == "metadata") $
+                case parsePropertyValue content of
+                  Left err ->
+                    throwError $
+                      DiagnosticReports
+                        ( fromString $
+                            "(" ++ renderResourceId (ResourceId (resourceTypeName resTy) resName) ++ ":" ++ propName ++ ")"
+                        )
+                        content
+                        (sageErrorReport err)
+                  Right value -> do
+                    setProperty resTy resName propName $ metadataValueFromToml value
+
+              pure Nothing
+            [resTyName, part, "dependencies", subKey] | (resName, ":properties") <- break (== ':') part -> do
+              resTy <- getResourceType store xactId resTyName
+              let resId = readResourceId subKey
+              createDependency resTy resName resId
+              pure Nothing
+            _ ->
+              throwError . DiagnosticSimple $ "unrecognised archive path: " ++ path
+
+        case mResourceId of
+          Nothing -> rest
+          Just resId -> (resId :) <$> rest
+    )
+    (pure [])
+    ( \err -> do
+        case err of
+          Left err' -> do
+            liftIO . putStrLn $ "TAR format error: " ++ show err'
+          Right err' -> do
+            liftIO . putStrLn $ "decode long names error: " ++ show err'
+        throwError $ DiagnosticSimple "TAR format error"
+    )
+    entries
 
 data ResourceType m
   = ResourceType
@@ -1057,6 +1134,10 @@ createDependency = createDependencyImpl
 removeDependency :: ResourceType m -> String -> ResourceId -> m ()
 removeDependency = removeDependencyImpl
 
+parsePropertyValue :: LazyByteString -> Either Toml.ParseError Toml.TomlValue
+parsePropertyValue content =
+  Sage.parse (Toml.valueParser Toml.TopLevel <* Sage.eof) (LazyByteString.toStrict content)
+
 lookupProperty ::
   MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe MetadataValue)
 lookupProperty resTy resName propName = do
@@ -1064,7 +1145,7 @@ lookupProperty resTy resName propName = do
   case mContent of
     Nothing -> pure Nothing
     Just content ->
-      case Sage.parse (Toml.valueParser Toml.TopLevel <* Sage.eof) (LazyByteString.toStrict content) of
+      case parsePropertyValue content of
         Right x -> pure . Just $ metadataValueFromToml x
         Left err ->
           throwError $

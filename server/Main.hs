@@ -42,7 +42,6 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
-import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.Traversable (for)
 import GHC.Stack (HasCallStack)
 import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified)
@@ -451,6 +450,38 @@ app store routesVar request respond = do
                       )
                     ]
                 pure $ Wai.responseLBS ok200 headers content
+              else
+                throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+      [part]
+        | part == fromString ".import" ->
+            if Wai.requestMethod request == fromString "PUT"
+              then do
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+                handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+                  imported <- Store.import_ store xactId =<< liftIO (Wai.consumeRequestBodyLazy request)
+                  if defer
+                    then do
+                      let
+                        response =
+                          fromString "imported resources:\n"
+                            <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
+                            <> fromString "(rules deferred)"
+
+                      pure $ Wai.responseLBS ok200 [] response
+                    else do
+                      changes <- evalRules store routesVar xactId imported
+
+                      let
+                        response =
+                          fromString "imported resources:\n"
+                            <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
+                            <> if null changes
+                              then mempty
+                              else
+                                fromString ("\nresource changes:\n")
+                                  <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
+
+                      pure $ Wai.responseLBS ok200 [] response
               else
                 throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part, resTyName, resName]

@@ -108,6 +108,9 @@ data Command
   | RefreshAll
       -- | Resource type to refresh
       String
+  | Import
+      -- | Archive to import
+      FilePath
 
 cliParser :: Options.Parser Cli
 cliParser =
@@ -140,6 +143,9 @@ cliParser =
           <> Options.command
             "refresh-all"
             (Options.info refreshAllParser $ Options.progDesc "Mark resources as changed")
+          <> Options.command
+            "import"
+            (Options.info importParser $ Options.progDesc "Import an archive")
       )
   where
     beginParser =
@@ -236,6 +242,11 @@ cliParser =
         <$> Options.strArgument
           (Options.metavar "TYPE" <> Options.help "Type of resource to refresh")
 
+    importParser =
+      Import
+        <$> Options.strArgument
+          (Options.metavar "FILE" <> Options.help "Archive to import")
+
 parseResourceId ::
   -- | Input
   String ->
@@ -327,6 +338,8 @@ main = do
       edit baseUrl mCertificateStore resourceId'
     RefreshAll resTy ->
       refreshAll baseUrl mCertificateStore resTy
+    Import path ->
+      import_ baseUrl mCertificateStore path
 
 -- <https://stackoverflow.com/a/41816183>
 httpManager :: Maybe CertificateStore -> IO Http.Manager
@@ -967,6 +980,27 @@ refreshAll baseUrl mCertificateStore resTy = do
   let headers = []
   (_responseHeaders, response) <- do
     httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
+
+  case response of
+    PreconditionFailed ->
+      error "impossible"
+    NotFound{} ->
+      error "impossible"
+    Conflict{} -> do
+      error "impossible"
+    Created{} -> do
+      error "impossible"
+    Ok a ->
+      ByteString.Lazy.Char8.putStrLn a
+
+import_ :: String -> Maybe CertificateStore -> FilePath -> IO ()
+import_ baseUrl mCertificateStore path = do
+  manager <- httpManager mCertificateStore
+
+  let headers = []
+  (_responseHeaders, response) <- do
+    content <- LazyByteString.readFile path
+    httpPut manager (baseUrl ++ "/.import") headers content
 
   case response of
     PreconditionFailed ->
