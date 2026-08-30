@@ -23,6 +23,7 @@ library
         entropy,
         filepath,
         sage,
+        temple,
         text >=2.0,
         tomlin
     hs-source-dirs:   src

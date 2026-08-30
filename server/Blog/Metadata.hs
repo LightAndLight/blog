@@ -10,7 +10,6 @@ module Blog.Metadata
   , renderPath
   , PathItem (..)
   , pathItem
-  , metadataValueToTempleExpr
   , metadataValueFromToml
   , renderMetadataValueToml
   )
@@ -42,7 +41,6 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
-import qualified Temple
 import qualified Toml
 
 resourceMetadataDecoder ::
@@ -122,30 +120,6 @@ data PathItem
   | ConstructorArg !Text !Int
   deriving (Show)
 
-metadataValueToTempleExpr :: Path -> MetadataValue -> Temple.Expr Path
-metadataValueToTempleExpr _path VTrue = Temple.Bool True
-metadataValueToTempleExpr _path VFalse = Temple.Bool False
-metadataValueToTempleExpr _path (VString s) =
-  Temple.String [Temple.PartText s]
-metadataValueToTempleExpr path (VList xs) =
-  Temple.Array $
-    fmap
-      ( \(ix, item) ->
-          let path' = path <> pathItem (ArrayItem ix)
-          in Temple.Located
-               path'
-               (metadataValueToTempleExpr path' item)
-      )
-      (zip [0 ..] xs)
-metadataValueToTempleExpr path (VConstructor name args) =
-  Temple.Constructor name $
-    fmap
-      ( \(ix, arg) ->
-          let path' = path <> pathItem (ConstructorArg name ix)
-          in Temple.Located path' $ metadataValueToTempleExpr path' arg
-      )
-      (zip [0 ..] args)
-
 renderMetadataValueToml :: MetadataValue -> LazyByteString
 renderMetadataValueToml VTrue = fromString "true"
 renderMetadataValueToml VFalse = fromString "false"
@@ -159,6 +133,19 @@ renderMetadataValueToml (VList xs) =
   fromString "["
     <> fold (intersperse (fromString ", ") (fmap renderMetadataValueToml xs))
     <> fromString "]"
+renderMetadataValueToml (VRecord fields) =
+  fromString "{"
+    <> fold
+      ( intersperse (fromString ", ") $
+          fmap
+            ( \(field, value) ->
+                Text.Lazy.Encoding.encodeUtf8 (LazyText.fromStrict field)
+                  <> fromString " = "
+                  <> renderMetadataValueToml value
+            )
+            fields
+      )
+    <> fromString "}"
 renderMetadataValueToml (VConstructor name args) =
   fromString "{"
     <> fromString "__ctor = "

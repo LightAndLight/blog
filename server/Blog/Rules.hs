@@ -340,6 +340,9 @@ metaToTempleTy :: MetadataType -> Temple.Type
 metaToTempleTy TBool = Temple.TBool
 metaToTempleTy TString = Temple.TString
 metaToTempleTy (TList t) = Temple.TStream (metaToTempleTy t)
+metaToTempleTy (TRecord fs) =
+  Temple.TRecord $
+    foldr (\(field, ty) -> Temple.TRecordField field (metaToTempleTy ty)) Temple.TRowEnd fs
 
 metaToTempleCore :: MetadataValue -> Temple.Core
 metaToTempleCore (VString s) =
@@ -350,6 +353,8 @@ metaToTempleCore VFalse =
   Temple.CFalse
 metaToTempleCore (VList xs) =
   Temple.CArray (fmap metaToTempleCore xs)
+metaToTempleCore (VRecord fields) =
+  Temple.CRecord ((fmap . fmap) metaToTempleCore fields)
 metaToTempleCore (VConstructor name args) =
   Temple.CConstructor name (fmap metaToTempleCore args)
 
@@ -722,6 +727,12 @@ inferMetadataValueType VFalse =
   pure (Temple.CFalse, Temple.TBool)
 inferMetadataValueType (VString s) =
   pure (Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 s], Temple.TString)
+inferMetadataValueType (VRecord fields) = do
+  rest <- Temple.metavar Temple.KRow
+  (fields', fieldTys) <-
+    unzip . fmap (\(f, (a, b)) -> ((f, a), (f, b)))
+      <$> (traverse . traverse) inferMetadataValueType fields
+  pure (Temple.CRecord fields', Temple.TRecord $ foldr (uncurry Temple.TRecordField) rest fieldTys)
 inferMetadataValueType (VConstructor name args) = do
   rest <- Temple.metavar Temple.KRow
   (args', argTys) <- unzip <$> traverse inferMetadataValueType args

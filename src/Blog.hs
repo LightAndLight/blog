@@ -25,6 +25,7 @@ import Data.Maybe (fromMaybe, isJust)
 import Data.String (fromString)
 import Data.Text (Text)
 import GHC.Stack (HasCallStack)
+import qualified Temple
 import qualified Text.Sage as Sage
 import qualified Toml
 
@@ -90,6 +91,7 @@ data MetadataType
   = TBool
   | TString
   | TList MetadataType
+  | TRecord [(Text, MetadataType)]
   deriving (Show)
 
 resourceConfigDecoder :: Toml.Decoder ResourceConfig
@@ -130,6 +132,13 @@ metadataTypeParser =
   TBool <$ Sage.string (fromString "bool")
     <|> TString <$ Sage.string (fromString "string")
     <|> TList <$ Sage.string (fromString "list") <* Sage.char '(' <*> metadataTypeParser <* Sage.char ')'
+    <|> TRecord
+      <$ Sage.string (fromString "record")
+      <* Sage.char '('
+      <*> Sage.sepBy
+        ((,) <$> Temple.identParser <* Temple.symbolic ':' <*> metadataTypeParser)
+        (Temple.symbolic ',')
+      <* Sage.char ')'
 
 data MetadataValue
   = VTrue
@@ -137,6 +146,7 @@ data MetadataValue
   | VString !Text
   | VList ![MetadataValue]
   | VConstructor !Text ![MetadataValue]
+  | VRecord ![(Text, MetadataValue)]
   deriving (Show)
 
 metadataValueString :: HasCallStack => MetadataValue -> Text
@@ -147,3 +157,7 @@ metadataTypeDecoder :: MetadataType -> Toml.ValueDecoder MetadataValue
 metadataTypeDecoder TBool = (\b -> if b then VTrue else VFalse) <$> Toml.bool
 metadataTypeDecoder TString = VString <$> Toml.text
 metadataTypeDecoder (TList ty) = fmap VList . Toml.list $ metadataTypeDecoder ty
+metadataTypeDecoder (TRecord fields) =
+  VRecord
+    <$> Toml.record
+      (traverse (\(field, ty) -> (,) field <$> Toml.recordKey field (metadataTypeDecoder ty)) fields)

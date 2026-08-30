@@ -87,6 +87,7 @@ import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
+import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
 import Data.Functor (void)
 import Data.List (union, (\\))
@@ -1136,7 +1137,9 @@ removeDependency = removeDependencyImpl
 
 parsePropertyValue :: LazyByteString -> Either Toml.ParseError Toml.TomlValue
 parsePropertyValue content =
-  Sage.parse (Toml.valueParser Toml.TopLevel <* Sage.eof) (LazyByteString.toStrict content)
+  Sage.parse
+    (Toml.valueParser Toml.TopLevel <* Sage.skipMany (Sage.satisfy Char.isSpace) <* Sage.eof)
+    (LazyByteString.toStrict content)
 
 lookupProperty ::
   MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe MetadataValue)
