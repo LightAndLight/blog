@@ -33,6 +33,7 @@ module Blog.Store
   , lookupTransaction
   , saveDeferred
   , restoreDeferred
+  , export
 
     -- * Resource types
   , ResourceType
@@ -72,6 +73,8 @@ import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
+import qualified Codec.Archive.Tar as Tar
+import qualified Codec.Archive.Tar.Entry as Tar (fileEntry)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmark)
 import Control.Exception (throwIO)
@@ -533,6 +536,52 @@ saveDeferred = saveDeferredImpl
 
 restoreDeferred :: Store m -> TransactionId -> m ()
 restoreDeferred = restoreDeferredImpl
+
+export :: MonadError DiagnosticReports m => Store m -> TransactionId -> m LazyByteString
+export store xactId = do
+  resourceTy <- getResourceType store xactId "resource"
+  tyIds <- listResource resourceTy
+
+  resourceEntries <- for tyIds $ \tyId@(ResourceId resTy resName) -> do
+    content <-
+      fromMaybe (error $ renderResourceId tyId ++ " does not exist")
+        <$> readResource resourceTy resName
+    pure $ Tar.fileEntry (resTy </> resName) content
+
+  entries <- for tyIds $ \(ResourceId _resTyName tyName) -> do
+    resTy <- getResourceType store xactId tyName
+    resources <- listResource resTy
+    fmap concat . for resources $ \resId@(ResourceId resTyName resName) -> do
+      content <-
+        fromMaybe (error $ renderResourceId resId ++ " does not exist")
+          <$> readResource resTy resName
+
+      let contentEntry = Tar.fileEntry (resTyName </> resName) content
+
+      properties <- listProperties resTy resName
+      propertyEntries <- for properties $ \propName -> do
+        propValue <-
+          fromMaybe (error $ renderResourceId resId ++ ":" ++ propName ++ " does not exist")
+            <$> readProperty resTy resName propName
+        pure $ Tar.fileEntry (resTyName </> propertiesPart resName </> propName) propValue
+
+      dependencies <- listDependencies resTy resName
+      dependencyEntries <- for dependencies $ \dependency -> do
+        pure $
+          Tar.fileEntry
+            (resTyName </> propertiesPart resName </> "dependencies" </> renderResourceId dependency)
+            mempty
+
+      dependents <- listDependents resTy resName
+      dependentEntries <- for dependents $ \dependent -> do
+        pure $
+          Tar.fileEntry
+            (resTyName </> propertiesPart resName </> "dependents" </> renderResourceId dependent)
+            mempty
+
+      pure $ contentEntry : propertyEntries ++ dependencyEntries ++ dependentEntries
+
+  pure $ Tar.write $ foldMap Tar.encodeLongNames (resourceEntries ++ concat entries)
 
 data ResourceType m
   = ResourceType

@@ -95,6 +95,7 @@ executable blog-server
         sage,
         stm,
         syb,
+        tar,
         temple,
         text >=2.0,
         time,

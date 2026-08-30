@@ -19,6 +19,7 @@ import Blog.Store (Store)
 import qualified Blog.Store as Store
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
+import Control.Exception (evaluate)
 import Control.Monad (unless)
 import Control.Monad.Catch (MonadMask, onException)
 import Control.Monad.Error.Class (MonadError (..))
@@ -39,8 +40,9 @@ import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.Traversable (for)
 import GHC.Stack (HasCallStack)
 import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified)
@@ -419,6 +421,38 @@ app store routesVar request respond = do
                         pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
                       else
                         throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+      [part]
+        | part == fromString ".export" ->
+            if Wai.requestMethod request == fromString "GET"
+              then do
+                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+                content <-
+                  handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+                    content <- Store.export store xactId
+
+                    -- If I don't force `content` here then I get a "thread
+                    -- blocked indefinitely on MVar" error when
+                    -- `Wai.responseLBS` tries to write out the result. Why?
+                    -- This prevents me from streaming the archive out.
+                    --
+                    -- TODO: fix this
+                    _ <- liftIO . evaluate $ LazyByteString.length content
+
+                    pure content
+
+                now <- liftIO getCurrentTime
+                let
+                  headers =
+                    [ (fromString "Content-Type", fromString "application/tar")
+                    ,
+                      ( fromString "Content-Disposition"
+                      , fromString $
+                          "attachment; filename=\"" ++ formatTime defaultTimeLocale "%FT%H:%M:%SZ" now ++ "-blog-export.tar\""
+                      )
+                    ]
+                pure $ Wai.responseLBS ok200 headers content
+              else
+                throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part, resTyName, resName]
         | part == fromString ".resource" ->
             if Wai.requestMethod request == fromString "GET"
