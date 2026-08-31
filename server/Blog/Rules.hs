@@ -150,6 +150,11 @@ rules =
       (Build.iResource "pdf" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "pdf-" *< Build.oBind "name"))
       resourceRoute
+    <> Build.rule
+      "woff2-route"
+      (Build.iResource "woff2" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "woff2-" *< Build.oBind "name"))
+      resourceRoute
 
 -- TODO: expose in `temple`?
 getRecordFields :: Temple.Type -> ([(Text, Temple.Type)], Maybe (Temple.Type))
