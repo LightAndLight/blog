@@ -1030,14 +1030,16 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
   (mExcerpt, html) <- do
     (_deps, document) <- loadMarkdown iArticle
 
-    let
-      isComment (RawBlock format value) = format == fromString "html" && fromString "<!--" `Text.isPrefixOf` value
-      isComment _ = False
-
-      mExcerpt = getFirst $ query @Block (\block -> First $ block <$ guard (not $ isComment block)) document
-
     (,)
-      <$> traverse (Html.runRenderT Html.emptyNotesState . Html.renderBlock) mExcerpt
+      <$> ( do
+              let mMetadataExcerpt = Map.lookup (fromString "excerpt") $ Build.resourceInputMetadata iArticle
+              case mMetadataExcerpt of
+                Just (VString metadataExcerpt) | not $ Text.null metadataExcerpt -> do
+                  pure . Just $ Builder.fromText metadataExcerpt
+                _ -> do
+                  let mExcerpt = getFirst $ query @Block (\case block@Para{} -> First $ Just block; _ -> mempty) document
+                  traverse (Html.runRenderT Html.emptyNotesState . Html.renderBlock) mExcerpt
+          )
       <*> Html.runRenderT Html.emptyNotesState (Html.renderBlocks document)
 
   for_ mExcerpt $ Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . Builder.toLazyText
