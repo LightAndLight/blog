@@ -651,7 +651,7 @@ httpResourcePost store routesVar request = do
       then throwError . DiagnosticSimple $ "resource " ++ resTyName ++ ":" ++ resName ++ " already exists"
       else do
         body <- liftIO $ Wai.consumeRequestBodyLazy request
-        Store.writeResource resTy resName body
+        _changed <- Store.writeResource resTy resName body
         if defer
           then
             pure $
@@ -714,7 +714,7 @@ httpResourcePut store routesVar request = do
         if maybe True (serverModificationTime <=) mLocalModificationTime
           then do
             body <- liftIO $ Wai.consumeRequestBodyLazy request
-            Store.writeResource resTy resName body
+            changed <- Store.writeResource resTy resName body
 
             if defer
               then
@@ -728,13 +728,17 @@ httpResourcePut store routesVar request = do
                         ]
                     )
               else do
-                changes <- evalRules store routesVar xactId [resId]
+                changes <- evalRules store routesVar xactId [resId | changed]
                 pure $
                   Wai.responseLBS
                     ok200
                     responseHeaders
                     ( ByteString.Lazy.Char8.unlines $
-                        fromString ("updated " ++ resTyName ++ ":" ++ resName)
+                        fromString
+                          ( "updated "
+                              ++ renderResourceId (ResourceId resTyName resName)
+                              ++ if changed then "" else " (nothing changed)"
+                          )
                           : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
                     )
           else

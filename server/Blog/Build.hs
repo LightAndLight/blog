@@ -6,6 +6,7 @@
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE KindSignatures #-}
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Blog.Build
@@ -52,7 +53,7 @@ module Blog.Build
 where
 
 import Blog
-  ( MetadataValue
+  ( MetadataValue (..)
   , ResourceId (ResourceId)
   , renderResourceId
   , resourceName
@@ -64,7 +65,7 @@ import Blog.Metadata
   )
 import Blog.Store (Store, TransactionId, hoistStore)
 import qualified Blog.Store as Store
-import Control.Monad (guard, unless)
+import Control.Monad (guard, unless, when)
 import Control.Monad.Error.Class (MonadError, liftEither, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -212,17 +213,12 @@ putResource resId@(ResourceId resTyName resName) content = do
   reasons <- ActionT $ asks aeReasons
 
   resTy <- Store.getResourceType store transactionId $ fromString resTyName
-  exists <- Store.doesResourceExist resTy resName
-  if exists
-    then do
-      Store.writeResource resTy resName content
-      let changes = [Change Updated resId reasons]
-      ActionT $ tell mempty{asChanges = changes}
-    else do
-      Store.writeResource resTy resName content
-      let changes = [Change Created resId reasons]
-      ActionT $ tell mempty{asChanges = changes}
-  ActionT $ tell mempty{asPending = [resId]}
+  existed <- Store.doesResourceExist resTy resName
+  changed <- Store.writeResource resTy resName content
+  when changed $ do
+    let status = if existed then Updated else Created
+    let changes = [Change status resId reasons]
+    ActionT $ tell mempty{asChanges = changes, asPending = [resId]}
 
 setProperty :: MonadIO m => ResourceId -> String -> MetadataValue -> ActionT m ()
 setProperty resId@(ResourceId resTyName resName) key value = do

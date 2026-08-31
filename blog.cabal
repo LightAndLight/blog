@@ -79,11 +79,13 @@ executable blog-server
         Text.Pandoc.Walk
     build-depends:
         base ^>=4.20.2.0,
+        base16-bytestring,
         blog,
         bytestring,
         commonmark,
         commonmark-extensions,
         containers,
+        cryptohash-sha256,
         deepseq,
         diagnostica,
         diagnostica-sage,

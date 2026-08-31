@@ -62,7 +62,7 @@ module Blog.Store
   ) where
 
 import Blog
-  ( MetadataValue
+  ( MetadataValue (..)
   , ResourceConfig (..)
   , ResourceId (..)
   , propertiesPart
@@ -83,8 +83,11 @@ import Control.Exception (throwIO)
 import Control.Monad (unless, when)
 import Control.Monad.Catch (ExitCase (..), MonadCatch, MonadMask, catch, generalBracket, throwM)
 import Control.Monad.Error.Class (MonadError, throwError)
+import Control.Monad.Fix (mfix)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import qualified Crypto.Hash.SHA256 as Sha256
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Base16 as Base16
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Char as Char
@@ -97,6 +100,7 @@ import Data.Monoid (First (..))
 import qualified Data.Set as Set
 import Data.String (fromString)
 import Data.Text (Text)
+import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime)
@@ -618,7 +622,7 @@ import_ store xactId archive = do
             [] -> undefined
             [resTyName, resName] -> do
               resTy <- getResourceType store xactId resTyName
-              writeResource resTy resName content
+              _changed <- writeResource resTy resName content
               pure . Just $ ResourceId resTyName resName
             [resTyName, part, propName] | (resName, ":properties") <- break (== ':') part -> do
               resTy <- getResourceType store xactId resTyName
@@ -667,7 +671,7 @@ data ResourceType m
   , resourceTypeConfig :: !ResourceConfig
   , doesResourceExistImpl :: !(String -> m Bool)
   , readResourceImpl :: !(String -> m (Maybe LazyByteString))
-  , writeResourceImpl :: !(String -> LazyByteString -> m ())
+  , writeResourceImpl :: !(String -> LazyByteString -> m Bool)
   , readPropertyImpl :: !(String -> String -> m (Maybe LazyByteString))
   , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
   , listPropertiesImpl :: !(String -> m [String])
@@ -718,7 +722,14 @@ resourceTypeFromDirectory ::
   ResourceConfig ->
   IO (ResourceType m)
 resourceTypeFromDirectory storeDir xactId resTyName config =
-  pure ResourceType{resourceTypeName = resTyName, resourceTypeConfig = config, ..}
+  mfix $ \self ->
+    pure
+      ResourceType
+        { resourceTypeName = resTyName
+        , resourceTypeConfig = config
+        , writeResourceImpl = writeResourceImpl self
+        , ..
+        }
   where
     baseResTyDir = storeDir </> resTyName
     xactResTyDir change = getTransactionIdDir storeDir xactId </> changePart change </> resTyName
@@ -819,8 +830,8 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
             then pure ()
             else IO.createDirectoryIfMissing True $ xactDir </> changePart Create </> dir
 
-    writeResourceImpl :: String -> LazyByteString -> m ()
-    writeResourceImpl resName body = do
+    writeResourceImpl :: ResourceType m -> String -> LazyByteString -> m Bool
+    writeResourceImpl self resName body = do
       removed <- liftIO . doesFileExist $ xactResTyDir Delete </> resName
       if removed
         then do
@@ -834,17 +845,63 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
             else
               doWrite Create
       where
+        newHash = Base16.encode $ Sha256.hashlazy body
+
+        getOldHash = do
+          mValue <- lookupProperty self resName "sha256"
+          case mValue of
+            Nothing ->
+              pure Nothing
+            Just (VString s) ->
+              pure . Just $ Text.Encoding.encodeUtf8 s
+            Just value ->
+              error $
+                renderResourceId (ResourceId resTyName resName)
+                  ++ ":sha256 is not a string (got "
+                  ++ show value
+                  ++ ")"
+
         doWrite change
           | resTyName == "resource" = do
               _config <- parseResourceConfig resName body
-              liftIO $ do
-                xactWriteFile "resource" resName body
-                xactCreateDir resName
+
+              let
+                onChange = do
+                  liftIO $ xactWriteFile "resource" resName body
+                  setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
+                  liftIO $ xactCreateDir resName
+
+              case change of
+                Delete ->
+                  pure True
+                Create -> do
+                  onChange
+                  pure True
+                Update -> do
+                  mOldHash <- getOldHash
+                  let changed = mOldHash /= Just newHash
+                  when changed onChange
+                  pure changed
           | otherwise = do
-              liftIO $ IO.createDirectoryIfMissing False (xactResTyDir change)
-              metadata <- extractMetadata resTyName config resName body
-              updateMetadata resName metadata
-              liftIO $ xactWriteFile resTyName resName body
+              let
+                onChange = do
+                  liftIO $ IO.createDirectoryIfMissing False (xactResTyDir change)
+                  metadata <- extractMetadata resTyName config resName body
+                  updateMetadata resName metadata
+                  liftIO $ xactWriteFile resTyName resName body
+                  setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
+
+              case change of
+                Delete ->
+                  pure True
+                Create -> do
+                  onChange
+                  pure True
+                Update -> do
+                  mOldHash <- getOldHash
+                  let changed = mOldHash /= Just newHash
+                  when changed onChange
+                  pure changed
 
     updateMetadata :: String -> Metadata -> m ()
     updateMetadata resName metadata = do
@@ -1096,7 +1153,12 @@ doesResourceExist = doesResourceExistImpl
 readResource :: ResourceType m -> String -> m (Maybe LazyByteString)
 readResource = readResourceImpl
 
-writeResource :: ResourceType m -> String -> LazyByteString -> m ()
+writeResource ::
+  ResourceType m ->
+  String ->
+  LazyByteString ->
+  -- | The resource's contents changed
+  m Bool
 writeResource = writeResourceImpl
 
 readProperty :: ResourceType m -> String -> String -> m (Maybe LazyByteString)
