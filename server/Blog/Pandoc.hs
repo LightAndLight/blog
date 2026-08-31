@@ -19,6 +19,7 @@ markdownReaderOptions =
           . enableExtension Ext_markdown_in_html_blocks
           . enableExtension Ext_auto_identifiers
           . enableExtension Ext_gfm_auto_identifiers
+          . enableExtension Ext_wikilinks_title_before_pipe
           $ getDefaultExtensions (fromString "commonmark_x")
     }
 
