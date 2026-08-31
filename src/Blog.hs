@@ -18,7 +18,7 @@ module Blog
   )
 where
 
-import Control.Applicative (optional, some, (<|>))
+import Control.Applicative (many, optional, some, (<|>))
 import qualified Data.Char as Char
 import Data.Map (Map)
 import Data.Maybe (fromMaybe, isJust)
@@ -41,7 +41,7 @@ nameParser =
   some $ Sage.satisfy ((||) <$> Char.isAlphaNum <*> (`elem` "-_."))
 
 resourceTypeParser :: Sage.Parser String
-resourceTypeParser = some $ Sage.satisfy Char.isAlpha
+resourceTypeParser = (:) <$> Sage.satisfy Char.isAlpha <*> many (Sage.satisfy Char.isAlphaNum)
 
 resourceNameParser :: Sage.Parser String
 resourceNameParser =
