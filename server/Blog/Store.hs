@@ -75,10 +75,9 @@ import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
+import Blog.Pandoc (markdownReaderOptions)
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as Tar (entryTarPath, fileEntry)
-import Commonmark.Pandoc (Cm, unCm)
-import Commonmark.Parser (commonmark)
 import Control.Exception (throwIO)
 import Control.Monad (unless, when)
 import Control.Monad.Catch (ExitCase (..), MonadCatch, MonadMask, catch, generalBracket, throwM)
@@ -117,7 +116,7 @@ import System.Directory
   )
 import System.FilePath (splitDirectories, takeDirectory, (</>))
 import System.IO.Error (isDoesNotExistError)
-import Text.Pandoc.Builder (Blocks)
+import qualified Text.Pandoc as Pandoc
 import Text.Pandoc.Definition (Block (..))
 import Text.Pandoc.Walk (query)
 import qualified Text.Sage as Sage
@@ -1256,9 +1255,9 @@ extractMetadataMarkdown resTyName config resName body = do
       Left err -> error "TODO: " err
       Right x -> pure $! LazyText.toStrict x
   markdown <-
-    case commonmark "(input)" body' of
+    case Pandoc.runPure $ Pandoc.readMarkdown markdownReaderOptions body' of
       Left err -> error "TODO: " err
-      Right x -> pure $ unCm (x :: Cm () Blocks)
+      Right x -> pure x
 
   let
     metadataBlock (CodeBlock (_ident, classes, _kvs) content)

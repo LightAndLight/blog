@@ -30,6 +30,9 @@ cradle:
     - path: "./server/Blog/Store.hs"
       component: "blog:exe:blog-server"
 
+    - path: "./server/Commonmark/Extensions/NativeDiv.hs"
+      component: "blog:exe:blog-server"
+
     - path: "./server/IO.hs"
       component: "blog:exe:blog-server"
 

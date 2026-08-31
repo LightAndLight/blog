@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
@@ -25,16 +26,11 @@ import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
 import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport, tomlResult)
 import Blog.Metadata (parseResourceMetadata)
+import Blog.Pandoc (htmlWriterOptions, markdownReaderOptions)
 import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
-import Commonmark.Extensions.Footnote (footnoteSpec)
-import Commonmark.Extensions.PipeTable (pipeTableSpec)
-import Commonmark.Extensions.Wikilinks (TitlePosition (..), wikilinksSpec)
-import Commonmark.Pandoc (Cm, unCm)
-import Commonmark.Parser (commonmarkWith)
-import Commonmark.Syntax (defaultSyntaxSpec)
 import Control.Applicative ((<|>))
 import Control.Monad (guard, unless)
 import Control.Monad.Error.Class (MonadError, throwError, tryError)
@@ -49,7 +45,6 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
-import Data.Functor.Identity (runIdentity)
 import Data.List (delete, find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
@@ -64,8 +59,6 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
-import Data.Text.Lazy.Builder (Builder)
-import qualified Data.Text.Lazy.Builder as Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime (..))
 import Data.Time.Format.ISO8601 (iso8601ParseM)
@@ -73,11 +66,12 @@ import Data.Traversable (for)
 import qualified Data.Tuple as Tuple
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
-import Text.Pandoc.Builder (Block, Blocks)
-import qualified Text.Pandoc.Builder as Blocks (toList)
-import Text.Pandoc.Definition (Block (..), Inline (..))
-import qualified Text.Pandoc.Html as Html
-import Text.Pandoc.Walk (query, walk, walkM)
+import Text.Pandoc (PandocPure)
+import qualified Text.Pandoc as Pandoc
+import Text.Pandoc.Builder (Block)
+import qualified Text.Pandoc.Builder as Pandoc
+import Text.Pandoc.Definition (Block (..), Inline (..), Pandoc, nullAttr)
+import Text.Pandoc.Walk (Walkable, query, walk, walkM)
 import qualified Text.Sage as Sage
 import qualified Toml
 
@@ -759,7 +753,7 @@ articlePropertyTypeProvider ::
   -- | Next
   Maybe [(Text, MetadataValue)] ->
   -- | Rendered article content
-  Builder ->
+  Text ->
   PropertyTypeProvider m
 articlePropertyTypeProvider mPrev mNext content =
   PropertyTypeProvider $ \_resTy _resName propName ->
@@ -806,7 +800,7 @@ articlePropertyTypeProvider mPrev mNext content =
                   pure $
                     Temple.CString
                       [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $
-                          Builder.toLazyText content
+                          LazyText.fromStrict content
                       ]
               else
                 pure Nothing
@@ -854,36 +848,157 @@ loadTemplate readTemplateRef renderTemplateRef iTemplate = do
           reports
     Right x -> pure x
 
+linkHeaders :: Walkable Block a => a -> a
+linkHeaders =
+  walk @Block
+    ( \block ->
+        case block of
+          Header level attr@(identifier, _classes, _attributes) content
+            | level > 1
+            , not (Text.null identifier) ->
+                Header level attr [Link nullAttr content (fromString "#" <> identifier, mempty)]
+          _ -> block
+    )
+
+tableOfContents :: Walkable Block a => a -> a
+tableOfContents document =
+  walk @Block
+    ( \block ->
+        case block of
+          Div attr@(ident, _classes, _attributes) _
+            | ident == fromString "toc" ->
+                Div
+                  attr
+                  -- This breaks if I use `Pandoc.Header 3 nullAttr [Str "Contents"]`
+                  -- I don't know why.
+                  [ RawBlock (fromString "html") (fromString "<h3>Contents</h3>")
+                  , contents
+                  ]
+          _ -> block
+    )
+    document
+  where
+    contents =
+      fromTocHeaders . toTocHeaders $
+        query @Block
+          ( \block -> case block of
+              Header{} -> [block]
+              _ -> mempty
+          )
+          document
+
+data TocHeader = TocHeader
+  { tocHeaderLevel :: Int
+  , tocHeaderId :: Text
+  , tocHeaderClasses :: [Text]
+  , tocHeaderAttrs :: [(Text, Text)]
+  , tocHeaderContent :: [Inline]
+  , tocHeaderChildren :: [TocHeader]
+  }
+  deriving (Eq, Show)
+
+toTocHeaders :: [Block] -> [TocHeader]
+toTocHeaders = go 2
+  where
+    go :: Int -> [Block] -> [TocHeader]
+    go level =
+      fmap
+        ( \((headerLevel, (identifier, classes, attrs), content), blocks) ->
+            let omitChildren =
+                  case lookup (fromString "toc:omit_children") attrs of
+                    Just value ->
+                      case Text.unpack value of
+                        "true" ->
+                          True
+                        "false" ->
+                          False
+                        _ ->
+                          error $ "invalid contents:omit_children value: " <> Text.unpack value
+                    Nothing ->
+                      False
+            in TocHeader
+                 headerLevel
+                 identifier
+                 classes
+                 attrs
+                 content
+                 (if omitChildren then [] else go (level + 1) blocks)
+        )
+        . snd
+        . separateBy
+          ( \case
+              Header headerLevel attrs content
+                | level == headerLevel ->
+                    Just (headerLevel, attrs, content)
+              _ -> Nothing
+          )
+
+data BreakOn a b
+  = Found {prefix :: [a], target :: b, suffix :: [a]}
+  | Missing [a]
+
+breakOn :: (a -> Maybe b) -> [a] -> BreakOn a b
+breakOn predicate items =
+  case items of
+    [] ->
+      Missing []
+    item : items' ->
+      case predicate item of
+        Nothing ->
+          case breakOn predicate items' of
+            Found{prefix, target, suffix} ->
+              Found{prefix = item : prefix, target, suffix}
+            Missing items'' ->
+              Missing (item : items'')
+        Just item' ->
+          Found{prefix = [], target = item', suffix = items'}
+
+separateBy :: (a -> Maybe b) -> [a] -> ([a], [(b, [a])])
+separateBy predicate items =
+  case breakOn predicate items of
+    Missing items' ->
+      (items', [])
+    Found{prefix, target, suffix} ->
+      case separateBy predicate suffix of
+        (prefix', suffix') ->
+          (prefix, (target, prefix') : suffix')
+
+fromTocHeaders :: [TocHeader] -> Block
+fromTocHeaders contents =
+  BulletList $
+    ( \content ->
+        Plain [Link nullAttr (tocHeaderContent content) (fromString "#" <> tocHeaderId content, mempty)]
+          : case tocHeaderChildren content of
+            [] -> []
+            _ ->
+              [fromTocHeaders $ tocHeaderChildren content]
+    )
+      <$> contents
+
 loadMarkdown ::
   forall m.
   MonadIO m =>
   Build.ResourceInput m LazyByteString ->
-  Build.ActionT m (Set ResourceId, [Block])
+  Build.ActionT m (Set ResourceId, Pandoc)
 loadMarkdown input = do
   content <-
     case Text.Lazy.Encoding.decodeUtf8' $ Build.resourceInputContent input of
       Left err -> error $ "TODO: " ++ show err
       Right x -> pure $! LazyText.toStrict x
 
-  let
-    result =
-      runIdentity $
-        commonmarkWith
-          (defaultSyntaxSpec <> wikilinksSpec TitleBeforePipe <> footnoteSpec <> pipeTableSpec)
-          ("(" ++ renderResourceId (Build.resourceInputId input) ++ ")")
-          content
+  let result = Pandoc.runPure $ Pandoc.readMarkdown markdownReaderOptions content
   case result of
     Left err ->
       error $ "TODO: " ++ show err
-    Right x -> do
-      let blocks = Blocks.toList $ unCm (x :: Cm () Blocks)
-      (deps, blocks') <- fmap Tuple.swap . runWriterT $ resolveResourceReferences blocks
-      pure (deps, removeMetadata blocks')
+    Right document -> do
+      (deps, document') <- fmap Tuple.swap . runWriterT $ resolveResourceReferences document
+      let document'' = tableOfContents . linkHeaders $ removeMetadata document'
+      pure (deps, document'')
   where
     wikilinkUrlName =
       "(wikilink in " ++ renderResourceId (Build.resourceInputId input) ++ ")"
 
-    resolveResourceReferences :: [Block] -> WriterT (Set ResourceId) (Build.ActionT m) [Block]
+    resolveResourceReferences :: Pandoc -> WriterT (Set ResourceId) (Build.ActionT m) Pandoc
     resolveResourceReferences =
       walkM
         @Inline
@@ -968,7 +1083,7 @@ loadMarkdown input = do
           pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
             Temple.evalCore env (Temple.CApp core [(fromString "resource", bindingValue)])
 
-    removeMetadata :: [Block] -> [Block]
+    removeMetadata :: Pandoc -> Pandoc
     removeMetadata =
       walk
         @[Block]
@@ -1004,6 +1119,9 @@ articleDependency iArticle () = do
   (deps, _markdown) <- loadMarkdown iArticle
   Build.setDependencies (Build.resourceInputId iArticle) deps
 
+pandoc :: MonadError DiagnosticReports m => PandocPure a -> m a
+pandoc = either (throwError . DiagnosticSimple . Text.unpack . Pandoc.renderError) pure . Pandoc.runPure
+
 articleHtml ::
   forall m.
   MonadIO m =>
@@ -1035,14 +1153,17 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
               let mMetadataExcerpt = Map.lookup (fromString "excerpt") $ Build.resourceInputMetadata iArticle
               case mMetadataExcerpt of
                 Just (VString metadataExcerpt) | not $ Text.null metadataExcerpt -> do
-                  pure . Just $ Builder.fromText metadataExcerpt
+                  pure . Just $ metadataExcerpt
                 _ -> do
                   let mExcerpt = getFirst $ query @Block (\case block@Para{} -> First $ Just block; _ -> mempty) document
-                  traverse (Html.runRenderT Html.emptyNotesState . Html.renderBlock) mExcerpt
+                  traverse
+                    (pandoc . Pandoc.writeHtml5String htmlWriterOptions . Pandoc.doc . Pandoc.singleton)
+                    mExcerpt
           )
-      <*> Html.runRenderT Html.emptyNotesState (Html.renderBlocks document)
+      <*> pandoc (Pandoc.writeHtml5String htmlWriterOptions document)
 
-  for_ mExcerpt $ Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . Builder.toLazyText
+  for_ mExcerpt $
+    Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict
 
   (prev, next) <- do
     let adjacencyFile = fromString $ "(" ++ renderResourceId (Build.resourceInputId iAdjacency) ++ ")"
@@ -1188,7 +1309,7 @@ pageHtml (iTemplate, iPage) oHtml = do
 
   html <- do
     (_deps, markdown) <- loadMarkdown iPage
-    Html.runRenderT Html.emptyNotesState (Html.renderBlocks markdown)
+    pandoc $ Pandoc.writeHtml5String htmlWriterOptions markdown
 
   bindings' <- for bindings $ \binding -> do
     let name = Temple.bindingName binding
@@ -1229,7 +1350,8 @@ pageHtml (iTemplate, iPage) oHtml = do
                     <> constantPropertyTypeProvider
                       (fromString "content")
                       ( Temple.CString
-                          [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $ Builder.toLazyText html
+                          [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $
+                              LazyText.fromStrict html
                           ]
                       , Temple.TString
                       )

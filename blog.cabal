@@ -66,24 +66,16 @@ executable blog-server
         Blog.Diagnostic
         Blog.Error
         Blog.Metadata
+        Blog.Pandoc
         Blog.Route
         Blog.Rules
         Blog.Store
         IO
-
-        -- Vendored
-        Commonmark.Pandoc
-        Text.Pandoc.Builder
-        Text.Pandoc.Definition
-        Text.Pandoc.Html
-        Text.Pandoc.Walk
     build-depends:
         base ^>=4.20.2.0,
         base16-bytestring,
         blog,
         bytestring,
-        commonmark,
-        commonmark-extensions,
         containers,
         cryptohash-sha256,
         deepseq,
@@ -95,6 +87,8 @@ executable blog-server
         http-types,
         mtl >=2.3.2,
         optparse-applicative,
+        pandoc,
+        pandoc-types,
         sage,
         stm,
         syb,
