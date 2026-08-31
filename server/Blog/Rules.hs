@@ -30,6 +30,7 @@ import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
 import Commonmark.Extensions.Footnote (footnoteSpec)
+import Commonmark.Extensions.PipeTable (pipeTableSpec)
 import Commonmark.Extensions.Wikilinks (TitlePosition (..), wikilinksSpec)
 import Commonmark.Pandoc (Cm, unCm)
 import Commonmark.Parser (commonmarkWith)
@@ -863,7 +864,7 @@ loadMarkdown input = do
     result =
       runIdentity $
         commonmarkWith
-          (defaultSyntaxSpec <> wikilinksSpec TitleBeforePipe <> footnoteSpec)
+          (defaultSyntaxSpec <> wikilinksSpec TitleBeforePipe <> footnoteSpec <> pipeTableSpec)
           ("(" ++ renderResourceId (Build.resourceInputId input) ++ ")")
           content
   case result of
