@@ -865,8 +865,9 @@ tableOfContents document =
   walk @Block
     ( \block ->
         case block of
-          Div attr@(ident, _classes, _attributes) _
-            | ident == fromString "toc" ->
+          Div attr@(ident, _classes, _attributes) children
+            | ident == fromString "toc"
+            , null children ->
                 Div
                   attr
                   -- This breaks if I use `Pandoc.Header 3 nullAttr [Str "Contents"]`
