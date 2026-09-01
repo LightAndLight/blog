@@ -52,8 +52,8 @@ import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromJust, fromMaybe, isNothing)
-import Data.Monoid (First (..), getFirst)
+import Data.Maybe (fromJust, fromMaybe, isJust, isNothing)
+import Data.Monoid (All (..), First (..), getAll, getFirst)
 import Data.Ord (Down (..))
 import Data.Set (Set)
 import qualified Data.Set as Set
@@ -870,7 +870,7 @@ tableOfContents document =
         case block of
           Div attr@(ident, _classes, _attributes) children
             | ident == fromString "toc"
-            , null children ->
+            , ignorableChildren children ->
                 Div
                   attr
                   -- This breaks if I use `Pandoc.Header 3 nullAttr [Str "Contents"]`
@@ -882,6 +882,20 @@ tableOfContents document =
     )
     document
   where
+    ignorableChildren :: [Block] -> Bool
+    ignorableChildren =
+      all $
+        getAll
+          . query
+            ( \case
+                RawBlock format html ->
+                  All $
+                    format == fromString "html"
+                      && isJust (Text.stripPrefix (fromString "<!--") html)
+                _ ->
+                  mempty
+            )
+
     contents =
       fromTocHeaders . toTocHeaders $
         query @Block
