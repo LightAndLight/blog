@@ -1192,7 +1192,17 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
                 Just (VString metadataExcerpt) | not $ Text.null metadataExcerpt -> do
                   pure . Just $ metadataExcerpt
                 _ -> do
-                  let mExcerpt = getFirst $ query @Block (\case block@Para{} -> First $ Just block; _ -> mempty) document
+                  let
+                    mExcerpt =
+                      getFirst $
+                        query @Block
+                          ( \case
+                              block@Para{} ->
+                                First . Just $
+                                  walk @[Inline] (filter (\case Note{} -> False; _ -> True)) block
+                              _ -> mempty
+                          )
+                          document
                   traverse
                     (pandoc . Pandoc.writeHtml5String htmlWriterOptions . Pandoc.doc . Pandoc.singleton)
                     mExcerpt
