@@ -961,7 +961,7 @@ toTocHeaders = go 2
                         "false" ->
                           False
                         _ ->
-                          error $ "invalid contents:omit_children value: " <> Text.unpack value
+                          error $ "invalid toc:omit_children value: " <> Text.unpack value
                     Nothing ->
                       False
             in TocHeader
