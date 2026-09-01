@@ -3,7 +3,7 @@ module Main (main) where
 import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
 import Control.Applicative (many, optional, (<**>), (<|>))
 import Control.Exception (catch, finally, throwIO)
-import Control.Monad (unless, when)
+import Control.Monad (unless, void, when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
@@ -18,6 +18,7 @@ import qualified Data.Text.Lazy.Builder as Text.Lazy.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Format (defaultTimeLocale, formatTime, rfc822DateFormat)
 import Data.X509.CertificateStore (CertificateStore, readCertificateStore)
+import GHC.Stack (HasCallStack)
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Http
 import Network.HTTP.Client.TLS (tlsManagerSettings)
@@ -366,6 +367,11 @@ data Response a
   | Conflict
   | Created a
   | Ok a
+  deriving (Show)
+
+expectOk :: (HasCallStack, Show a) => Response a -> IO a
+expectOk (Ok a) = pure a
+expectOk x = error $ "impossible: " ++ show x
 
 http ::
   Http.Manager ->
@@ -496,20 +502,8 @@ rollback baseUrl mCertificateStore xactId = do
 listTransactions :: String -> Maybe CertificateStore -> IO ()
 listTransactions baseUrl mCertificateStore = do
   manager <- httpManager mCertificateStore
-
   (_responseHeaders, response) <- httpGet manager (baseUrl ++ "/.transaction") []
-
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Created{} ->
-      error "impossible"
-    Conflict ->
-      error "impossible"
-    Ok a -> do
-      ByteString.Lazy.Char8.putStr a
+  ByteString.Lazy.Char8.putStr =<< expectOk response
 
 view ::
   String ->
@@ -680,17 +674,7 @@ create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
           headers
           body
 
-      case response of
-        PreconditionFailed ->
-          error "impossible"
-        NotFound{} ->
-          error "impossible"
-        Conflict{} ->
-          error "impossible"
-        Created{} -> do
-          error "impossible"
-        Ok a ->
-          ByteString.Lazy.Char8.putStrLn a
+      ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
 beginTransaction ::
   String ->
@@ -705,17 +689,7 @@ beginTransaction baseUrl mCertificateStore defer = do
   let headers = [(fromString "X-Blog-Transaction-Defer", fromString "true") | defer]
   (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") headers mempty
 
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Created{} ->
-      error "impossible"
-    Conflict ->
-      error "impossible"
-    Ok a -> do
-      pure $ LazyByteString.toStrict a
+  LazyByteString.toStrict <$> expectOk response
 
 commitTransaction ::
   String ->
@@ -729,17 +703,7 @@ commitTransaction baseUrl mCertificateStore xactId = do
   let headers = transactionIdHeaders xactId
   (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
 
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Conflict ->
-      error "impossible"
-    Created{} -> do
-      error "impossible"
-    Ok _ ->
-      pure ()
+  void $ expectOk response
 
 rollbackTransaction ::
   String ->
@@ -754,17 +718,7 @@ rollbackTransaction baseUrl mCertificateStore xactId = do
   (_responseHeaders, response) <-
     httpPost manager (baseUrl ++ "/.transaction/rollback") headers mempty
 
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Conflict ->
-      error "impossible"
-    Created{} -> do
-      error "impossible"
-    Ok _ ->
-      pure ()
+  void $ expectOk response
 
 -- | Run an action in a transaction, committing on success and rolling back on exception/failure.
 withTransaction ::
@@ -836,17 +790,7 @@ update baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
         let headers = foldMap transactionIdHeaders mXactId' ++ resourceIdHeaders resourceId
         httpPut manager (baseUrl ++ "/.resource") headers body
 
-      case response of
-        PreconditionFailed ->
-          error "impossible"
-        NotFound{} ->
-          error "impossible"
-        Created{} ->
-          error "impossible"
-        Conflict -> do
-          error "impossible"
-        Ok body -> do
-          ByteString.Lazy.Char8.putStrLn body
+      ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
     doProperties mXactId' ps = do
       (_responseHeaders, response) <- do
@@ -858,17 +802,7 @@ update baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
           headers
           body
 
-      case response of
-        PreconditionFailed ->
-          error "impossible"
-        NotFound{} ->
-          error "impossible"
-        Created{} ->
-          error "impossible"
-        Conflict -> do
-          error "impossible"
-        Ok body -> do
-          ByteString.Lazy.Char8.putStrLn body
+      ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
   let
     withTransaction' mXactId' f =
@@ -981,17 +915,7 @@ refreshAll baseUrl mCertificateStore resTy = do
   (_responseHeaders, response) <- do
     httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
 
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Conflict{} -> do
-      error "impossible"
-    Created{} -> do
-      error "impossible"
-    Ok a ->
-      ByteString.Lazy.Char8.putStrLn a
+  ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
 import_ :: String -> Maybe CertificateStore -> FilePath -> IO ()
 import_ baseUrl mCertificateStore path = do
@@ -1002,14 +926,4 @@ import_ baseUrl mCertificateStore path = do
     content <- LazyByteString.readFile path
     httpPut manager (baseUrl ++ "/.import") headers content
 
-  case response of
-    PreconditionFailed ->
-      error "impossible"
-    NotFound{} ->
-      error "impossible"
-    Conflict{} -> do
-      error "impossible"
-    Created{} -> do
-      error "impossible"
-    Ok a ->
-      ByteString.Lazy.Char8.putStrLn a
+  ByteString.Lazy.Char8.putStrLn =<< expectOk response
