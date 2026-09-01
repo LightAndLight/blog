@@ -457,7 +457,9 @@ typeProviderErrorDiagnostic renderTemplateRef getTemplateRef resId err =
     renderTypeProviderPath [p] = renderPart p
     renderTypeProviderPath (p : ps@(p' : _)) = renderPart p ++ (case p' of PField{} -> "."; PIndex{} -> "") ++ renderTypeProviderPath ps
 
-    renderPart (PField f) = Text.unpack f
+    renderPart (PField f)
+      | Text.elem '.' f = "`" ++ Text.unpack f ++ "`"
+      | otherwise = Text.unpack f
     renderPart (PIndex n) = "[" ++ show n ++ "]"
 
     renderTemplateId templateId = "(" ++ renderResourceId templateId ++ "): "
