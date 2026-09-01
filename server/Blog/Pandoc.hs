@@ -11,10 +11,10 @@ markdownReaderOptions =
         -- Syntax for adding attributes to Markdown elements.
         -- `tableOfContents` uses this to omit a heading's children from the contents listing.
         enableExtension Ext_header_attributes
-          .
+          . enableExtension Ext_link_attributes
           -- Uses `Div` blocks for `<div>` tags so that I can post-process them.
           -- See `tableOfContents` for an example.
-          enableExtension Ext_native_divs
+          . enableExtension Ext_native_divs
           . enableExtension Ext_backtick_code_blocks
           . enableExtension Ext_markdown_in_html_blocks
           . enableExtension Ext_auto_identifiers
