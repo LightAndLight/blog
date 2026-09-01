@@ -6,6 +6,7 @@ module Blog
   , resourceIdParser
   , readResourceId
   , renderResourceId
+  , propertyParser
   , ResourceType (..)
   , ResourceConfig (..)
   , resourceConfigDecoder
@@ -45,6 +46,10 @@ resourceTypeParser = (:) <$> Sage.satisfy Char.isAlpha <*> many (Sage.satisfy Ch
 
 resourceNameParser :: Sage.Parser String
 resourceNameParser =
+  nameParser
+
+propertyParser :: Sage.Parser String
+propertyParser =
   nameParser
 
 resourceIdParser :: Sage.Parser ResourceId

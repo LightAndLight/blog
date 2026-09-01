@@ -18,8 +18,11 @@ import Blog
   , metaCfgOptional
   , metaCfgType
   , metadataValueString
+  , propertyParser
   , renderResourceId
   , resourceIdParser
+  , resourceNameParser
+  , resourceTypeParser
   )
 import Blog.Build ((*<))
 import qualified Blog.Build as Build
@@ -31,7 +34,7 @@ import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
-import Control.Applicative ((<|>))
+import Control.Applicative (many, (<|>))
 import Control.Monad (guard, unless)
 import Control.Monad.Error.Class (MonadError, throwError, tryError)
 import Control.Monad.Except (ExceptT (..), mapExceptT, runExceptT)
@@ -45,7 +48,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
-import Data.List (delete, find, sortOn)
+import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -996,93 +999,82 @@ loadMarkdown input = do
       let document'' = tableOfContents . linkHeaders $ removeMetadata document'
       pure (deps, document'')
   where
-    wikilinkUrlName =
-      "(wikilink in " ++ renderResourceId (Build.resourceInputId input) ++ ")"
+    resourceUriParser :: Sage.Parser (Temple.Core, Temple.Type)
+    resourceUriParser =
+      ( \resTyName resName propertyPath ->
+          let
+            core =
+              foldl
+                (\acc field -> Temple.CField acc field)
+                (Temple.CVar $ fromString "resource")
+                (resTyName : resName : propertyPath)
+
+            ty =
+              foldr
+                ( \field rest ->
+                    Temple.TRecord $ Temple.TRecordField field rest Temple.TRowEnd
+                )
+                Temple.TString
+                (resTyName : resName : propertyPath)
+          in
+            (core, ty)
+      )
+        <$ Sage.string (fromString "resource")
+        <* Sage.char ':'
+        <*> fmap fromString resourceTypeParser
+        <* Sage.char ':'
+        <*> fmap fromString resourceNameParser
+        <*> many (Sage.char '/' *> fmap fromString propertyParser)
 
     resolveResourceReferences :: Pandoc -> WriterT (Set ResourceId) (Build.ActionT m) Pandoc
     resolveResourceReferences =
       walkM
         @Inline
         ( \case
-            Link (ident, classes, kvs) alts (url, title) | fromString "wikilink" `elem` classes -> do
-              let urlInput = Text.Encoding.encodeUtf8 url
-              parsed <-
-                case Sage.parse Temple.exprParser urlInput of
-                  Left err ->
-                    throwError $
-                      DiagnosticReports
-                        (fromString wikilinkUrlName)
-                        (LazyByteString.fromStrict urlInput)
-                        (sageErrorReport err)
-                  Right x -> pure x
-              resolved <- resolveResourceReference urlInput parsed
-              pure $ Link (ident, delete (fromString "wikilink") classes, kvs) alts (resolved, title)
+            Link (ident, classes, kvs) alts (url, title)
+              | let urlInput = Text.Encoding.encodeUtf8 url
+              , Right parsed <- Sage.parse (resourceUriParser <* Sage.eof) urlInput -> do
+                  resolved <- resolveResourceReference parsed
+                  pure $ Link (ident, classes, kvs) alts (resolved, title)
+            Image (ident, classes, kvs) alts (url, title)
+              | let urlInput = Text.Encoding.encodeUtf8 url
+              , Right parsed <- Sage.parse (resourceUriParser <* Sage.eof) urlInput -> do
+                  resolved <- resolveResourceReference parsed
+                  pure $ Image (ident, classes, kvs) alts (resolved, title)
             x ->
               pure x
         )
 
     resolveResourceReference ::
-      ByteString -> Temple.LExpr Temple.Offset -> WriterT (Set ResourceId) (Build.ActionT m) Text
-    resolveResourceReference urlInput expr = do
+      (Temple.Core, Temple.Type) -> WriterT (Set ResourceId) (Build.ActionT m) Text
+    resolveResourceReference (core, ty) = do
       let currentTemplateRef = Temple.TemplateRef $ "(" ++ renderResourceId (Build.resourceInputId input) ++ ")"
 
       let readTemplateRef = const $ error "impossible readTemplateRef"
       let renderTemplateRef = const $ error "impossible renderTemplateRef"
       let getTemplateRef = const $ error "impossible getTemplateRef"
 
-      (deps, bindings, core) <- do
+      store <- lift Build.askStore
+      xactId <- lift Build.askTransactionId
+      result <- runExceptT $ do
+        let path = [PField $ fromString "resource"]
         result <-
-          runExceptT $
-            Temple.inferBindings readTemplateRef currentTemplateRef (Temple.TemplateBase [Temple.PartExpr expr])
+          Temple.runInferT (Temple.emptyInferEnv readTemplateRef currentTemplateRef) Temple.emptyInferState $
+            resourceTypeProvider store xactId path ty
+        either (throwError . TypeError path) pure result
+
+      let env = Temple.defaultEvalEnv mempty
+      bindingValue <-
         case result of
-          Left err -> do
+          Left err ->
             throwError
-              . DiagnosticReports
-                (fromString wikilinkUrlName)
-                (LazyByteString.fromStrict urlInput)
-              =<< templeTypeErrorReport renderTemplateRef getTemplateRef err
-          Right x ->
-            pure x
+              =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId input) err
+          Right (_state, providedCore) ->
+            pure $ Temple.evalCore env providedCore
 
-      for_ bindings $ \binding -> do
-        unless (Temple.bindingName binding == fromString "resource") $ do
-          let (_ref, offset) = NonEmpty.head $ Temple.bindingLocations binding
-          throwError $
-            DiagnosticReports
-              (fromString wikilinkUrlName)
-              (LazyByteString.fromStrict urlInput)
-              ( One $
-                  Diagnostic.emit
-                    (Diagnostic.Offset $ Temple.getOffset offset)
-                    Diagnostic.Caret
-                    (fromString "not in scope")
-              )
-
-      case find ((fromString "resource" ==) . Temple.bindingName) bindings of
-        Nothing ->
-          pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
-            Temple.evalCore (Temple.defaultEvalEnv deps) core
-        Just binding -> do
-          store <- lift Build.askStore
-          xactId <- lift Build.askTransactionId
-          let path = [PField $ Temple.bindingName binding]
-          result <- runExceptT $ do
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef currentTemplateRef) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
-              resourceTypeProvider store xactId path ty
-            either (throwError . TypeError path) pure result
-
-          bindingValue <-
-            case result of
-              Left err ->
-                throwError
-                  =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId input) err
-              Right (_state, providedCore) ->
-                pure providedCore
-
-          let env = Temple.defaultEvalEnv deps
-          pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
-            Temple.evalCore env (Temple.CApp core [(fromString "resource", bindingValue)])
+      let env' = env{Temple.eeScope = Map.singleton (fromString "resource") bindingValue}
+      pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
+        Temple.evalCore env' core
 
     removeMetadata :: Pandoc -> Pandoc
     removeMetadata =
