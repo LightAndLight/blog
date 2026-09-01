@@ -163,6 +163,11 @@ rules =
       (Build.iResource "png" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "png-" *< Build.oBind "name"))
       resourceRoute
+    <> Build.rule
+      "svg-route"
+      (Build.iResource "svg" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "svg-" *< Build.oBind "name"))
+      resourceRoute
 
 -- TODO: expose in `temple`?
 getRecordFields :: Temple.Type -> ([(Text, Temple.Type)], Maybe (Temple.Type))
