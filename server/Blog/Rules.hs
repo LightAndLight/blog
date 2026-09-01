@@ -1230,6 +1230,64 @@ getAdjacency iAdjacency = do
 
   pure (prev', next')
 
+makeResourceBinding ::
+  Monad m =>
+  (Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)) ->
+  Temple.Binding ->
+  ExceptT TypeProviderError (Build.ActionT m) Temple.Core
+makeResourceBinding readTemplateRef binding = do
+  store <- lift Build.askStore
+  xactId <- lift Build.askTransactionId
+
+  ((_state, a), _deps) <- do
+    let
+      f :: (Either e a, w) -> Either e (a, w)
+      f (ea, w) = (,w) <$> ea
+
+    mapExceptT (fmap f . runWriterT) $ do
+      let readTemplateRef' = lift . lift . readTemplateRef
+      let currentTemplate = Temple.TemplateRef "."
+      let path' = pure . PField $ Temple.bindingName binding
+      result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+        ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+        resourceTypeProvider store xactId path' ty
+      either (throwError . TypeError path') pure result
+
+  pure a
+
+bindingParameterNotFound ::
+  MonadError TypeProviderError m => Build.ResourceInput n x -> Temple.Binding -> m a
+bindingParameterNotFound input binding = do
+  let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
+  let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId input
+  throwError $
+    ParameterNotFound
+      (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
+      bindingRef
+      bindingOffset
+
+handleTypeProvider ::
+  MonadIO m =>
+  (Temple.TemplateRef -> String) ->
+  Build.ResourceInput m x ->
+  ExceptT TypeProviderError (Build.ActionT m) a ->
+  Build.ActionT m a
+handleTypeProvider renderTemplateRef iTemplate ma = do
+  ea <- runExceptT ma
+  case ea of
+    Right a -> pure a
+    Left err -> do
+      let
+        getTemplateRef (Temple.TemplateRef name') =
+          fromMaybe
+            (error $ "missing resource " ++ renderResourceId (ResourceId (resourceType templateId) name'))
+            <$> Store.readResource (Build.resourceInputType iTemplate) name'
+
+      throwError
+        =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+  where
+    templateId = Build.resourceInputId iTemplate
+
 articleHtml ::
   forall m.
   MonadIO m =>
@@ -1289,28 +1347,10 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
     let name = Temple.bindingName binding
     let tyScheme = Temple.bindingScheme binding
 
-    result <-
-      runExceptT $
+    value <-
+      handleTypeProvider renderTemplateRef iTemplate $
         case Text.unpack name of
-          "resource" -> do
-            store <- lift Build.askStore
-            xactId <- lift Build.askTransactionId
-
-            (a, _deps) <- do
-              let
-                f :: (Either e a, w) -> Either e (a, w)
-                f (ea, w) = (,w) <$> ea
-
-              mapExceptT (fmap f . runWriterT) $ do
-                let readTemplateRef' = lift . lift . readTemplateRef
-                let currentTemplate = Temple.TemplateRef "."
-                let path' = pure . PField $ Temple.bindingName binding
-                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-                  ty <- Temple.instantiateTypeScheme tyScheme
-                  resourceTypeProvider store xactId path' ty
-                either (throwError . TypeError path') pure result
-
-            pure a
+          "resource" -> makeResourceBinding readTemplateRef binding
           "self" -> do
             let readTemplateRef' = lift . readTemplateRef
             let currentTemplate = Temple.TemplateRef "."
@@ -1327,26 +1367,8 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
                 )
                 path'
                 ty
-            either (throwError . TypeError path') pure result
-          _ -> do
-            let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
-            let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
-            throwError $
-              ParameterNotFound
-                (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
-                bindingRef
-                bindingOffset
-    value <-
-      case result of
-        Right (_state, value) -> pure value
-        Left err -> do
-          let
-            getTemplateRef (Temple.TemplateRef name') =
-              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
-                <$> Store.readResource (Build.resourceInputType iTemplate) name'
-
-          throwError
-            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+            either (throwError . TypeError path') (pure . snd) result
+          _ -> bindingParameterNotFound iTemplate binding
 
     pure (name, value)
 
@@ -1391,28 +1413,10 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
     let name = Temple.bindingName binding
     let tyScheme = Temple.bindingScheme binding
 
-    result <-
-      runExceptT $
+    value <-
+      handleTypeProvider renderTemplateRef iTemplate $
         case Text.unpack name of
-          "resource" -> do
-            store <- lift Build.askStore
-            xactId <- lift Build.askTransactionId
-
-            (a, _deps) <- do
-              let
-                f :: (Either e a, w) -> Either e (a, w)
-                f (ea, w) = (,w) <$> ea
-
-              mapExceptT (fmap f . runWriterT) $ do
-                let readTemplateRef' = lift . lift . readTemplateRef
-                let currentTemplate = Temple.TemplateRef "."
-                let path' = pure . PField $ Temple.bindingName binding
-                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-                  ty <- Temple.instantiateTypeScheme tyScheme
-                  resourceTypeProvider store xactId path' ty
-                either (throwError . TypeError path') pure result
-
-            pure a
+          "resource" -> makeResourceBinding readTemplateRef binding
           "self" -> do
             let readTemplateRef' = lift . readTemplateRef
             let currentTemplate = Temple.TemplateRef "."
@@ -1429,26 +1433,8 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
                 )
                 path'
                 ty
-            either (throwError . TypeError path') pure result
-          _ -> do
-            let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
-            let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
-            throwError $
-              ParameterNotFound
-                (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
-                bindingRef
-                bindingOffset
-    value <-
-      case result of
-        Right (_state, value) -> pure value
-        Left err -> do
-          let
-            getTemplateRef (Temple.TemplateRef name') =
-              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
-                <$> Store.readResource (Build.resourceInputType iTemplate) name'
-
-          throwError
-            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+            either (throwError . TypeError path') (pure . snd) result
+          _ -> bindingParameterNotFound iTemplate binding
 
     pure (name, value)
 
@@ -1479,8 +1465,6 @@ pageHtml ::
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 pageHtml (iTemplate, iPage) oHtml = do
-  let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
-
   let
     templateResourceType = resourceType $ Build.resourceInputId iTemplate
 
@@ -1502,28 +1486,10 @@ pageHtml (iTemplate, iPage) oHtml = do
     let name = Temple.bindingName binding
     let tyScheme = Temple.bindingScheme binding
 
-    result <-
-      runExceptT $
+    value <-
+      handleTypeProvider renderTemplateRef iTemplate $
         case Text.unpack name of
-          "resource" -> do
-            store <- lift Build.askStore
-            xactId <- lift Build.askTransactionId
-
-            (a, _deps) <- do
-              let
-                f :: (Either e a, w) -> Either e (a, w)
-                f (ea, w) = (,w) <$> ea
-
-              mapExceptT (fmap f . runWriterT) $ do
-                let readTemplateRef' = lift . lift . readTemplateRef
-                let currentTemplate = Temple.TemplateRef "."
-                let path' = pure . PField $ Temple.bindingName binding
-                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-                  ty <- Temple.instantiateTypeScheme tyScheme
-                  resourceTypeProvider store xactId path' ty
-                either (throwError . TypeError path') pure result
-
-            pure a
+          "resource" -> makeResourceBinding readTemplateRef binding
           "self" -> do
             let readTemplateRef' = lift . readTemplateRef
             let currentTemplate = Temple.TemplateRef "."
@@ -1546,25 +1512,8 @@ pageHtml (iTemplate, iPage) oHtml = do
                 )
                 path'
                 ty
-            either (throwError . TypeError path') pure result
-          _ -> do
-            let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
-            throwError $
-              ParameterNotFound
-                (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
-                bindingRef
-                bindingOffset
-    value <-
-      case result of
-        Right (_state, value) -> pure value
-        Left err -> do
-          let
-            getTemplateRef (Temple.TemplateRef name') =
-              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
-                <$> Store.readResource (Build.resourceInputType iTemplate) name'
-
-          throwError
-            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+            either (throwError . TypeError path') (pure . snd) result
+          _ -> bindingParameterNotFound iTemplate binding
 
     pure (name, value)
 
@@ -1644,28 +1593,10 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
     let name = Temple.bindingName binding
     let tyScheme = Temple.bindingScheme binding
 
-    result <-
-      runExceptT $
+    value <-
+      handleTypeProvider renderTemplateRef iTemplate $
         case Text.unpack name of
-          "resource" -> do
-            store <- lift Build.askStore
-            xactId <- lift Build.askTransactionId
-
-            (a, _deps) <- do
-              let
-                f :: (Either e a, w) -> Either e (a, w)
-                f (ea, w) = (,w) <$> ea
-
-              mapExceptT (fmap f . runWriterT) $ do
-                let readTemplateRef' = lift . lift . readTemplateRef
-                let currentTemplate = Temple.TemplateRef "."
-                let path' = pure . PField $ Temple.bindingName binding
-                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-                  ty <- Temple.instantiateTypeScheme tyScheme
-                  resourceTypeProvider store xactId path' ty
-                either (throwError . TypeError path') (pure . snd) result
-
-            pure a
+          "resource" -> makeResourceBinding readTemplateRef binding
           "self" -> do
             let readTemplateRef' = lift . readTemplateRef
             let currentTemplate = Temple.TemplateRef "."
@@ -1852,24 +1783,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                 path'
                 ty
             either (throwError . TypeError path') (pure . snd) result
-          _ -> do
-            let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
-            throwError $
-              ParameterNotFound
-                (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
-                bindingRef
-                bindingOffset
-    value <-
-      case result of
-        Right value -> pure value
-        Left err -> do
-          let
-            getTemplateRef (Temple.TemplateRef name') =
-              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
-                <$> Store.readResource (Build.resourceInputType iTemplate) name'
-
-          throwError
-            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+          _ -> bindingParameterNotFound iTemplate binding
 
     pure (name, value)
 
