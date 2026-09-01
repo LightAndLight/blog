@@ -4,12 +4,6 @@
 module Blog.Metadata
   ( resourceMetadataDecoder
   , parseResourceMetadata
-  , Path
-  , pathToList
-  , pathUncons
-  , renderPath
-  , PathItem (..)
-  , pathItem
   , metadataValueFromToml
   , renderMetadataValueToml
   )
@@ -82,43 +76,6 @@ parseResourceMetadata config resTyName resName content = do
   let content' = LazyByteString.toStrict content
   toml <- tomlResult resourceFile content $ Toml.parse content'
   tomlResult resourceFile content $ Toml.decode toml decoder
-
-newtype Path = Path [PathItem]
-  deriving (Show, Semigroup, Monoid)
-
-pathToList :: Path -> [PathItem]
-pathToList (Path xs) = xs
-
-pathUncons :: Path -> Maybe (PathItem, Path)
-pathUncons (Path []) = Nothing
-pathUncons (Path (x : xs)) = Just (x, Path xs)
-
-renderPath :: Path -> String
-renderPath (Path []) = "(root)"
-renderPath (Path ps) = go ps
-  where
-    go [] = ""
-    go (p' : ps') =
-      ( case p' of
-          RecordField name -> Text.unpack name
-          ArrayItem ix -> "[" ++ show ix ++ "]"
-          ConstructorArg _name ix -> show ix
-      )
-        ++ ( case ps' of
-               RecordField{} : _ -> "."
-               ConstructorArg{} : _ -> "."
-               _ -> ""
-           )
-        ++ go ps'
-
-pathItem :: PathItem -> Path
-pathItem = Path . pure
-
-data PathItem
-  = ArrayItem !Int
-  | RecordField !Text
-  | ConstructorArg !Text !Int
-  deriving (Show)
 
 renderMetadataValueToml :: MetadataValue -> LazyByteString
 renderMetadataValueToml VTrue = fromString "true"
