@@ -132,6 +132,7 @@ rules =
       )
       (Build.oResource "html" (Build.oMatch "index"))
       indexHtml
+    -- TODO: there should be some catch-all logic for routing via the URL property.
     <> Build.rule
       "html-route"
       (Build.iResource "html" (Build.iBind "name"))
@@ -151,6 +152,16 @@ rules =
       "woff2-route"
       (Build.iResource "woff2" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "woff2-" *< Build.oBind "name"))
+      resourceRoute
+    <> Build.rule
+      "gif-route"
+      (Build.iResource "gif" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "gif-" *< Build.oBind "name"))
+      resourceRoute
+    <> Build.rule
+      "png-route"
+      (Build.iResource "png" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "png-" *< Build.oBind "name"))
       resourceRoute
 
 -- TODO: expose in `temple`?
