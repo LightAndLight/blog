@@ -87,14 +87,17 @@ rules =
     templateDependency
     <> Build.rule
       "article-adjacency"
-      (Build.iResourceAll "article" Build.iAny)
-      (Build.oResource "adjacency" $ Build.oMatch "article-" *< Build.oAny)
+      ( (,)
+          <$> Build.iResourceAll "article" Build.iAny
+          <*> Build.iResourceAll "note" Build.iAny
+      )
+      (Build.oResource "adjacency" Build.oAny)
       articleAdjacency
     <> Build.rule
       "article-dependency"
       (Build.iResource "article" Build.iAny)
       (pure ())
-      articleDependency
+      markdownDependency
     <> Build.rule
       "article-html"
       ( (,,)
@@ -107,6 +110,20 @@ rules =
           <*> Build.oResource "html" (Build.oMatch "article-" *< Build.oBind "name")
       )
       articleHtml
+    <> Build.rule
+      "note-dependency"
+      (Build.iResource "note" Build.iAny)
+      (pure ())
+      markdownDependency
+    <> Build.rule
+      "note-html"
+      ( (,,)
+          <$> Build.iResource "template" (Build.iMatch "note.html.temple")
+          <*> Build.iResource "note" (Build.iBind "name")
+          <*> Build.iResource "adjacency" (Build.iMatch "note-" <> Build.iBind "name")
+      )
+      (Build.oResource "html" (Build.oMatch "note-" *< Build.oBind "name"))
+      noteHtml
     <> Build.rule
       "page-dependency"
       (Build.iResource "page" Build.iAny)
@@ -122,13 +139,14 @@ rules =
       pageHtml
     <> Build.rule
       "index-html"
-      ( (,)
+      ( (,,)
           <$> Build.iResource "template" (Build.iMatch "post-list.html.temple")
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "name")
                 <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
             )
+          <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
       (Build.oResource "html" (Build.oMatch "index"))
       indexHtml
@@ -258,68 +276,79 @@ templateDependency iTemplate () = do
 
 articleAdjacency ::
   Monad m =>
-  Build.ResourceInputs m LazyByteString ->
+  (Build.ResourceInputs m LazyByteString, Build.ResourceInputs m LazyByteString) ->
   Build.ResourceOutput m String ->
   Build.ActionT m ()
-articleAdjacency iArticles oAdjacency = do
+articleAdjacency (iArticles, iNotes) oAdjacency = do
   store <- Build.askStore
   xactId <- Build.askTransactionId
 
-  resTy <- do
-    let resTyName = Build.resourceInputsType iArticles
-    Store.getResourceType store xactId resTyName
-  articles' <- Store.listResource resTy
-  articlesWithPublished <- for articles' $ \article -> do
-    metadata <- do
-      mMetadata <- Store.readResourceMetadata resTy $ resourceName article
-      case mMetadata of
-        Nothing ->
-          throwError . DiagnosticSimple $ renderResourceId article ++ " has no metadata"
-        Just metadata ->
-          parseResourceMetadata
-            (Store.resourceTypeConfig resTy)
-            (Store.resourceTypeName resTy)
-            (resourceName article)
-            metadata
+  articlesWithPublished <- getResourcesWithPublished store xactId iArticles
+  notesWithPublished <- getResourcesWithPublished store xactId iNotes
 
-    published <- do
-      input <- case Map.lookup (fromString "published") metadata of
-        Nothing ->
-          throwError . DiagnosticSimple $ renderResourceId article ++ "'s metadata has no 'published' field"
-        Just x ->
-          pure x
-      let !input' = metadataValueString input
-      let
-        parseDateTime :: Text -> Maybe UTCTime
-        parseDateTime = iso8601ParseM . Text.unpack
-
-        parseDate :: Text -> Maybe UTCTime
-        parseDate x = do
-          day <- iso8601ParseM $ Text.unpack x
-          pure $ UTCTime day 0
-      case parseDateTime input' <|> parseDate input' of
-        Nothing ->
-          throwError . DiagnosticSimple $
-            renderResourceId article ++ "'s metadata has an invalid 'published' field: " ++ Text.unpack input'
-        Just x -> pure (x :: UTCTime)
-    pure (article, published)
-
-  let sortedArticles = sortOn snd articlesWithPublished
+  let sortedArticles = fmap snd . sortOn fst $ articlesWithPublished ++ notesWithPublished
   let adjacencies = makeAdjacencies sortedArticles
 
   for_ adjacencies $ \adjacency -> do
-    let Adjacency prev (ResourceId _ currentResName) next = fmap fst adjacency
+    let Adjacency prev (ResourceId currentResTyName currentResName) next = adjacency
     let
       -- TODO: string escaping, move to `tomlin` library
       tomlString = (fromString "\"" <>) . (<> fromString "\"")
     Build.writeResource
       oAdjacency
-      currentResName
+      (currentResTyName ++ "-" ++ currentResName)
       ( foldMap (<> fromString "\n") $
           [ fromString "previous = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [prev]
           ]
             ++ [fromString "next = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [next]]
       )
+  where
+    getResourcesWithPublished ::
+      Monad m =>
+      Store (Build.ActionT m) ->
+      Store.TransactionId ->
+      Build.ResourceInputs m a ->
+      Build.ActionT m [(UTCTime, ResourceId)]
+    getResourcesWithPublished store xactId inputs = do
+      resTy <- do
+        let resTyName = Build.resourceInputsType inputs
+        Store.getResourceType store xactId resTyName
+
+      inputs' <- Store.listResource resTy
+      for inputs' $ \input -> do
+        metadata <- do
+          mMetadata <- Store.readResourceMetadata resTy $ resourceName input
+          case mMetadata of
+            Nothing ->
+              throwError . DiagnosticSimple $ renderResourceId input ++ " has no metadata"
+            Just metadata ->
+              parseResourceMetadata
+                (Store.resourceTypeConfig resTy)
+                (Store.resourceTypeName resTy)
+                (resourceName input)
+                metadata
+
+        published <- do
+          published <- case Map.lookup (fromString "published") metadata of
+            Nothing ->
+              throwError . DiagnosticSimple $ renderResourceId input ++ "'s metadata has no 'published' field"
+            Just x ->
+              pure x
+          let !published' = metadataValueString published
+          let
+            parseDateTime :: Text -> Maybe UTCTime
+            parseDateTime = iso8601ParseM . Text.unpack
+
+            parseDate :: Text -> Maybe UTCTime
+            parseDate x = do
+              day <- iso8601ParseM $ Text.unpack x
+              pure $ UTCTime day 0
+          case parseDateTime published' <|> parseDate published' of
+            Nothing ->
+              throwError . DiagnosticSimple $
+                renderResourceId input ++ "'s metadata has an invalid 'published' field: " ++ Text.unpack published'
+            Just x -> pure (x :: UTCTime)
+        pure (published, input)
 
 data Adjacency a
   = Adjacency
@@ -1132,6 +1161,9 @@ loadMarkdown input = do
                 True
         )
 
+renderHtml :: MonadError DiagnosticReports m => Pandoc -> m Text
+renderHtml = pandoc . Pandoc.writeHtml5String htmlWriterOptions
+
 loadMetadata :: Monad m => Build.ResourceInput m a -> Build.ActionT m (Map Text MetadataValue)
 loadMetadata input = do
   let resId = Build.resourceInputId input
@@ -1146,18 +1178,57 @@ loadMetadata input = do
     content
 
 -- TODO: should this be a separate rule? Is there a way to maintain dependencies inside `articleHtml`?
-articleDependency ::
+markdownDependency ::
   forall m.
   MonadIO m =>
   Build.ResourceInput m LazyByteString ->
   () ->
   Build.ActionT m ()
-articleDependency iArticle () = do
-  (deps, _markdown) <- loadMarkdown iArticle
-  Build.setDependencies (Build.resourceInputId iArticle) deps
+markdownDependency input () = do
+  (deps, _markdown) <- loadMarkdown input
+  Build.setDependencies (Build.resourceInputId input) deps
 
 pandoc :: MonadError DiagnosticReports m => PandocPure a -> m a
 pandoc = either (throwError . DiagnosticSimple . Text.unpack . Pandoc.renderError) pure . Pandoc.runPure
+
+getAdjacency ::
+  Monad m =>
+  Build.ResourceInput m LazyByteString ->
+  Build.ActionT m (Maybe [(Text, MetadataValue)], Maybe [(Text, MetadataValue)])
+getAdjacency iAdjacency = do
+  let adjacencyFile = fromString $ "(" ++ renderResourceId (Build.resourceInputId iAdjacency) ++ ")"
+  let adjacencyContent = Build.resourceInputContent iAdjacency
+  toml <-
+    tomlResult adjacencyFile adjacencyContent . Toml.parse $ LazyByteString.toStrict adjacencyContent
+  let
+    decoder =
+      (,)
+        <$> Toml.optionalKey (fromString "previous") (Toml.pstring resourceIdParser)
+        <*> Toml.optionalKey (fromString "next") (Toml.pstring resourceIdParser)
+  (prev, next) <- tomlResult adjacencyFile adjacencyContent $ Toml.decode toml decoder
+
+  let
+    getAdjacencyFields resId@(ResourceId resTyName resName) = do
+      store <- Build.askStore
+      xactId <- Build.askTransactionId
+
+      resTy <- Store.getResourceType store xactId resTyName
+      mContent <- Store.readResourceMetadata resTy resName
+      content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
+      metadata <-
+        parseResourceMetadata
+          (Store.resourceTypeConfig resTy)
+          (Store.resourceTypeName resTy)
+          resName
+          content
+      pure $
+        [(fromString "title", prev') | Just prev' <- [Map.lookup (fromString "title") metadata]]
+          ++ [(fromString "url", next') | Just next' <- [Map.lookup (fromString "url") metadata]]
+
+  prev' <- traverse getAdjacencyFields prev
+  next' <- traverse getAdjacencyFields next
+
+  pure (prev', next')
 
 articleHtml ::
   forall m.
@@ -1207,45 +1278,12 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
                     (pandoc . Pandoc.writeHtml5String htmlWriterOptions . Pandoc.doc . Pandoc.singleton)
                     mExcerpt
           )
-      <*> pandoc (Pandoc.writeHtml5String htmlWriterOptions document)
+      <*> renderHtml document
 
   for_ mExcerpt $
     Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict
 
-  (prev, next) <- do
-    let adjacencyFile = fromString $ "(" ++ renderResourceId (Build.resourceInputId iAdjacency) ++ ")"
-    let adjacencyContent = Build.resourceInputContent iAdjacency
-    toml <-
-      tomlResult adjacencyFile adjacencyContent . Toml.parse $ LazyByteString.toStrict adjacencyContent
-    let
-      decoder =
-        (,)
-          <$> Toml.optionalKey (fromString "previous") (Toml.pstring resourceIdParser)
-          <*> Toml.optionalKey (fromString "next") (Toml.pstring resourceIdParser)
-    (prev, next) <- tomlResult adjacencyFile adjacencyContent $ Toml.decode toml decoder
-
-    let
-      getAdjacencyFields resId@(ResourceId resTyName resName) = do
-        store <- Build.askStore
-        xactId <- Build.askTransactionId
-
-        resTy <- Store.getResourceType store xactId resTyName
-        mContent <- Store.readResourceMetadata resTy resName
-        content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
-        metadata <-
-          parseResourceMetadata
-            (Store.resourceTypeConfig resTy)
-            (Store.resourceTypeName resTy)
-            resName
-            content
-        pure $
-          [(fromString "title", prev') | Just prev' <- [Map.lookup (fromString "title") metadata]]
-            ++ [(fromString "url", next') | Just next' <- [Map.lookup (fromString "url") metadata]]
-
-    prev' <- traverse getAdjacencyFields prev
-    next' <- traverse getAdjacencyFields next
-
-    pure (prev', next')
+  (prev, next) <- getAdjacency iAdjacency
 
   bindings' <- for bindings $ \binding -> do
     let name = Temple.bindingName binding
@@ -1317,6 +1355,108 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
   Build.writeResource oHtml () output
 
   metadata <- loadMetadata iArticle
+  let mUrl = Map.lookup (fromString "url") metadata
+  for_ mUrl $ Build.setResourceProperty oHtml () "url"
+
+noteHtml ::
+  forall m.
+  MonadIO m =>
+  ( Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  ) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
+  let templateResourceType = resourceType $ Build.resourceInputId iTemplate
+
+  let
+    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
+    readTemplateRef (Temple.TemplateRef name) =
+      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+
+  let
+    renderTemplateRef (Temple.TemplateRef name) =
+      renderResourceId (ResourceId templateResourceType name)
+
+  (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
+
+  html <- do
+    (_deps, document) <- loadMarkdown iNote
+    pandoc (Pandoc.writeHtml5String htmlWriterOptions document)
+
+  (prev, next) <- getAdjacency iAdjacency
+
+  bindings' <- for bindings $ \binding -> do
+    let name = Temple.bindingName binding
+    let tyScheme = Temple.bindingScheme binding
+
+    result <-
+      runExceptT $
+        case Text.unpack name of
+          "resource" -> do
+            store <- lift Build.askStore
+            xactId <- lift Build.askTransactionId
+
+            (a, _deps) <- do
+              let
+                f :: (Either e a, w) -> Either e (a, w)
+                f (ea, w) = (,w) <$> ea
+
+              mapExceptT (fmap f . runWriterT) $ do
+                let readTemplateRef' = lift . lift . readTemplateRef
+                let currentTemplate = Temple.TemplateRef "."
+                let path' = pure . PField $ Temple.bindingName binding
+                result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                  ty <- Temple.instantiateTypeScheme tyScheme
+                  resourceTypeProvider store xactId path' ty
+                either (throwError . TypeError path') pure result
+
+            pure a
+          "self" -> do
+            let readTemplateRef' = lift . readTemplateRef
+            let currentTemplate = Temple.TemplateRef "."
+            let path' = pure . PField $ Temple.bindingName binding
+            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+              ty <- Temple.instantiateTypeScheme tyScheme
+              propertiesTypeProvider
+                (Build.resourceInputType iNote)
+                (fromString . resourceName $ Build.resourceInputId iNote)
+                ( articlePropertyTypeProvider prev next html
+                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                    <> contentPropertyTypeProvider
+                    <> lookupPropertyTypeProvider
+                )
+                path'
+                ty
+            either (throwError . TypeError path') pure result
+          _ -> do
+            let (bindingRef, bindingOffset) = NonEmpty.head $ Temple.bindingLocations binding
+            let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+            throwError $
+              ParameterNotFound
+                (inputTemplateRef <$ guard (bindingRef /= inputTemplateRef))
+                bindingRef
+                bindingOffset
+    value <-
+      case result of
+        Right (_state, value) -> pure value
+        Left err -> do
+          let
+            getTemplateRef (Temple.TemplateRef name') =
+              fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name'))
+                <$> Store.readResource (Build.resourceInputType iTemplate) name'
+
+          throwError
+            =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef (Build.resourceInputId iTemplate) err
+
+    pure (name, value)
+
+  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+
+  Build.writeResource oHtml () output
+
+  metadata <- loadMetadata iNote
   let mUrl = Map.lookup (fromString "url") metadata
   for_ mUrl $ Build.setResourceProperty oHtml () "url"
 
@@ -1436,15 +1576,28 @@ pageHtml (iTemplate, iPage) oHtml = do
   let mUrl = Map.lookup (fromString "url") metadata
   for_ mUrl $ Build.setResourceProperty oHtml () "url"
 
+data IndexItem m
+  = IndexArticle
+      -- | Article
+      (Build.ResourceInput m LazyByteString)
+      -- | Excerpt
+      (Maybe (Build.ResourceInput m LazyByteString))
+  | IndexNote
+      -- | Note
+      (Build.ResourceInput m LazyByteString)
+      -- | Rendered HTML
+      Text
+
 indexHtml ::
   forall m.
   MonadIO m =>
   ( Build.ResourceInput m LazyByteString
   , [(Build.ResourceInput m LazyByteString, Maybe (Build.ResourceInput m LazyByteString))]
+  , [Build.ResourceInput m LazyByteString]
   ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
-indexHtml (iTemplate, iArticlesWithExcerpts) oHtml = do
+indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
   let
     inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
 
@@ -1560,81 +1713,141 @@ indexHtml (iTemplate, iArticlesWithExcerpts) oHtml = do
             let readTemplateRef' = lift . readTemplateRef
             let currentTemplate = Temple.TemplateRef "."
             let path' = pure . PField $ Temple.bindingName binding
-            sortedArticles <-
-              fmap snd . sortOn (Down . fst)
-                <$> for
-                  (zip [0 ..] iArticlesWithExcerpts)
-                  ( \(ix, (iArticle, miExcerpt)) -> do
-                      let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata iArticle)
-                      published <-
-                        case mPublished of
-                          Nothing ->
-                            throwError $
-                              PropertyNotFound
-                                (path' <> pure (PIndex ix) <> pure (PField $ fromString "metadata"))
-                                (fromString "published")
-                          Just published
-                            | VString s <- published -> pure s
-                            | otherwise -> error "TODO: published not a string"
-                      pure (published, (iArticle, miExcerpt))
-                  )
 
+            let
+              getPublished ix input = do
+                let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata input)
+                case mPublished of
+                  Nothing ->
+                    throwError $
+                      PropertyNotFound
+                        (path' <> pure (PIndex ix) <> pure (PField $ fromString "metadata"))
+                        (fromString "published")
+                  Just published
+                    | VString s <- published -> pure s
+                    | otherwise -> error "TODO: published not a string"
+
+            articlesWithExcerptsWithPublished <-
+              for
+                (zip [0 ..] iArticlesWithExcerpts)
+                ( \(ix, (iArticle, miExcerpt)) -> do
+                    published <- getPublished ix iArticle
+                    pure (published, IndexArticle iArticle miExcerpt)
+                )
+
+            notesWithPublished <-
+              for
+                (zip [0 ..] iNotes)
+                ( \(ix, iNote) -> do
+                    published <- getPublished ix iNote
+                    (_deps, document) <- lift $ loadMarkdown iNote
+                    html <- lift $ renderHtml document
+                    pure (published, IndexNote iNote html)
+                )
+
+            let sortedPosts = fmap snd . sortOn (Down . fst) $ articlesWithExcerptsWithPublished ++ notesWithPublished
+
+            let
+              postTypeTy =
+                Temple.TSum $
+                  foldr
+                    (uncurry Temple.TSumConstructor)
+                    Temple.TRowEnd
+                    [
+                      ( fromString "Article"
+                      ,
+                        [ Temple.TRecord $
+                            foldr
+                              (uncurry Temple.TRecordField)
+                              Temple.TRowEnd
+                              [
+                                ( fromString "excerpt"
+                                , Temple.TString
+                                )
+                              ]
+                        ]
+                      )
+                    ,
+                      ( fromString "Note"
+                      ,
+                        [ Temple.TRecord $
+                            foldr
+                              (uncurry Temple.TRecordField)
+                              Temple.TRowEnd
+                              [
+                                ( fromString "content"
+                                , Temple.TString
+                                )
+                              ,
+                                ( fromString "references"
+                                , Temple.TStream $
+                                    Temple.TRecord $
+                                      foldr
+                                        (uncurry Temple.TRecordField)
+                                        Temple.TRowEnd
+                                        [ (fromString "url", Temple.TString)
+                                        , (fromString "title", Temple.TString)
+                                        ]
+                                )
+                              ]
+                        ]
+                      )
+                    ]
             result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
               ty <- Temple.instantiateTypeScheme tyScheme
               listTypeProvider
                 ( fmap
-                    ( \(iArticle, miExcerpt) ->
-                        propertiesTypeProvider
-                          (Build.resourceInputType iArticle)
-                          (fromString . resourceName $ Build.resourceInputId iArticle)
-                          -- TODO: this property should come from metadata.
-                          --
-                          -- Currently blocked on having a good syntax for sum types in metadata.
-                          ( nestedPropertyTypeProvider (fromString "metadata") $
-                              constantPropertyTypeProvider
-                                (fromString "type")
-                                ( Temple.CConstructor (fromString "Article") []
-                                , Temple.TSum $
-                                    foldr
-                                      (uncurry Temple.TSumConstructor)
-                                      Temple.TRowEnd
-                                      [ (fromString "Article", [])
-                                      ,
-                                        ( fromString "Reply"
-                                        ,
-                                          [ Temple.TRecord $
-                                              foldr
-                                                (uncurry Temple.TRecordField)
-                                                Temple.TRowEnd
-                                                [
-                                                  ( fromString "references"
-                                                  , Temple.TStream $
-                                                      Temple.TRecord $
-                                                        foldr
-                                                          (uncurry Temple.TRecordField)
-                                                          Temple.TRowEnd
-                                                          [ (fromString "url", Temple.TString)
-                                                          , (fromString "title", Temple.TString)
-                                                          ]
-                                                  )
-                                                ]
+                    ( \case
+                        IndexArticle iArticle miExcerpt ->
+                          propertiesTypeProvider
+                            (Build.resourceInputType iArticle)
+                            (fromString . resourceName $ Build.resourceInputId iArticle)
+                            -- TODO: this property should come from metadata.
+                            --
+                            -- Currently blocked on having a good syntax for sum types in metadata.
+                            ( nestedPropertyTypeProvider (fromString "metadata") $
+                                constantPropertyTypeProvider
+                                  (fromString "type")
+                                  ( Temple.CConstructor
+                                      (fromString "Article")
+                                      [ Temple.CRecord
+                                          [ ( fromString "excerpt"
+                                            , Temple.CString [Temple.CPartText . LazyByteString.toStrict $ Build.resourceInputContent iExcerpt]
+                                            )
+                                          | Just iExcerpt <- [miExcerpt]
                                           ]
-                                        )
                                       ]
-                                )
-                                <> foldMap
-                                  ( \iExcerpt ->
-                                      constantPropertyTypeProvider
-                                        (fromString "excerpt")
-                                        ( Temple.CString [Temple.CPartText . LazyByteString.toStrict $ Build.resourceInputContent iExcerpt]
-                                        , Temple.TString
-                                        )
+                                  , postTypeTy
                                   )
-                                  miExcerpt
-                                <> metadataPropertyTypeProvider
-                          )
+                                  <> metadataPropertyTypeProvider
+                            )
+                        IndexNote iNote html ->
+                          propertiesTypeProvider
+                            (Build.resourceInputType iNote)
+                            (fromString . resourceName $ Build.resourceInputId iNote)
+                            -- TODO: this property should come from metadata.
+                            --
+                            -- Currently blocked on having a good syntax for sum types in metadata.
+                            ( nestedPropertyTypeProvider (fromString "metadata") $
+                                constantPropertyTypeProvider
+                                  (fromString "type")
+                                  ( Temple.CConstructor
+                                      (fromString "Note")
+                                      [ Temple.CRecord
+                                          [ (fromString "content", Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 html])
+                                          ,
+                                            ( fromString "references"
+                                            , metaToTempleCore . fromJust $
+                                                Map.lookup (fromString "references") (Build.resourceInputMetadata iNote)
+                                            )
+                                          ]
+                                      ]
+                                  , postTypeTy
+                                  )
+                                  <> metadataPropertyTypeProvider
+                            )
                     )
-                    sortedArticles
+                    sortedPosts
                 )
                 path'
                 ty
