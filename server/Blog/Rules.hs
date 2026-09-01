@@ -874,10 +874,23 @@ linkHeaders =
   walk @Block
     ( \block ->
         case block of
-          Header level attr@(identifier, _classes, _attributes) content
+          Header level (ident, classes, attrs) content
             | level > 1
-            , not (Text.null identifier) ->
-                Header level attr [Link nullAttr content (fromString "#" <> identifier, mempty)]
+            , not (Text.null ident) ->
+                let
+                  ignore = fromString "link_headers:ignore"
+                  linked =
+                    Header
+                      level
+                      (ident, classes, filter (\(key, _value) -> key /= ignore) attrs)
+                      [Link nullAttr content (fromString "#" <> ident, mempty)]
+                  unlinked = Header level (ident, classes, filter (\(key, _value) -> key /= ignore) attrs) content
+                in
+                  case Text.unpack <$> lookup ignore attrs of
+                    Nothing -> linked
+                    Just "true" -> unlinked
+                    Just "false" -> linked
+                    Just value -> error $ "invalid link_headers:ignore value: " <> value
           _ -> block
     )
 
