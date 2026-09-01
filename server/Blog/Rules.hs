@@ -901,7 +901,7 @@ tableOfContents document =
         case block of
           Div attr@(ident, _classes, _attributes) children
             | ident == fromString "toc"
-            , ignorableChildren children ->
+            , all ignorable children ->
                 Div
                   attr
                   -- This breaks if I use `Pandoc.Header 3 nullAttr [Str "Contents"]`
@@ -913,19 +913,18 @@ tableOfContents document =
     )
     document
   where
-    ignorableChildren :: [Block] -> Bool
-    ignorableChildren =
-      all $
-        getAll
-          . query
-            ( \case
-                RawBlock format html ->
-                  All $
-                    format == fromString "html"
-                      && isJust (Text.stripPrefix (fromString "<!--") html)
-                _ ->
-                  mempty
-            )
+    ignorable :: Block -> Bool
+    ignorable =
+      getAll
+        . query
+          ( \case
+              RawBlock format html ->
+                All $
+                  format == fromString "html"
+                    && isJust (Text.stripPrefix (fromString "<!--") html)
+              _ ->
+                All False
+          )
 
     contents =
       fromTocHeaders . toTocHeaders $
