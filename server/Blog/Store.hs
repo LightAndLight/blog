@@ -221,7 +221,7 @@ fromDirectory storeDir = do
             then do
               content <-
                 liftIO $
-                  IO.readFile (getTransactionIdDir storeDir xactId </> "resource" </> resTyName)
+                  IO.readFile (getTransactionIdDir storeDir xactId </> changePart Update </> "resource" </> resTyName)
                     `catch` \err@(WithCallStack _cs err') ->
                       if isDoesNotExistError err'
                         then IO.readFile (storeDir </> "resource" </> resTyName)
