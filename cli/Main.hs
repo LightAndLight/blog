@@ -371,7 +371,10 @@ data Response a
 
 expectOk :: (HasCallStack, Show a) => Response a -> IO a
 expectOk (Ok a) = pure a
-expectOk x = error $ "impossible: " ++ show x
+expectOk x = unexpected x
+
+unexpected :: (HasCallStack, Show a) => Response a -> IO b
+unexpected x = error $ "unexpected response: " ++ show x
 
 http ::
   Http.Manager ->
@@ -568,10 +571,6 @@ view baseUrl mCertificateStore viewTarget resourceId = do
     httpGet manager url headers
 
   case rBody of
-    Conflict ->
-      error "impossible"
-    Created{} ->
-      error "impossible"
     PreconditionFailed -> do
       putStrLn "error: the local copy of this resource is out of date"
       exitFailure
@@ -580,6 +579,8 @@ view baseUrl mCertificateStore viewTarget resourceId = do
       exitFailure
     Ok body -> do
       LazyByteString.writeFile resourcePathLocal body
+    _ ->
+      unexpected rBody
 
   callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
 
@@ -608,17 +609,13 @@ list baseUrl mCertificateStore resourceTyName = do
     httpGet manager url headers
 
   case rBody of
-    Conflict ->
-      error "impossible"
-    Created{} ->
-      error "impossible"
-    PreconditionFailed -> do
-      error "impossible"
     NotFound{} -> do
       putStrLn $ "error: resource type " ++ resourceTyName ++ " not found"
       exitFailure
     Ok body -> do
       LazyByteString.writeFile resourcePathLocal body
+    _ ->
+      unexpected rBody
 
   callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
 
@@ -652,17 +649,13 @@ create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
         httpPost manager (baseUrl ++ "/.resource") headers body
 
       case response of
-        PreconditionFailed ->
-          error "impossible"
-        NotFound{} ->
-          error "impossible"
-        Ok{} ->
-          error "impossible"
         Conflict -> do
           putStrLn $ "error: " ++ renderResourceId resourceId ++ " already exists"
           exitFailure
         Created a -> do
           ByteString.Lazy.Char8.putStrLn a
+        _ ->
+          unexpected response
 
     unless (null properties) $ do
       let headers = foldMap transactionIdHeaders mXactId'
@@ -856,10 +849,6 @@ edit baseUrl mCertificateStore resourceId = do
 
   updated <-
     case rBody of
-      Conflict ->
-        error "impossible"
-      Created{} ->
-        error "impossible"
       PreconditionFailed -> do
         putStrLn "error: the local copy of this resource is out of date"
         exitFailure
@@ -869,6 +858,8 @@ edit baseUrl mCertificateStore resourceId = do
       Ok body -> do
         when (isNothing mLocalModificationTime) $ LazyByteString.writeFile resourcePathLocal body
         pure True
+      _ ->
+        unexpected rBody
 
   callProcess editor [resourcePathLocal]
 
@@ -893,10 +884,6 @@ edit baseUrl mCertificateStore resourceId = do
         httpPost manager url headers body
 
   case response of
-    Conflict ->
-      error "impossible"
-    NotFound{} -> do
-      error "impossible"
     PreconditionFailed -> do
       putStrLn "error: the server has a newer copy of the resource (update aborted)"
       exitFailure
@@ -906,6 +893,8 @@ edit baseUrl mCertificateStore resourceId = do
     Ok body -> do
       ByteString.Lazy.Char8.putStrLn body
       removeFile resourcePathLocal
+    _ ->
+      unexpected response
 
 refreshAll :: String -> Maybe CertificateStore -> String -> IO ()
 refreshAll baseUrl mCertificateStore resTy = do
