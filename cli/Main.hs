@@ -307,40 +307,41 @@ main = do
             exitFailure
           Just store -> pure $ Just store
   let baseUrl = cliBaseUrl cli
+  manager <- httpManager mCertificateStore
   case cliCommand cli of
     Begin defer ->
-      begin baseUrl mCertificateStore defer
+      begin baseUrl manager defer
     Commit xactId ->
-      commit baseUrl mCertificateStore $ fromString xactId
+      commit baseUrl manager $ fromString xactId
     Rollback xactId ->
-      rollback baseUrl mCertificateStore $ fromString xactId
+      rollback baseUrl manager $ fromString xactId
     ListTransactions ->
-      listTransactions baseUrl mCertificateStore
+      listTransactions baseUrl manager
     View viewTarget resourceId -> do
       resourceId' <- parseResourceId resourceId
-      view baseUrl mCertificateStore viewTarget resourceId'
+      view baseUrl manager viewTarget resourceId'
     List resourceTyName ->
-      list baseUrl mCertificateStore resourceTyName
+      list baseUrl manager resourceTyName
     Create mXactId mSrcFile properties resourceId -> do
       let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
-      create baseUrl mCertificateStore mXactId' mSrcFile properties' resourceId'
+      create baseUrl manager mXactId' mSrcFile properties' resourceId'
     CreateAll mXactId srcDir resTy -> do
       let mXactId' = fmap fromString mXactId
-      createAll baseUrl mCertificateStore mXactId' srcDir resTy
+      createAll baseUrl manager mXactId' srcDir resTy
     Update mXactId mSrcFile properties resourceId -> do
       let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
-      update baseUrl mCertificateStore mXactId' mSrcFile properties' resourceId'
+      update baseUrl manager mXactId' mSrcFile properties' resourceId'
     Edit resourceId -> do
       resourceId' <- parseResourceId resourceId
-      edit baseUrl mCertificateStore resourceId'
+      edit baseUrl manager resourceId'
     RefreshAll resTy ->
-      refreshAll baseUrl mCertificateStore resTy
+      refreshAll baseUrl manager resTy
     Import path ->
-      import_ baseUrl mCertificateStore path
+      import_ baseUrl manager path
 
 -- <https://stackoverflow.com/a/41816183>
 httpManager :: Maybe CertificateStore -> IO Http.Manager
@@ -487,38 +488,35 @@ transactionIdHeaders xactId =
   [ (fromString "X-Blog-TransactionId", xactId)
   ]
 
-begin :: String -> Maybe CertificateStore -> Bool -> IO ()
-begin baseUrl mCertificateStore defer = do
-  xactId <- beginTransaction baseUrl mCertificateStore defer
+begin :: String -> Http.Manager -> Bool -> IO ()
+begin baseUrl manager defer = do
+  xactId <- beginTransaction baseUrl manager defer
   ByteString.Char8.putStrLn $ fromString "began " <> xactId
 
-commit :: String -> Maybe CertificateStore -> ByteString -> IO ()
-commit baseUrl mCertificateStore xactId = do
-  commitTransaction baseUrl mCertificateStore xactId
+commit :: String -> Http.Manager -> ByteString -> IO ()
+commit baseUrl manager xactId = do
+  commitTransaction baseUrl manager xactId
   ByteString.Char8.putStrLn $ fromString "committed " <> xactId
 
-rollback :: String -> Maybe CertificateStore -> ByteString -> IO ()
-rollback baseUrl mCertificateStore xactId = do
-  rollbackTransaction baseUrl mCertificateStore xactId
+rollback :: String -> Http.Manager -> ByteString -> IO ()
+rollback baseUrl manager xactId = do
+  rollbackTransaction baseUrl manager xactId
   ByteString.Char8.putStrLn $ fromString "rolled back " <> xactId
 
-listTransactions :: String -> Maybe CertificateStore -> IO ()
-listTransactions baseUrl mCertificateStore = do
-  manager <- httpManager mCertificateStore
+listTransactions :: String -> Http.Manager -> IO ()
+listTransactions baseUrl manager = do
   (_responseHeaders, response) <- httpGet manager (baseUrl ++ "/.transaction") []
   ByteString.Lazy.Char8.putStr =<< expectOk response
 
 view ::
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   ViewTarget ->
   ResourceId ->
   IO ()
-view baseUrl mCertificateStore viewTarget resourceId = do
+view baseUrl manager viewTarget resourceId = do
   dataHome <- getDataHome
   pager <- getPager
-
-  manager <- httpManager mCertificateStore
 
   let
     resourceDirLocal =
@@ -586,15 +584,13 @@ view baseUrl mCertificateStore viewTarget resourceId = do
 
 list ::
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Resource type
   String ->
   IO ()
-list baseUrl mCertificateStore resourceTyName = do
+list baseUrl manager resourceTyName = do
   dataHome <- getDataHome
   pager <- getPager
-
-  manager <- httpManager mCertificateStore
 
   let resourceDirLocal = dataHome </> "blog" </> "resource" </> (resourceTyName ++ ":temp")
   createDirectoryIfMissing True resourceDirLocal
@@ -622,7 +618,7 @@ list baseUrl mCertificateStore resourceTyName = do
 create ::
   -- | Base URL
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Transaction ID
   Maybe ByteString ->
   -- | Source file
@@ -630,12 +626,10 @@ create ::
   [Property] ->
   ResourceId ->
   IO ()
-create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
-  manager <- httpManager mCertificateStore
-
+create baseUrl manager mXactId mSrcFile properties resourceId = do
   let
     withTransaction' f
-      | isNothing mXactId && not (null properties) = withTransaction baseUrl mCertificateStore (f . Just)
+      | isNothing mXactId && not (null properties) = withTransaction baseUrl manager (f . Just)
       | otherwise = f mXactId
 
   withTransaction' $ \mXactId' -> do
@@ -670,29 +664,27 @@ create baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
       ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
 beginTransaction ::
+  -- | Base URL
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Defer rules until commit
   Bool ->
   -- | Transaction ID
   IO ByteString
-beginTransaction baseUrl mCertificateStore defer = do
-  manager <- httpManager mCertificateStore
-
+beginTransaction baseUrl manager defer = do
   let headers = [(fromString "X-Blog-Transaction-Defer", fromString "true") | defer]
   (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") headers mempty
 
   LazyByteString.toStrict <$> expectOk response
 
 commitTransaction ::
+  -- | Base URL
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Transaction ID
   ByteString ->
   IO ()
-commitTransaction baseUrl mCertificateStore xactId = do
-  manager <- httpManager mCertificateStore
-
+commitTransaction baseUrl manager xactId = do
   let headers = transactionIdHeaders xactId
   (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
 
@@ -700,13 +692,11 @@ commitTransaction baseUrl mCertificateStore xactId = do
 
 rollbackTransaction ::
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Transaction ID
   ByteString ->
   IO ()
-rollbackTransaction baseUrl mCertificateStore xactId = do
-  manager <- httpManager mCertificateStore
-
+rollbackTransaction baseUrl manager xactId = do
   let headers = transactionIdHeaders xactId
   (_responseHeaders, response) <-
     httpPost manager (baseUrl ++ "/.transaction/rollback") headers mempty
@@ -717,37 +707,38 @@ rollbackTransaction baseUrl mCertificateStore xactId = do
 withTransaction ::
   -- | Base URL
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   {-| Arguments:
 
   * Transaction ID
   -}
   (ByteString -> IO b) ->
   IO b
-withTransaction baseUrl mCertificateStore f = do
-  (a, ()) <- generalBracket (beginTransaction baseUrl mCertificateStore False) exit $ f
+withTransaction baseUrl manager f = do
+  (a, ()) <- generalBracket (beginTransaction baseUrl manager False) exit $ f
   pure a
   where
-    exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl mCertificateStore xactId
-    exit xactId (ExitCaseException _err) = rollbackTransaction baseUrl mCertificateStore xactId
-    exit xactId ExitCaseAbort = rollbackTransaction baseUrl mCertificateStore xactId
+    exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl manager xactId
+    exit xactId (ExitCaseException _err) = rollbackTransaction baseUrl manager xactId
+    exit xactId ExitCaseAbort = rollbackTransaction baseUrl manager xactId
 
 createAll ::
+  -- | Base URL
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Transaction ID
   Maybe ByteString ->
   FilePath ->
   String ->
   IO ()
-createAll baseUrl mCertificateStore mXactId srcDir resTy = do
+createAll baseUrl manager mXactId srcDir resTy = do
   entries <- listDirectory srcDir
   when (null entries) $ do
     putStrLn $ "error: " ++ srcDir ++ " is empty"
     exitFailure
 
   let
-    withTransaction' Nothing f = withTransaction baseUrl mCertificateStore f
+    withTransaction' Nothing f = withTransaction baseUrl manager f
     withTransaction' (Just xactId) f = f xactId
 
   withTransaction' mXactId $ \xactId ->
@@ -757,14 +748,14 @@ createAll baseUrl mCertificateStore mXactId srcDir resTy = do
       if isFile
         then do
           let resourceId = ResourceId resTy entry
-          create baseUrl mCertificateStore (Just xactId) (Just path) [] resourceId
+          create baseUrl manager (Just xactId) (Just path) [] resourceId
         else do
           putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
 
 update ::
   -- | Base URL
   String ->
-  Maybe CertificateStore ->
+  Http.Manager ->
   -- | Transaction ID
   Maybe ByteString ->
   -- | Source file
@@ -773,9 +764,7 @@ update ::
   [Property] ->
   ResourceId ->
   IO ()
-update baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
-  manager <- httpManager mCertificateStore
-
+update baseUrl manager mXactId mSrcFile properties resourceId = do
   let
     doBody mXactId' srcFile = do
       (_responseHeaders, response) <- do
@@ -800,7 +789,7 @@ update baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
   let
     withTransaction' mXactId' f =
       case mXactId' of
-        Nothing -> withTransaction baseUrl mCertificateStore f
+        Nothing -> withTransaction baseUrl manager f
         Just xactId -> f xactId
 
   case (mSrcFile, properties) of
@@ -815,12 +804,10 @@ update baseUrl mCertificateStore mXactId mSrcFile properties resourceId = do
         doBody (Just xactId) srcFile
         doProperties (Just xactId) properties
 
-edit :: String -> Maybe CertificateStore -> ResourceId -> IO ()
-edit baseUrl mCertificateStore resourceId = do
+edit :: String -> Http.Manager -> ResourceId -> IO ()
+edit baseUrl manager resourceId = do
   dataHome <- getDataHome
   editor <- getEditor
-
-  manager <- httpManager mCertificateStore
 
   let resourceDirLocal = dataHome </> "blog" </> resourceType resourceId
   createDirectoryIfMissing True resourceDirLocal
@@ -896,20 +883,16 @@ edit baseUrl mCertificateStore resourceId = do
     _ ->
       unexpected response
 
-refreshAll :: String -> Maybe CertificateStore -> String -> IO ()
-refreshAll baseUrl mCertificateStore resTy = do
-  manager <- httpManager mCertificateStore
-
+refreshAll :: String -> Http.Manager -> String -> IO ()
+refreshAll baseUrl manager resTy = do
   let headers = []
   (_responseHeaders, response) <- do
     httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
 
   ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
-import_ :: String -> Maybe CertificateStore -> FilePath -> IO ()
-import_ baseUrl mCertificateStore path = do
-  manager <- httpManager mCertificateStore
-
+import_ :: String -> Http.Manager -> FilePath -> IO ()
+import_ baseUrl manager path = do
   let headers = []
   (_responseHeaders, response) <- do
     content <- LazyByteString.readFile path
