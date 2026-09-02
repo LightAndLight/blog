@@ -94,7 +94,7 @@ import Data.Foldable (for_, traverse_)
 import Data.Functor (void)
 import Data.List (union, (\\))
 import Data.Map (Map)
-import Data.Maybe (catMaybes, fromMaybe)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Monoid (First (..))
 import qualified Data.Set as Set
 import Data.String (fromString)
@@ -745,38 +745,32 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       b <- mb
       if b then andIO mbs else pure False
 
+    resolvePath :: FilePath -> IO (Maybe FilePath)
+    resolvePath path = do
+      removed <- doesFileExist $ xactResTyDir Delete </> path
+      if removed
+        then pure Nothing
+        else
+          orElseM
+            [ tryPath $ xactResTyDir Create </> path
+            , tryPath $ xactResTyDir Update </> path
+            , tryPath $ baseResTyDir </> path
+            ]
+      where
+        tryPath path' = do
+          exists <- doesFileExist $ path'
+          if exists then pure $ Just path' else pure Nothing
+
     doesResourceExistImpl :: String -> m Bool
-    doesResourceExistImpl resName =
-      liftIO $ do
-        removed <- doesFileExist $ xactResTyDir Delete </> resName
-        if removed
-          then pure False
-          else
-            orIO
-              [ doesFileExist $ xactResTyDir Create </> resName
-              , doesFileExist $ xactResTyDir Update </> resName
-              , doesFileExist $ baseResTyDir </> resName
-              ]
+    doesResourceExistImpl resName = liftIO $ isJust <$> resolvePath resName
 
     readResourceImpl :: String -> m (Maybe LazyByteString)
     readResourceImpl resName =
       liftIO $ do
-        removed <- doesFileExist $ xactResTyDir Delete </> resName
-        if removed
-          then pure Nothing
-          else
-            orElseM
-              [ doRead $ xactResTyDir Create </> resName
-              , doRead $ xactResTyDir Update </> resName
-              , doRead $ baseResTyDir </> resName
-              ]
-      where
-        doRead path =
-          fmap Just (IO.readFile path)
-            `catch` \(WithCallStack _cs err) ->
-              if isDoesNotExistError err
-                then pure Nothing
-                else throwIO err
+        mPath <- resolvePath resName
+        case mPath of
+          Nothing -> pure Nothing
+          Just path -> Just <$> IO.readFile path
 
     xactWriteFile ::
       HasCallStack =>
@@ -928,24 +922,12 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
             `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
 
     readPropertyImpl :: String -> String -> m (Maybe LazyByteString)
-    readPropertyImpl resName propName = do
-      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> propertiesPart resName </> propName
-      if removed
-        then pure Nothing
-        else
-          liftIO $
-            orElseM
-              [ doRead $ xactResTyDir Create </> propertiesPart resName </> propName
-              , doRead $ xactResTyDir Update </> propertiesPart resName </> propName
-              , doRead $ baseResTyDir </> propertiesPart resName </> propName
-              ]
-      where
-        doRead path =
-          fmap Just (IO.readFile path)
-            `catch` \(WithCallStack _cs err) ->
-              if isDoesNotExistError err
-                then pure Nothing
-                else throwM err
+    readPropertyImpl resName propName =
+      liftIO $ do
+        mPath <- resolvePath $ propertiesPart resName </> propName
+        case mPath of
+          Nothing -> pure Nothing
+          Just path -> Just <$> IO.readFile path
 
     setPropertyImpl :: String -> String -> MetadataValue -> m ()
     setPropertyImpl resName key value = do
@@ -988,19 +970,10 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
       liftIO $ do
-        removed <- doesFileExist $ xactResTyDir Delete </> resName
-        if removed
-          then pure Nothing
-          else
-            orElseM
-              [ doTime $ xactResTyDir Create </> resName
-              , doTime $ xactResTyDir Update </> resName
-              , doTime $ baseResTyDir </> resName
-              ]
-      where
-        doTime path =
-          fmap Just (IO.getModificationTime path)
-            `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
+        mPath <- resolvePath resName
+        case mPath of
+          Nothing -> pure Nothing
+          Just path -> Just <$> IO.getModificationTime path
 
     listResourceImpl :: m [ResourceId]
     listResourceImpl =
