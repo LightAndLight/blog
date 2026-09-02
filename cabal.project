@@ -28,7 +28,7 @@ source-repository-package
 source-repository-package
   type: git
   location: https://github.com/LightAndLight/temple.git
-  tag: 55231301837973a99a5903098f3e49a99210e0da
+  tag: cb93db52d28e372e0d8a9f01f6acddc01c74da3d
 
 source-repository-package
   type: git
