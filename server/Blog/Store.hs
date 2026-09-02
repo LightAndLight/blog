@@ -1,6 +1,7 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -135,16 +136,18 @@ data Store m
   }
 
 hoistStore :: Functor m => (forall a. m a -> n a) -> Store m -> Store n
-hoistStore f (Store x1 x2 x3 x4 x5 x6 x7 x8) =
+hoistStore f Store{..} =
   Store
-    (fmap (fmap (f . fmap (fmap (hoistResourceType f)))) x1)
-    (fmap f x2)
-    (fmap f x3)
-    (fmap f x4)
-    (f x5)
-    (fmap f x6)
-    (fmap f x7)
-    (fmap f x8)
+    { lookupResourceTypeImpl = \xactId resTyName ->
+        f $ fmap (hoistResourceType f) <$> lookupResourceTypeImpl xactId resTyName
+    , beginTransactionImpl = f . beginTransactionImpl
+    , commitTransactionImpl = f . commitTransactionImpl
+    , rollbackTransactionImpl = f . rollbackTransactionImpl
+    , listTransactionsImpl = f listTransactionsImpl
+    , lookupTransactionImpl = f . lookupTransactionImpl
+    , saveDeferredImpl = f . saveDeferredImpl
+    , restoreDeferredImpl = f . restoreDeferredImpl
+    }
 
 newtype TransactionId = TransactionId ID
   deriving (Eq, Ord)
@@ -683,24 +686,25 @@ data ResourceType m
   , removeDependencyImpl :: !(String -> ResourceId -> m ())
   }
 
-hoistResourceType :: Functor m => (forall a. m a -> n a) -> ResourceType m -> ResourceType n
-hoistResourceType f (ResourceType x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15) =
+hoistResourceType :: (forall a. m a -> n a) -> ResourceType m -> ResourceType n
+hoistResourceType f ResourceType{..} =
   ResourceType
-    x1
-    x2
-    (fmap f x3)
-    (fmap f x4)
-    (fmap (fmap f) x5)
-    (fmap (fmap f) x6)
-    (fmap (fmap (fmap f)) x7)
-    (fmap f x8)
-    (f x9)
-    (fmap f x10)
-    (fmap f x11)
-    (fmap f x12)
-    (fmap f x13)
-    (fmap (fmap f) x14)
-    (fmap (fmap f) x15)
+    { resourceTypeName
+    , resourceTypeConfig
+    , doesResourceExistImpl = f . doesResourceExistImpl
+    , readResourceImpl = f . readResourceImpl
+    , writeResourceImpl = \resName content -> f $ writeResourceImpl resName content
+    , readPropertyImpl = \resName propName -> f $ readPropertyImpl resName propName
+    , setPropertyImpl = \resName key value -> f $ setPropertyImpl resName key value
+    , listPropertiesImpl = f . listPropertiesImpl
+    , listResourceImpl = f listResourceImpl
+    , readResourceMetadataImpl = f . readResourceMetadataImpl
+    , readResourceModificationTimeImpl = f . readResourceModificationTimeImpl
+    , listDependenciesImpl = f . listDependenciesImpl
+    , listDependentsImpl = f . listDependentsImpl
+    , createDependencyImpl = \resNameSrc dependencyTarget -> f $ createDependencyImpl resNameSrc dependencyTarget
+    , removeDependencyImpl = \resNameSrc dependencyTarget -> f $ removeDependencyImpl resNameSrc dependencyTarget
+    }
 
 orElseM :: Monad m => [m (Maybe a)] -> m (Maybe a)
 orElseM [] = pure Nothing
