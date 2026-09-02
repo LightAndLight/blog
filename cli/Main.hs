@@ -615,6 +615,10 @@ list baseUrl manager resourceTyName = do
 
   callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
 
+withTransaction' :: String -> Http.Manager -> Maybe ByteString -> (ByteString -> IO a) -> IO a
+withTransaction' baseUrl manager Nothing f = withTransaction baseUrl manager f
+withTransaction' _baseUrl _manager (Just xactId) f = f xactId
+
 create ::
   -- | Base URL
   String ->
@@ -628,11 +632,11 @@ create ::
   IO ()
 create baseUrl manager mXactId mSrcFile properties resourceId = do
   let
-    withTransaction' f
+    withTransaction'' f
       | isNothing mXactId && not (null properties) = withTransaction baseUrl manager (f . Just)
       | otherwise = f mXactId
 
-  withTransaction' $ \mXactId' -> do
+  withTransaction'' $ \mXactId' -> do
     do
       let headers = resourceIdHeaders resourceId ++ foldMap transactionIdHeaders mXactId'
       (_responseHeaders, response) <- do
@@ -737,11 +741,7 @@ createAll baseUrl manager mXactId srcDir resTy = do
     putStrLn $ "error: " ++ srcDir ++ " is empty"
     exitFailure
 
-  let
-    withTransaction' Nothing f = withTransaction baseUrl manager f
-    withTransaction' (Just xactId) f = f xactId
-
-  withTransaction' mXactId $ \xactId ->
+  withTransaction' baseUrl manager mXactId $ \xactId ->
     for_ entries $ \entry -> do
       let path = srcDir </> entry
       isFile <- doesFileExist path
@@ -786,12 +786,6 @@ update baseUrl manager mXactId mSrcFile properties resourceId = do
 
       ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
-  let
-    withTransaction' mXactId' f =
-      case mXactId' of
-        Nothing -> withTransaction baseUrl manager f
-        Just xactId -> f xactId
-
   case (mSrcFile, properties) of
     (Nothing, []) -> do
       putStrLn "nothing to do"
@@ -800,7 +794,7 @@ update baseUrl manager mXactId mSrcFile properties resourceId = do
     (Just srcFile, []) -> do
       doBody mXactId srcFile
     (Just srcFile, _ : _) ->
-      withTransaction' mXactId $ \xactId -> do
+      withTransaction' baseUrl manager mXactId $ \xactId -> do
         doBody (Just xactId) srcFile
         doProperties (Just xactId) properties
 
