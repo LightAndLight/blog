@@ -1358,16 +1358,13 @@ handleTypeProvider renderTemplateRef getTemplateRef location ma = do
       throwError
         =<< typeProviderErrorDiagnostic renderTemplateRef getTemplateRef location err
 
-articleHtml ::
+renderTemplate ::
   forall m.
   MonadIO m =>
-  ( Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
-  ) ->
-  (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
-  Build.ActionT m ()
-articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
+  Build.ResourceInput m LazyByteString ->
+  Map Text (Temple.Binding -> ExceptT TypeProviderError (Build.ActionT m) Temple.Core) ->
+  Build.ActionT m LazyByteString
+renderTemplate iTemplate typeProviders = do
   let templateResourceType = resourceType $ Build.resourceInputId iTemplate
 
   let
@@ -1385,6 +1382,40 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
         <$> Store.readResource (Build.resourceInputType iTemplate) name
 
   (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
+
+  bindings' <- for bindings $ \binding -> do
+    let name = Temple.bindingName binding
+
+    value <-
+      handleTypeProvider
+        renderTemplateRef
+        getTemplateRef
+        (renderResourceId $ Build.resourceInputId iTemplate)
+        $ case Map.lookup name typeProviders of
+          Just typeProvider -> typeProvider binding
+          Nothing ->
+            bindingParameterNotFound
+              (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate)
+              binding
+
+    pure (name, value)
+
+  pure $ Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+
+articleHtml ::
+  forall m.
+  MonadIO m =>
+  ( Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  , Build.ResourceInput m LazyByteString
+  ) ->
+  (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
+  Build.ActionT m ()
+articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
+  let
+    readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
+    readTemplateRef (Temple.TemplateRef name) =
+      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
 
   (mExcerpt, html) <- do
     (_deps, document) <- loadMarkdown iArticle
@@ -1418,44 +1449,36 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   (prev, next) <- getAdjacency iAdjacency
 
-  bindings' <- for bindings $ \binding -> do
-    let name = Temple.bindingName binding
-    let tyScheme = Temple.bindingScheme binding
-
-    value <-
-      handleTypeProvider
-        renderTemplateRef
-        getTemplateRef
-        (renderResourceId $ Build.resourceInputId iTemplate)
-        $ case Text.unpack name of
-          "resource" -> do
-            (_resIds, core) <- makeResourceBinding readTemplateRef binding
-            pure core
-          "self" -> do
-            let readTemplateRef' = lift . readTemplateRef
-            let currentTemplate = Temple.TemplateRef "."
-            let path' = pure . PField $ Temple.bindingName binding
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme tyScheme
-              propertiesTypeProvider
-                (Build.resourceInputType iArticle)
-                (fromString . resourceName $ Build.resourceInputId iArticle)
-                ( articlePropertyTypeProvider prev next html
-                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
-                    <> contentPropertyTypeProvider
-                    <> lookupPropertyTypeProvider
-                )
-                path'
-                ty
-            either (throwError . TypeError path') (pure . snd) result
-          _ ->
-            bindingParameterNotFound
-              (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate)
-              binding
-
-    pure (name, value)
-
-  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+  output <-
+    renderTemplate iTemplate $
+      Map.fromList
+        [
+          ( fromString "resource"
+          , \binding -> do
+              (_resIds, core) <- makeResourceBinding readTemplateRef binding
+              pure core
+          )
+        ,
+          ( fromString "self"
+          , \binding -> do
+              let readTemplateRef' = lift . readTemplateRef
+              let currentTemplate = Temple.TemplateRef "."
+              let path' = pure . PField $ Temple.bindingName binding
+              result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+                propertiesTypeProvider
+                  (Build.resourceInputType iArticle)
+                  (fromString . resourceName $ Build.resourceInputId iArticle)
+                  ( articlePropertyTypeProvider prev next html
+                      <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                      <> contentPropertyTypeProvider
+                      <> lookupPropertyTypeProvider
+                  )
+                  path'
+                  ty
+              either (throwError . TypeError path') (pure . snd) result
+          )
+        ]
 
   Build.writeResource oHtml () output
 
@@ -1473,23 +1496,10 @@ noteHtml ::
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
-  let templateResourceType = resourceType $ Build.resourceInputId iTemplate
-
   let
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
       fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
-
-  let
-    renderTemplateRef (Temple.TemplateRef name) =
-      renderResourceId (ResourceId templateResourceType name)
-
-  let
-    getTemplateRef (Temple.TemplateRef name) =
-      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-        <$> Store.readResource (Build.resourceInputType iTemplate) name
-
-  (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
 
   html <- do
     (_deps, document) <- loadMarkdown iNote
@@ -1497,44 +1507,36 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
 
   (prev, next) <- getAdjacency iAdjacency
 
-  bindings' <- for bindings $ \binding -> do
-    let name = Temple.bindingName binding
-    let tyScheme = Temple.bindingScheme binding
-
-    value <-
-      handleTypeProvider
-        renderTemplateRef
-        getTemplateRef
-        (renderResourceId $ Build.resourceInputId iTemplate)
-        $ case Text.unpack name of
-          "resource" -> do
-            (_resIds, core) <- makeResourceBinding readTemplateRef binding
-            pure core
-          "self" -> do
-            let readTemplateRef' = lift . readTemplateRef
-            let currentTemplate = Temple.TemplateRef "."
-            let path' = pure . PField $ Temple.bindingName binding
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme tyScheme
-              propertiesTypeProvider
-                (Build.resourceInputType iNote)
-                (fromString . resourceName $ Build.resourceInputId iNote)
-                ( articlePropertyTypeProvider prev next html
-                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
-                    <> contentPropertyTypeProvider
-                    <> lookupPropertyTypeProvider
-                )
-                path'
-                ty
-            either (throwError . TypeError path') (pure . snd) result
-          _ ->
-            bindingParameterNotFound
-              (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate)
-              binding
-
-    pure (name, value)
-
-  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+  output <-
+    renderTemplate iTemplate $
+      Map.fromList
+        [
+          ( fromString "resource"
+          , \binding -> do
+              (_resIds, core) <- makeResourceBinding readTemplateRef binding
+              pure core
+          )
+        ,
+          ( fromString "self"
+          , \binding -> do
+              let readTemplateRef' = lift . readTemplateRef
+              let currentTemplate = Temple.TemplateRef "."
+              let path' = pure . PField $ Temple.bindingName binding
+              result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+                propertiesTypeProvider
+                  (Build.resourceInputType iNote)
+                  (fromString . resourceName $ Build.resourceInputId iNote)
+                  ( articlePropertyTypeProvider prev next html
+                      <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                      <> contentPropertyTypeProvider
+                      <> lookupPropertyTypeProvider
+                  )
+                  path'
+                  ty
+              either (throwError . TypeError path') (pure . snd) result
+          )
+        ]
 
   Build.writeResource oHtml () output
 
@@ -1562,71 +1564,50 @@ pageHtml ::
   Build.ActionT m ()
 pageHtml (iTemplate, iPage) oHtml = do
   let
-    templateResourceType = resourceType $ Build.resourceInputId iTemplate
-
-  let
-    renderTemplateRef (Temple.TemplateRef name) =
-      renderResourceId (ResourceId templateResourceType name)
-
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
       fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
-
-  let
-    getTemplateRef (Temple.TemplateRef name) =
-      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-        <$> Store.readResource (Build.resourceInputType iTemplate) name
-
-  (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
 
   html <- do
     (_deps, markdown) <- loadMarkdown iPage
     pandoc $ Pandoc.writeHtml5String htmlWriterOptions markdown
 
-  bindings' <- for bindings $ \binding -> do
-    let name = Temple.bindingName binding
-    let tyScheme = Temple.bindingScheme binding
-
-    value <-
-      handleTypeProvider
-        renderTemplateRef
-        getTemplateRef
-        (renderResourceId $ Build.resourceInputId iTemplate)
-        $ case Text.unpack name of
-          "resource" -> do
-            (_resIds, core) <- makeResourceBinding readTemplateRef binding
-            pure core
-          "self" -> do
-            let readTemplateRef' = lift . readTemplateRef
-            let currentTemplate = Temple.TemplateRef "."
-            let path' = pure . PField $ Temple.bindingName binding
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme tyScheme
-              propertiesTypeProvider
-                (Build.resourceInputType iPage)
-                (fromString . resourceName $ Build.resourceInputId iPage)
-                ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
-                    <> constantPropertyTypeProvider
-                      (fromString "content")
-                      ( Temple.CString
-                          [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $
-                              LazyText.fromStrict html
-                          ]
-                      , Temple.TString
-                      )
-                    <> lookupPropertyTypeProvider
-                )
-                path'
-                ty
-            either (throwError . TypeError path') (pure . snd) result
-          _ ->
-            bindingParameterNotFound
-              (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate)
-              binding
-
-    pure (name, value)
-
-  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+  output <-
+    renderTemplate iTemplate $
+      Map.fromList
+        [
+          ( fromString "resource"
+          , \binding -> do
+              (_resIds, core) <- makeResourceBinding readTemplateRef binding
+              pure core
+          )
+        ,
+          ( fromString "self"
+          , \binding -> do
+              let readTemplateRef' = lift . readTemplateRef
+              let currentTemplate = Temple.TemplateRef "."
+              let path' = pure . PField $ Temple.bindingName binding
+              result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+                propertiesTypeProvider
+                  (Build.resourceInputType iPage)
+                  (fromString . resourceName $ Build.resourceInputId iPage)
+                  ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                      <> constantPropertyTypeProvider
+                        (fromString "content")
+                        ( Temple.CString
+                            [ Temple.CPartText . LazyByteString.toStrict . Text.Lazy.Encoding.encodeUtf8 $
+                                LazyText.fromStrict html
+                            ]
+                        , Temple.TString
+                        )
+                      <> lookupPropertyTypeProvider
+                  )
+                  path'
+                  ty
+              either (throwError . TypeError path') (pure . snd) result
+          )
+        ]
 
   Build.writeResource oHtml () output
 
@@ -1657,229 +1638,215 @@ indexHtml ::
   Build.ActionT m ()
 indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
   let
-    templateResourceType = resourceType $ Build.resourceInputId iTemplate
-
-    renderTemplateRef (Temple.TemplateRef name) =
-      renderResourceId (ResourceId templateResourceType name)
-
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
       fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
 
-  let
-    getTemplateRef (Temple.TemplateRef name) =
-      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-        <$> Store.readResource (Build.resourceInputType iTemplate) name
-
-  (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
-
-  bindings' <- for bindings $ \binding -> do
-    let name = Temple.bindingName binding
-    let tyScheme = Temple.bindingScheme binding
-
-    value <-
-      handleTypeProvider
-        renderTemplateRef
-        getTemplateRef
-        (renderResourceId $ Build.resourceInputId iTemplate)
-        $ case Text.unpack name of
-          "resource" -> do
-            (_resIds, core) <- makeResourceBinding readTemplateRef binding
-            pure core
-          "self" -> do
-            let readTemplateRef' = lift . readTemplateRef
-            let currentTemplate = Temple.TemplateRef "."
-            let path' = pure . PField $ Temple.bindingName binding
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme tyScheme
-              propertiesTypeProvider
-                (Build.resourceInputType iTemplate)
-                (fromString . resourceName $ Build.resourceInputId iTemplate)
-                ( nestedPropertyTypeProvider
-                    (fromString "metadata")
-                    ( constantPropertyTypeProvider
-                        (fromString "url")
-                        (Temple.CString [Temple.CPartText $ fromString "/"], Temple.TString)
-                        <> constantPropertyTypeProvider
-                          (fromString "title")
-                          (Temple.CString [Temple.CPartText $ fromString "blog.ielliott.io"], Temple.TString)
-                        <> constantPropertyTypeProvider
-                          (fromString "description")
-                          (Temple.CString [Temple.CPartText $ fromString "Isaac Elliott's personal blog."], Temple.TString)
-                        <> constantPropertyTypeProvider (fromString "math") (Temple.CFalse, Temple.TBool)
-                        <> constantPropertyTypeProvider (fromString "chinese") (Temple.CFalse, Temple.TBool)
-                        <> constantPropertyTypeProvider (fromString "asciinema") (Temple.CFalse, Temple.TBool)
-                    )
-                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
-                    <> contentPropertyTypeProvider
-                    <> lookupPropertyTypeProvider
-                )
-                path'
-                ty
-            either (throwError . TypeError path') (pure . snd) result
-          "tag" -> do
-            let readTemplateRef' = lift . readTemplateRef
-            let currentTemplate = Temple.TemplateRef "."
-            let path' = pure . PField $ Temple.bindingName binding
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme tyScheme
-
-              let actualTy = mkOptional Temple.TString
-              unifyPropertyType path' ty actualTy
-
-              pure $ Temple.CConstructor (fromString "None") []
-            either (throwError . TypeError path') (pure . snd) result
-          "posts" -> do
-            let readTemplateRef' = lift . readTemplateRef
-            let currentTemplate = Temple.TemplateRef "."
-            let path' = pure . PField $ Temple.bindingName binding
-
-            let
-              getPublished ix input = do
-                let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata input)
-                case mPublished of
-                  Nothing ->
-                    throwError $
-                      PropertyNotFound
-                        (path' <> pure (PIndex ix) <> pure (PField $ fromString "metadata"))
-                        (fromString "published")
-                  Just published
-                    | VString s <- published -> pure s
-                    | otherwise -> error "TODO: published not a string"
-
-            articlesWithExcerptsWithPublished <-
-              for
-                (zip [0 ..] iArticlesWithExcerpts)
-                ( \(ix, (iArticle, miExcerpt)) -> do
-                    published <- getPublished ix iArticle
-                    pure (published, IndexArticle iArticle miExcerpt)
-                )
-
-            notesWithPublished <-
-              for
-                (zip [0 ..] iNotes)
-                ( \(ix, iNote) -> do
-                    published <- getPublished ix iNote
-                    (_deps, document) <- lift $ loadMarkdown iNote
-                    html <- lift $ renderHtml document
-                    pure (published, IndexNote iNote html)
-                )
-
-            let sortedPosts = fmap snd . sortOn (Down . fst) $ articlesWithExcerptsWithPublished ++ notesWithPublished
-
-            let
-              postTypeTy =
-                Temple.TSum $
-                  foldr
-                    (uncurry Temple.TSumConstructor)
-                    Temple.TRowEnd
-                    [
-                      ( fromString "Article"
-                      ,
-                        [ Temple.TRecord $
-                            foldr
-                              (uncurry Temple.TRecordField)
-                              Temple.TRowEnd
-                              [
-                                ( fromString "excerpt"
-                                , Temple.TString
-                                )
-                              ]
-                        ]
+  output <-
+    renderTemplate iTemplate $
+      Map.fromList
+        [
+          ( fromString "resource"
+          , \binding -> do
+              (_resIds, core) <- makeResourceBinding readTemplateRef binding
+              pure core
+          )
+        ,
+          ( fromString "self"
+          , \binding -> do
+              let readTemplateRef' = lift . readTemplateRef
+              let currentTemplate = Temple.TemplateRef "."
+              let path' = pure . PField $ Temple.bindingName binding
+              result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+                propertiesTypeProvider
+                  (Build.resourceInputType iTemplate)
+                  (fromString . resourceName $ Build.resourceInputId iTemplate)
+                  ( nestedPropertyTypeProvider
+                      (fromString "metadata")
+                      ( constantPropertyTypeProvider
+                          (fromString "url")
+                          (Temple.CString [Temple.CPartText $ fromString "/"], Temple.TString)
+                          <> constantPropertyTypeProvider
+                            (fromString "title")
+                            (Temple.CString [Temple.CPartText $ fromString "blog.ielliott.io"], Temple.TString)
+                          <> constantPropertyTypeProvider
+                            (fromString "description")
+                            (Temple.CString [Temple.CPartText $ fromString "Isaac Elliott's personal blog."], Temple.TString)
+                          <> constantPropertyTypeProvider (fromString "math") (Temple.CFalse, Temple.TBool)
+                          <> constantPropertyTypeProvider (fromString "chinese") (Temple.CFalse, Temple.TBool)
+                          <> constantPropertyTypeProvider (fromString "asciinema") (Temple.CFalse, Temple.TBool)
                       )
-                    ,
-                      ( fromString "Note"
+                      <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                      <> contentPropertyTypeProvider
+                      <> lookupPropertyTypeProvider
+                  )
+                  path'
+                  ty
+              either (throwError . TypeError path') (pure . snd) result
+          )
+        ,
+          ( fromString "tag"
+          , \binding -> do
+              let readTemplateRef' = lift . readTemplateRef
+              let currentTemplate = Temple.TemplateRef "."
+              let path' = pure . PField $ Temple.bindingName binding
+              result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+
+                let actualTy = mkOptional Temple.TString
+                unifyPropertyType path' ty actualTy
+
+                pure $ Temple.CConstructor (fromString "None") []
+              either (throwError . TypeError path') (pure . snd) result
+          )
+        ,
+          ( fromString "posts"
+          , \binding -> do
+              let readTemplateRef' = lift . readTemplateRef
+              let currentTemplate = Temple.TemplateRef "."
+              let path' = pure . PField $ Temple.bindingName binding
+
+              let
+                getPublished ix input = do
+                  let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata input)
+                  case mPublished of
+                    Nothing ->
+                      throwError $
+                        PropertyNotFound
+                          (path' <> pure (PIndex ix) <> pure (PField $ fromString "metadata"))
+                          (fromString "published")
+                    Just published
+                      | VString s <- published -> pure s
+                      | otherwise -> error "TODO: published not a string"
+
+              articlesWithExcerptsWithPublished <-
+                for
+                  (zip [0 ..] iArticlesWithExcerpts)
+                  ( \(ix, (iArticle, miExcerpt)) -> do
+                      published <- getPublished ix iArticle
+                      pure (published, IndexArticle iArticle miExcerpt)
+                  )
+
+              notesWithPublished <-
+                for
+                  (zip [0 ..] iNotes)
+                  ( \(ix, iNote) -> do
+                      published <- getPublished ix iNote
+                      (_deps, document) <- lift $ loadMarkdown iNote
+                      html <- lift $ renderHtml document
+                      pure (published, IndexNote iNote html)
+                  )
+
+              let sortedPosts = fmap snd . sortOn (Down . fst) $ articlesWithExcerptsWithPublished ++ notesWithPublished
+
+              let
+                postTypeTy =
+                  Temple.TSum $
+                    foldr
+                      (uncurry Temple.TSumConstructor)
+                      Temple.TRowEnd
+                      [
+                        ( fromString "Article"
+                        ,
+                          [ Temple.TRecord $
+                              foldr
+                                (uncurry Temple.TRecordField)
+                                Temple.TRowEnd
+                                [
+                                  ( fromString "excerpt"
+                                  , Temple.TString
+                                  )
+                                ]
+                          ]
+                        )
                       ,
-                        [ Temple.TRecord $
-                            foldr
-                              (uncurry Temple.TRecordField)
-                              Temple.TRowEnd
-                              [
-                                ( fromString "content"
-                                , Temple.TString
-                                )
-                              ,
-                                ( fromString "references"
-                                , Temple.TStream $
-                                    Temple.TRecord $
-                                      foldr
-                                        (uncurry Temple.TRecordField)
-                                        Temple.TRowEnd
-                                        [ (fromString "url", Temple.TString)
-                                        , (fromString "title", Temple.TString)
+                        ( fromString "Note"
+                        ,
+                          [ Temple.TRecord $
+                              foldr
+                                (uncurry Temple.TRecordField)
+                                Temple.TRowEnd
+                                [
+                                  ( fromString "content"
+                                  , Temple.TString
+                                  )
+                                ,
+                                  ( fromString "references"
+                                  , Temple.TStream $
+                                      Temple.TRecord $
+                                        foldr
+                                          (uncurry Temple.TRecordField)
+                                          Temple.TRowEnd
+                                          [ (fromString "url", Temple.TString)
+                                          , (fromString "title", Temple.TString)
+                                          ]
+                                  )
+                                ]
+                          ]
+                        )
+                      ]
+              result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
+                ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
+                listTypeProvider
+                  ( fmap
+                      ( \case
+                          IndexArticle iArticle miExcerpt ->
+                            propertiesTypeProvider
+                              (Build.resourceInputType iArticle)
+                              (fromString . resourceName $ Build.resourceInputId iArticle)
+                              -- TODO: this property should come from metadata.
+                              --
+                              -- Currently blocked on having a good syntax for sum types in metadata.
+                              ( nestedPropertyTypeProvider (fromString "metadata") $
+                                  constantPropertyTypeProvider
+                                    (fromString "type")
+                                    ( Temple.CConstructor
+                                        (fromString "Article")
+                                        [ Temple.CRecord
+                                            [ ( fromString "excerpt"
+                                              , Temple.CString [Temple.CPartText . LazyByteString.toStrict $ Build.resourceInputContent iExcerpt]
+                                              )
+                                            | Just iExcerpt <- [miExcerpt]
+                                            ]
                                         ]
-                                )
-                              ]
-                        ]
+                                    , postTypeTy
+                                    )
+                                    <> metadataPropertyTypeProvider
+                              )
+                          IndexNote iNote html ->
+                            propertiesTypeProvider
+                              (Build.resourceInputType iNote)
+                              (fromString . resourceName $ Build.resourceInputId iNote)
+                              -- TODO: this property should come from metadata.
+                              --
+                              -- Currently blocked on having a good syntax for sum types in metadata.
+                              ( nestedPropertyTypeProvider (fromString "metadata") $
+                                  constantPropertyTypeProvider
+                                    (fromString "type")
+                                    ( Temple.CConstructor
+                                        (fromString "Note")
+                                        [ Temple.CRecord
+                                            [ (fromString "content", Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 html])
+                                            ,
+                                              ( fromString "references"
+                                              , metaToTempleCore . fromJust $
+                                                  Map.lookup (fromString "references") (Build.resourceInputMetadata iNote)
+                                              )
+                                            ]
+                                        ]
+                                    , postTypeTy
+                                    )
+                                    <> metadataPropertyTypeProvider
+                              )
                       )
-                    ]
-            result <- Temple.runInferT (Temple.emptyInferEnv readTemplateRef' currentTemplate) Temple.emptyInferState $ do
-              ty <- Temple.instantiateTypeScheme tyScheme
-              listTypeProvider
-                ( fmap
-                    ( \case
-                        IndexArticle iArticle miExcerpt ->
-                          propertiesTypeProvider
-                            (Build.resourceInputType iArticle)
-                            (fromString . resourceName $ Build.resourceInputId iArticle)
-                            -- TODO: this property should come from metadata.
-                            --
-                            -- Currently blocked on having a good syntax for sum types in metadata.
-                            ( nestedPropertyTypeProvider (fromString "metadata") $
-                                constantPropertyTypeProvider
-                                  (fromString "type")
-                                  ( Temple.CConstructor
-                                      (fromString "Article")
-                                      [ Temple.CRecord
-                                          [ ( fromString "excerpt"
-                                            , Temple.CString [Temple.CPartText . LazyByteString.toStrict $ Build.resourceInputContent iExcerpt]
-                                            )
-                                          | Just iExcerpt <- [miExcerpt]
-                                          ]
-                                      ]
-                                  , postTypeTy
-                                  )
-                                  <> metadataPropertyTypeProvider
-                            )
-                        IndexNote iNote html ->
-                          propertiesTypeProvider
-                            (Build.resourceInputType iNote)
-                            (fromString . resourceName $ Build.resourceInputId iNote)
-                            -- TODO: this property should come from metadata.
-                            --
-                            -- Currently blocked on having a good syntax for sum types in metadata.
-                            ( nestedPropertyTypeProvider (fromString "metadata") $
-                                constantPropertyTypeProvider
-                                  (fromString "type")
-                                  ( Temple.CConstructor
-                                      (fromString "Note")
-                                      [ Temple.CRecord
-                                          [ (fromString "content", Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 html])
-                                          ,
-                                            ( fromString "references"
-                                            , metaToTempleCore . fromJust $
-                                                Map.lookup (fromString "references") (Build.resourceInputMetadata iNote)
-                                            )
-                                          ]
-                                      ]
-                                  , postTypeTy
-                                  )
-                                  <> metadataPropertyTypeProvider
-                            )
-                    )
-                    sortedPosts
-                )
-                path'
-                ty
-            either (throwError . TypeError path') (pure . snd) result
-          _ ->
-            bindingParameterNotFound
-              (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate)
-              binding
-
-    pure (name, value)
-
-  let output = Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+                      sortedPosts
+                  )
+                  path'
+                  ty
+              either (throwError . TypeError path') (pure . snd) result
+          )
+        ]
 
   Build.writeResource oHtml () output
 
