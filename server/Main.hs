@@ -21,7 +21,7 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
 import Control.Exception (evaluate)
 import Control.Monad (unless)
-import Control.Monad.Catch (MonadMask, onException)
+import Control.Monad.Catch (MonadCatch, MonadMask, onException)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -296,310 +296,76 @@ app store routesVar request respond = do
     case Wai.pathInfo request of
       [part]
         | part == fromString ".resource" ->
-            if Wai.requestMethod request == fromString "GET"
-              then httpResourceGet store routesVar request
-              else
-                if Wai.requestMethod request == fromString "POST"
-                  then httpResourcePost store routesVar request
-                  else
-                    if Wai.requestMethod request == fromString "PUT"
-                      then httpResourcePut store routesVar request
-                      else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpResourceGet store routesVar request
+              "POST" -> httpResourceCreate store routesVar request
+              "PUT" -> httpResourceUpdate store routesVar request
+              _ -> methodNotAllowed
       [part, resTyName]
         | part == fromString ".resource" ->
-            if Wai.requestMethod request == fromString "GET"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-                let store' = Store.hoistStore lift store
-                mItems <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
-                  resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
-                  lift $ Store.listResource resTy
-
-                case mItems of
-                  Nothing ->
-                    pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
-                  Just items ->
-                    pure $
-                      Wai.responseLBS
-                        ok200
-                        []
-                        (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
-              else
-                if Wai.requestMethod request == fromString "REFRESH"
-                  then do
-                    mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-                    handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
-                      mResTy <- Store.lookupResourceType store xactId (Text.unpack resTyName)
-                      case mResTy of
-                        Nothing ->
-                          pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
-                        Just resTy -> do
-                          entries <- Store.listResource resTy
-                          changes <- evalRules store routesVar xactId entries
-
-                          pure $
-                            Wai.responseLBS
-                              ok200
-                              []
-                              ( ByteString.Lazy.Char8.unlines $
-                                  fromString
-                                    ("refreshed " ++ Text.unpack resTyName ++ ":*" ++ if defer then " (ignoring defer)" else "")
-                                    : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
-                              )
-                  else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpResourceTypeList store routesVar request resTyName
+              "REFRESH" -> httpResourceTypeRefresh store routesVar request resTyName
+              _ -> methodNotAllowed
       [part]
         | part == fromString ".transaction" ->
-            if Wai.requestMethod request == fromString "GET"
-              then do
-                xactIds <- handleExceptT $ Store.listTransactions store
-                pure . Wai.responseLBS ok200 [] . fromString $
-                  foldMap ((++ "\n") . Store.renderTransactionId) xactIds
-              else
-                throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpTransactionList store
+              _ -> methodNotAllowed
       [part, action]
         | part == fromString ".transaction" ->
-            if action == fromString "begin"
-              then do
-                defer <-
-                  case lookup (fromString "X-Blog-Transaction-Defer") (Wai.requestHeaders request) of
-                    Nothing -> pure False
-                    Just value -> do
-                      case fmap Char.toLower $ ByteString.Char8.unpack value of
-                        "true" -> pure True
-                        "false" -> pure False
-                        _ ->
-                          throwError
-                            . Wai.responseLBS badRequest400 []
-                            $ fromString "invalid X-Blog-Transaction-Defer value: " <> LazyByteString.fromStrict value
-
-                xactId <- handleExceptT $ Store.beginTransaction store defer
-                liftIO $ beginRoutes routesVar xactId
-                pure $ Wai.responseLBS ok200 [] (fromString $ Store.renderTransactionId xactId)
-              else
-                if action == fromString "commit"
-                  then do
-                    let headers = Wai.requestHeaders request
-                    xactId <- do
-                      value <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-TransactionId"
-                      parseTransactionId value
-                    handleExceptT $ do
-                      transaction <-
-                        maybe (throwError $ DiagnosticSimple "transaction not found") pure
-                          =<< Store.lookupTransaction store xactId
-                      let
-                        commit = do
-                          Store.commitTransaction store xactId
-                          liftIO $ commitRoutes routesVar xactId
-                      if Store.xactDefer transaction
-                        then do
-                          changes <- do
-                            let resIds = fmap Store.xactChangeId (Store.xactChanges transaction)
-                            Store.saveDeferred store xactId
-                            evalRules store routesVar xactId resIds `onException` Store.restoreDeferred store xactId
-                          commit
-                          pure . Wai.responseLBS ok200 [] $
-                            fromString "resource changes:\n"
-                              <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
-                              <> fromString ("\ncommitted " ++ Store.renderTransactionId xactId)
-                        else do
-                          commit
-                          pure . Wai.responseLBS ok200 [] . fromString $ "committed " ++ Store.renderTransactionId xactId
-                  else
-                    if action == fromString "rollback"
-                      then do
-                        let headers = Wai.requestHeaders request
-                        xactId <- do
-                          value <-
-                            fmap ByteString.Char8.unpack . requireHeader headers $
-                              fromString "X-Blog-TransactionId"
-                          parseTransactionId value
-                        handleExceptT $ Store.rollbackTransaction store xactId
-                        liftIO $ rollbackRoutes routesVar xactId
-                        pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
-                      else
-                        throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+            case Text.unpack action of
+              "begin" ->
+                case ByteString.Char8.unpack $ Wai.requestMethod request of
+                  "POST" -> httpTransactionBegin store routesVar request
+                  _ -> methodNotAllowed
+              "commit" -> do
+                case ByteString.Char8.unpack $ Wai.requestMethod request of
+                  "POST" -> httpTransactionCommit store routesVar request
+                  _ -> methodNotAllowed
+              "rollback" -> do
+                case ByteString.Char8.unpack $ Wai.requestMethod request of
+                  "POST" -> httpTransactionRollback store routesVar request
+                  _ -> methodNotAllowed
+              _ -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part]
         | part == fromString ".export" ->
-            if Wai.requestMethod request == fromString "GET"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-                content <-
-                  handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
-                    content <- Store.export store xactId
-
-                    -- If I don't force `content` here then I get a "thread
-                    -- blocked indefinitely on MVar" error when
-                    -- `Wai.responseLBS` tries to write out the result. Why?
-                    -- This prevents me from streaming the archive out.
-                    --
-                    -- TODO: fix this
-                    _ <- liftIO . evaluate $ LazyByteString.length content
-
-                    pure content
-
-                now <- liftIO getCurrentTime
-                let
-                  headers =
-                    [ (fromString "Content-Type", fromString "application/tar")
-                    ,
-                      ( fromString "Content-Disposition"
-                      , fromString $
-                          "attachment; filename=\"" ++ formatTime defaultTimeLocale "%FT%H:%M:%SZ" now ++ "-blog-export.tar\""
-                      )
-                    ]
-                pure $ Wai.responseLBS ok200 headers content
-              else
-                throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpExport store routesVar request
+              _ -> methodNotAllowed
       [part]
         | part == fromString ".import" ->
-            if Wai.requestMethod request == fromString "PUT"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-                handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
-                  imported <- Store.import_ store xactId =<< liftIO (Wai.consumeRequestBodyLazy request)
-                  if defer
-                    then do
-                      let
-                        response =
-                          fromString "imported resources:\n"
-                            <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
-                            <> fromString "(rules deferred)"
-
-                      pure $ Wai.responseLBS ok200 [] response
-                    else do
-                      changes <- evalRules store routesVar xactId imported
-
-                      let
-                        response =
-                          fromString "imported resources:\n"
-                            <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
-                            <> if null changes
-                              then mempty
-                              else
-                                fromString ("\nresource changes:\n")
-                                  <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
-
-                      pure $ Wai.responseLBS ok200 [] response
-              else
-                throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "PUT" -> httpImport store routesVar request
+              _ -> methodNotAllowed
       [part, resTyName, resName]
         | part == fromString ".resource" ->
-            if Wai.requestMethod request == fromString "GET"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-                let store' = Store.hoistStore lift store
-                mBody <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
-                  resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
-                  MaybeT $ Store.readResource resTy (Text.unpack resName)
-
-                case mBody of
-                  Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "resource not found")
-                  Just body -> pure $ Wai.responseLBS ok200 [] body
-              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpResourceLookup store routesVar request resTyName resName
+              _ -> methodNotAllowed
       [part, resTyName, resName, part']
         | part == fromString ".resource"
         , part' == fromString "metadata" ->
-            if Wai.requestMethod request == fromString "GET"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-                mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
-                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-                  Store.readResourceMetadata resTy (Text.unpack resName)
-
-                case mBody of
-                  Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "metadata not found")
-                  Just body -> pure $ Wai.responseLBS ok200 [] body
-              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpResourceMetadataLookup store routesVar request resTyName resName
+              _ -> methodNotAllowed
         | part == fromString ".resource"
         , part' == fromString "property" -> do
-            if Wai.requestMethod request == fromString "PATCH"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-                handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
-                  body <- liftIO $ Wai.consumeRequestBodyLazy request
-                  Toml.Toml (Toml.Located _offset properties) nonKeys <-
-                    case Toml.parse $ LazyByteString.toStrict body of
-                      Left err -> do
-                        let resourceId = renderResourceId (ResourceId (Text.unpack resTyName) (Text.unpack resName))
-                        throwError
-                          . DiagnosticReports
-                            (fromString $ "(" ++ resourceId ++ ":properties)")
-                            body
-                          $ tomlErrorReport err
-                      Right x -> pure x
-
-                  unless (null nonKeys) . error $
-                    "TODO: non-key-value properties: " ++ show nonKeys
-
-                  resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-                  let resId = ResourceId (Text.unpack resTyName) (Text.unpack resName)
-                  names <- for properties $ \(name, Toml.TomlKeyEntry _offset (Toml.Located _offset' value)) -> do
-                    Store.setProperty resTy (resourceName resId) (Text.unpack name) (metadataValueFromToml value)
-                    pure name
-
-                  if defer
-                    then do
-                      let
-                        response =
-                          fromString "updated properties:\n"
-                            <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
-                            <> fromString "(rules deferred)"
-
-                      pure $ Wai.responseLBS ok200 [] response
-                    else do
-                      changes <- evalRules store routesVar xactId [resId]
-
-                      let
-                        response =
-                          fromString "updated properties:\n"
-                            <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
-                            <> if null changes
-                              then mempty
-                              else
-                                fromString ("\nresource changes:\n")
-                                  <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
-
-                      pure $ Wai.responseLBS ok200 [] response
-              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "PATCH" -> httpResourcePropertiesUpdate store routesVar request resTyName resName
+              _ -> methodNotAllowed
       [part, resTyName, resName, part', propName]
         | part == fromString ".resource"
         , part' == fromString "property" -> do
-            if Wai.requestMethod request == fromString "GET"
-              then do
-                mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-                mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
-                  resTy <- Store.getResourceType store xactId $ Text.unpack resTyName
-                  Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
-
-                case mBody of
-                  Nothing ->
-                    pure $ Wai.responseLBS notFound404 [] (fromString "property not found")
-                  Just body ->
-                    pure $ Wai.responseLBS ok200 [] body
-              else throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpResourcePropertyLookup store routesVar request resTyName resName propName
+              _ -> methodNotAllowed
       path -> do
-        mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-
-        handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
-          routes <- liftIO $ readActiveRoutes routesVar
-          case Routes.lookup path routes of
-            Nothing ->
-              pure $ Wai.responseLBS notFound404 [] (fromString "not found")
-            Just resId -> do
-              resTy <- Store.getResourceType store xactId $ resourceType resId
-              mContent <- Store.readResource resTy $ resourceName resId
-              case mContent of
-                Nothing ->
-                  pure $ Wai.responseLBS notFound404 [] (fromString "not found")
-                Just content -> do
-                  let contentType = Text.Encoding.encodeUtf8 . cfgContentType $ Store.resourceTypeConfig resTy
-                  pure $ Wai.responseLBS ok200 [(hContentType, contentType)] content
+        case ByteString.Char8.unpack $ Wai.requestMethod request of
+          "GET" -> httpRouteGet store routesVar request path
+          _ -> methodNotAllowed
+  where
+    methodNotAllowed = throwError $ Wai.responseLBS methodNotAllowed405 [] (fromString "method not allowed")
 
 httpResourceGet ::
   (MonadMask m, MonadIO m) =>
@@ -629,13 +395,13 @@ httpResourceGet store routesVar request = do
           []
           (fromString $ "resource " ++ Text.unpack resTyName ++ ":" ++ resName ++ " does not exist")
 
-httpResourcePost ::
+httpResourceCreate ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
   Routes ->
   Wai.Request ->
   HandlerT m Wai.Response
-httpResourcePost store routesVar request = do
+httpResourceCreate store routesVar request = do
   let headers = Wai.requestHeaders request
 
   resTyName <-
@@ -674,13 +440,13 @@ httpResourcePost store routesVar request = do
                       : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
                 )
 
-httpResourcePut ::
+httpResourceUpdate ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
   Routes ->
   Wai.Request ->
   HandlerT m Wai.Response
-httpResourcePut store routesVar request = do
+httpResourceUpdate store routesVar request = do
   let headers = Wai.requestHeaders request
 
   resTyName <- fmap ByteString.Char8.unpack $ requireHeader headers "X-Blog-ResourceType"
@@ -747,3 +513,347 @@ httpResourcePut store routesVar request = do
       Nothing ->
         pure . Wai.responseLBS badRequest400 [] . fromString $
           "resource " ++ resTyName ++ ":" ++ resName ++ " does not exist"
+
+httpResourceTypeList ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  Text ->
+  HandlerT m Wai.Response
+httpResourceTypeList store routesVar request resTyName = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  let store' = Store.hoistStore lift store
+  mItems <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
+    resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
+    lift $ Store.listResource resTy
+
+  case mItems of
+    Nothing ->
+      pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
+    Just items ->
+      pure $
+        Wai.responseLBS
+          ok200
+          []
+          (foldMap ((<> fromString "\n") . fromString . renderResourceId) items)
+
+httpResourceTypeRefresh ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  Text ->
+  HandlerT m Wai.Response
+httpResourceTypeRefresh store routesVar request resTyName = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+    mResTy <- Store.lookupResourceType store xactId (Text.unpack resTyName)
+    case mResTy of
+      Nothing ->
+        pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
+      Just resTy -> do
+        entries <- Store.listResource resTy
+        changes <- evalRules store routesVar xactId entries
+
+        pure $
+          Wai.responseLBS
+            ok200
+            []
+            ( ByteString.Lazy.Char8.unlines $
+                fromString
+                  ("refreshed " ++ Text.unpack resTyName ++ ":*" ++ if defer then " (ignoring defer)" else "")
+                  : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+            )
+
+httpTransactionList :: Monad m => Store (ExceptT DiagnosticReports m) -> HandlerT m Wai.Response
+httpTransactionList store = do
+  xactIds <- handleExceptT $ Store.listTransactions store
+  pure . Wai.responseLBS ok200 [] . fromString $
+    foldMap ((++ "\n") . Store.renderTransactionId) xactIds
+
+httpTransactionBegin ::
+  MonadIO m => Store (ExceptT DiagnosticReports m) -> Routes -> Wai.Request -> HandlerT m Wai.Response
+httpTransactionBegin store routesVar request = do
+  defer <-
+    case lookup (fromString "X-Blog-Transaction-Defer") (Wai.requestHeaders request) of
+      Nothing -> pure False
+      Just value -> do
+        case fmap Char.toLower $ ByteString.Char8.unpack value of
+          "true" -> pure True
+          "false" -> pure False
+          _ ->
+            throwError
+              . Wai.responseLBS badRequest400 []
+              $ fromString "invalid X-Blog-Transaction-Defer value: " <> LazyByteString.fromStrict value
+
+  xactId <- handleExceptT $ Store.beginTransaction store defer
+  liftIO $ beginRoutes routesVar xactId
+  pure $ Wai.responseLBS ok200 [] (fromString $ Store.renderTransactionId xactId)
+
+httpTransactionCommit ::
+  (MonadCatch m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) -> Routes -> Wai.Request -> HandlerT m Wai.Response
+httpTransactionCommit store routesVar request = do
+  let headers = Wai.requestHeaders request
+  xactId <- do
+    value <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-TransactionId"
+    parseTransactionId value
+  handleExceptT $ do
+    transaction <-
+      maybe (throwError $ DiagnosticSimple "transaction not found") pure
+        =<< Store.lookupTransaction store xactId
+    let
+      commit = do
+        Store.commitTransaction store xactId
+        liftIO $ commitRoutes routesVar xactId
+    if Store.xactDefer transaction
+      then do
+        changes <- do
+          let resIds = fmap Store.xactChangeId (Store.xactChanges transaction)
+          Store.saveDeferred store xactId
+          evalRules store routesVar xactId resIds `onException` Store.restoreDeferred store xactId
+        commit
+        pure . Wai.responseLBS ok200 [] $
+          fromString "resource changes:\n"
+            <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
+            <> fromString ("\ncommitted " ++ Store.renderTransactionId xactId)
+      else do
+        commit
+        pure . Wai.responseLBS ok200 [] . fromString $ "committed " ++ Store.renderTransactionId xactId
+
+httpTransactionRollback ::
+  MonadIO m => Store (ExceptT DiagnosticReports m) -> Routes -> Wai.Request -> HandlerT m Wai.Response
+httpTransactionRollback store routesVar request = do
+  let headers = Wai.requestHeaders request
+  xactId <- do
+    value <-
+      fmap ByteString.Char8.unpack . requireHeader headers $
+        fromString "X-Blog-TransactionId"
+    parseTransactionId value
+  handleExceptT $ Store.rollbackTransaction store xactId
+  liftIO $ rollbackRoutes routesVar xactId
+  pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
+
+httpExport ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  HandlerT m Wai.Response
+httpExport store routesVar request = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+  content <-
+    handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+      content <- Store.export store xactId
+
+      -- If I don't force `content` here then I get a "thread
+      -- blocked indefinitely on MVar" error when
+      -- `Wai.responseLBS` tries to write out the result. Why?
+      -- This prevents me from streaming the archive out.
+      --
+      -- TODO: fix this
+      _ <- liftIO . evaluate $ LazyByteString.length content
+
+      pure content
+
+  now <- liftIO getCurrentTime
+  let
+    headers =
+      [ (fromString "Content-Type", fromString "application/tar")
+      ,
+        ( fromString "Content-Disposition"
+        , fromString $
+            "attachment; filename=\"" ++ formatTime defaultTimeLocale "%FT%H:%M:%SZ" now ++ "-blog-export.tar\""
+        )
+      ]
+  pure $ Wai.responseLBS ok200 headers content
+
+httpImport ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  HandlerT m Wai.Response
+httpImport store routesVar request = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+    imported <- Store.import_ store xactId =<< liftIO (Wai.consumeRequestBodyLazy request)
+    if defer
+      then do
+        let
+          response =
+            fromString "imported resources:\n"
+              <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
+              <> fromString "(rules deferred)"
+
+        pure $ Wai.responseLBS ok200 [] response
+      else do
+        changes <- evalRules store routesVar xactId imported
+
+        let
+          response =
+            fromString "imported resources:\n"
+              <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
+              <> if null changes
+                then mempty
+                else
+                  fromString ("\nresource changes:\n")
+                    <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
+
+        pure $ Wai.responseLBS ok200 [] response
+
+httpResourceLookup ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  -- | Resource type name
+  Text ->
+  -- | Resource name
+  Text ->
+  HandlerT m Wai.Response
+httpResourceLookup store routesVar request resTyName resName = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  let store' = Store.hoistStore lift store
+  mBody <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
+    resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
+    MaybeT $ Store.readResource resTy (Text.unpack resName)
+
+  case mBody of
+    Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "resource not found")
+    Just body -> pure $ Wai.responseLBS ok200 [] body
+
+httpResourceMetadataLookup ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  -- | Resource type name
+  Text ->
+  -- | Resource name
+  Text ->
+  HandlerT m Wai.Response
+httpResourceMetadataLookup store routesVar request resTyName resName = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+    resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+    Store.readResourceMetadata resTy (Text.unpack resName)
+
+  case mBody of
+    Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "metadata not found")
+    Just body -> pure $ Wai.responseLBS ok200 [] body
+
+httpResourcePropertiesUpdate ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  -- | Resource type name
+  Text ->
+  -- | Resource name
+  Text ->
+  HandlerT m Wai.Response
+httpResourcePropertiesUpdate store routesVar request resTyName resName = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+    body <- liftIO $ Wai.consumeRequestBodyLazy request
+    Toml.Toml (Toml.Located _offset properties) nonKeys <-
+      case Toml.parse $ LazyByteString.toStrict body of
+        Left err -> do
+          let resourceId = renderResourceId (ResourceId (Text.unpack resTyName) (Text.unpack resName))
+          throwError
+            . DiagnosticReports
+              (fromString $ "(" ++ resourceId ++ ":properties)")
+              body
+            $ tomlErrorReport err
+        Right x -> pure x
+
+    unless (null nonKeys) . error $
+      "TODO: non-key-value properties: " ++ show nonKeys
+
+    resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
+    let resId = ResourceId (Text.unpack resTyName) (Text.unpack resName)
+    names <- for properties $ \(name, Toml.TomlKeyEntry _offset (Toml.Located _offset' value)) -> do
+      Store.setProperty resTy (resourceName resId) (Text.unpack name) (metadataValueFromToml value)
+      pure name
+
+    if defer
+      then do
+        let
+          response =
+            fromString "updated properties:\n"
+              <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
+              <> fromString "(rules deferred)"
+
+        pure $ Wai.responseLBS ok200 [] response
+      else do
+        changes <- evalRules store routesVar xactId [resId]
+
+        let
+          response =
+            fromString "updated properties:\n"
+              <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
+              <> if null changes
+                then mempty
+                else
+                  fromString ("\nresource changes:\n")
+                    <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
+
+        pure $ Wai.responseLBS ok200 [] response
+
+httpResourcePropertyLookup ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  -- | Resource type name
+  Text ->
+  -- | Resource name
+  Text ->
+  -- | Property name
+  Text ->
+  HandlerT m Wai.Response
+httpResourcePropertyLookup store routesVar request resTyName resName propName = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+    resTy <- Store.getResourceType store xactId $ Text.unpack resTyName
+    Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
+
+  case mBody of
+    Nothing ->
+      pure $ Wai.responseLBS notFound404 [] (fromString "property not found")
+    Just body ->
+      pure $ Wai.responseLBS ok200 [] body
+
+httpRouteGet ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  -- | Path
+  [Text] ->
+  HandlerT m Wai.Response
+httpRouteGet store routesVar request path = do
+  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+
+  handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+    routes <- liftIO $ readActiveRoutes routesVar
+    case Routes.lookup path routes of
+      Nothing ->
+        pure $ Wai.responseLBS notFound404 [] (fromString "not found")
+      Just resId -> do
+        resTy <- Store.getResourceType store xactId $ resourceType resId
+        mContent <- Store.readResource resTy $ resourceName resId
+        case mContent of
+          Nothing ->
+            pure $ Wai.responseLBS notFound404 [] (fromString "not found")
+          Just content -> do
+            let contentType = Text.Encoding.encodeUtf8 . cfgContentType $ Store.resourceTypeConfig resTy
+            pure $ Wai.responseLBS ok200 [(hContentType, contentType)] content
