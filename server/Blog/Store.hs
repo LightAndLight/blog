@@ -114,7 +114,7 @@ import System.Directory
   , removeDirectoryRecursive
   , renameDirectory
   )
-import System.FilePath (splitDirectories, takeDirectory, (</>))
+import System.FilePath (splitDirectories, splitFileName, takeDirectory, (</>))
 import System.IO.Error (isDoesNotExistError)
 import qualified Text.Pandoc as Pandoc
 import Text.Pandoc.Definition (Block (..))
@@ -354,7 +354,7 @@ fromDirectory storeDir = do
             if isDir
               then do
                 wasEmpty <- go srcPath tgtPath
-                when wasEmpty $ IO.removeDirectory tgtPath
+                when wasEmpty $ IO.removeDirectoryRecursive tgtPath
               else IO.removeFile tgtPath
           pure isEmpty
 
@@ -1078,7 +1078,10 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
             else do
               updated <- doesFileExist $ getTransactionIdDir storeDir xactId </> changePart Update </> path
               when updated $ doRemove (getTransactionIdDir storeDir xactId) (changePart Update </> path)
-              IO.writeFile (getTransactionIdDir storeDir xactId </> changePart Delete </> path) mempty
+              do
+                IO.createDirectoryIfMissing True $
+                  getTransactionIdDir storeDir xactId </> changePart Delete </> takeDirectory path
+                IO.writeFile (getTransactionIdDir storeDir xactId </> changePart Delete </> path) mempty
       where
         doRemove base path' = do
           isDir <- doesDirectoryExist $ base </> path'
@@ -1140,11 +1143,11 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
 
       liftIO $ do
         let dependenciesDir = resTyName </> propertiesPart resNameSrc </> "dependencies"
-        xactRemoveFile $ dependenciesDir </> renderResourceId dependencySource
+        xactRemoveFile $ dependenciesDir </> renderResourceId dependencyTarget
 
       liftIO $ do
         let dependentsDir = resTyNameTgt </> propertiesPart resNameTgt </> "dependents"
-        xactRemoveFile $ dependentsDir </> renderResourceId dependencyTarget
+        xactRemoveFile $ dependentsDir </> renderResourceId dependencySource
 
 doesResourceExist :: ResourceType m -> String -> m Bool
 doesResourceExist = doesResourceExistImpl

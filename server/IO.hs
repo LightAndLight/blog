@@ -8,6 +8,7 @@ module IO
   , removeFile
   , createDirectoryIfMissing
   , removeDirectory
+  , removeDirectoryRecursive
   , listDirectory
   , getModificationTime
   , WithCallStack (..)
@@ -47,6 +48,9 @@ createDirectoryIfMissing parent path =
 
 removeDirectory :: HasCallStack => FilePath -> IO ()
 removeDirectory path = Directory.removeDirectory path `catch` (throwIO . WithCallStack @IOError callStack)
+
+removeDirectoryRecursive :: HasCallStack => FilePath -> IO ()
+removeDirectoryRecursive path = Directory.removeDirectoryRecursive path `catch` (throwIO . WithCallStack @IOError callStack)
 
 listDirectory :: HasCallStack => FilePath -> IO [String]
 listDirectory path = Directory.listDirectory path `catch` (throwIO . WithCallStack @IOError callStack)
