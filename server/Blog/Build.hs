@@ -414,7 +414,7 @@ queryInputs i = go i
                     case matchResourceName resNamePat $ resourceName resId of
                       Nothing -> pure acc
                       Just bindings -> do
-                        value <- makeResource resId
+                        value <- makeResource resTy $ resourceName resId
                         if resId `Set.member` changes
                           then do
                             let
@@ -512,12 +512,11 @@ queryInputs i = go i
                   }
               ]
 
-makeResource :: MonadIO m => ResourceId -> ActionT m (Maybe (ResourceInput m ByteString))
-makeResource resId@(ResourceId resTyName resName) = do
-  store <- askStore
-  transactionId <- askTransactionId
-
-  resTy <- Store.getResourceType store transactionId resTyName
+makeResource ::
+  MonadIO m =>
+  Store.ResourceType (ActionT m) -> String -> ActionT m (Maybe (ResourceInput m ByteString))
+makeResource resTy resName = do
+  let resTyName = Store.resourceTypeName resTy
   mContent <- Store.readResource resTy resName
   case mContent of
     Nothing ->
@@ -532,7 +531,7 @@ makeResource resId@(ResourceId resTyName resName) = do
       pure $
         Just
           ResourceInput
-            { resourceInputId = resId
+            { resourceInputId = ResourceId resTyName resName
             , resourceInputType = resTy
             , resourceInputMetadata = metadata
             , resourceInputProperty = Store.lookupProperty resTy resName
