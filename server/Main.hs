@@ -650,7 +650,7 @@ httpTransactionRollback store routesVar request = do
     parseTransactionId value
   handleExceptT $ Store.rollbackTransaction store xactId
   liftIO $ rollbackRoutes routesVar xactId
-  pure $ Wai.responseLBS ok200 [] (fromString $ "committed " ++ Store.renderTransactionId xactId)
+  pure $ Wai.responseLBS ok200 [] (fromString $ "rolled back " ++ Store.renderTransactionId xactId)
 
 httpExport ::
   (MonadMask m, MonadIO m) =>
