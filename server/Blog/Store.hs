@@ -104,12 +104,10 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
-import Data.Map (Map)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Monoid (First (..))
 import qualified Data.Set as Set
 import Data.String (fromString)
-import Data.Text (Text)
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
@@ -696,20 +694,20 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       when changed $ do
         liftIO $ overlayWriteFile overlay resName body
         setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
-        metadata <- extractMetadata resTyName config resName body
-        updateMetadata resName metadata
+        mMetadata <- extractMetadata resTyName config resName body
+        for_ mMetadata $ updateMetadata resName
 
       pure changed
       where
         newHash = Base16.encode $ Sha256.hashlazy body
 
-    updateMetadata :: String -> Metadata -> m ()
+    updateMetadata :: String -> ByteString -> m ()
     updateMetadata resName metadata = do
       liftIO $
         overlayWriteFile
           overlay
           (propertiesPart resName </> "metadata")
-          (LazyByteString.fromStrict $ metadataSource metadata)
+          (LazyByteString.fromStrict metadata)
 
     readResourceMetadataImpl :: String -> m (Maybe ByteString)
     readResourceMetadataImpl resName =
@@ -877,14 +875,6 @@ lookupProperty resTy resName propName = do
               (LazyByteString.fromStrict content)
               (sageErrorReport err)
 
-data Metadata
-  = Metadata
-  { metadataSource :: ByteString
-  -- ^ Source
-  , metadataValues :: Map Text MetadataValue
-  -- ^ Parsed
-  }
-
 extractMetadata ::
   MonadError DiagnosticReports m =>
   -- | Resource type
@@ -893,11 +883,11 @@ extractMetadata ::
   -- | Resource name
   String ->
   LazyByteString.ByteString ->
-  m Metadata
+  m (Maybe ByteString)
 extractMetadata resTyName config resName body =
   if cfgContentType config == fromString "text/markdown"
     then extractMetadataMarkdown resTyName config resName body
-    else pure $ Metadata mempty mempty
+    else pure Nothing
 
 extractMetadataMarkdown ::
   MonadError DiagnosticReports m =>
@@ -907,7 +897,7 @@ extractMetadataMarkdown ::
   -- | Resource name
   String ->
   LazyByteString.ByteString ->
-  m Metadata
+  m (Maybe ByteString)
 extractMetadataMarkdown resTyName config resName body = do
   body' <-
     case Text.Lazy.Encoding.decodeUtf8' body of
@@ -926,13 +916,16 @@ extractMetadataMarkdown resTyName config resName body = do
     metadataBlock _ = Nothing
 
   case getFirst $ query @Block (First . metadataBlock) markdown of
-    Nothing -> pure $ Metadata mempty mempty
+    Nothing ->
+      pure Nothing
     Just content -> do
+      -- validate the metadata before returning
       let decoder = resourceMetadataDecoder config
       let
         resourceFile =
           fromString $
             "(" ++ renderResourceId (ResourceId resTyName resName) ++ ":metadata)"
       toml <- tomlResult resourceFile content $ Toml.parse content
-      values <- tomlResult resourceFile content $ Toml.decode toml decoder
-      pure $ Metadata content values
+      _values <- tomlResult resourceFile content $ Toml.decode toml decoder
+
+      pure $ Just content
