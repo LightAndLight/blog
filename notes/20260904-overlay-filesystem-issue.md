@@ -45,3 +45,6 @@ would have it removed, and so `a/` would not be created on commit.
 
 I think the root issue is that there's no way to distinguish between a created
 `b/` within an existing `a/`, and a created `b/` within a created `a/`.
+
+Update: I've worked around the problem by treating directories in the `create`
+filesystem as "create if missing".
