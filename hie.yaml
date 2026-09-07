@@ -6,6 +6,9 @@ cradle:
     - path: "./cli/Main.hs"
       component: "blog:exe:blog"
 
+    - path: "./server-lib"
+      component: "blog:lib:blog-server-lib"
+
     - path: "./server/Main.hs"
       component: "blog:exe:blog-server"
 
@@ -21,6 +24,9 @@ cradle:
     - path: "./server/Blog/Metadata.hs"
       component: "blog:exe:blog-server"
 
+    - path: "./server/Blog/Pandoc.hs"
+      component: "blog:exe:blog-server"
+
     - path: "./server/Blog/Route.hs"
       component: "blog:exe:blog-server"
 
@@ -28,27 +34,6 @@ cradle:
       component: "blog:exe:blog-server"
 
     - path: "./server/Blog/Store.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/Commonmark/Extensions/NativeDiv.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/IO.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/Commonmark/Pandoc.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/Text/Pandoc/Builder.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/Text/Pandoc/Definition.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/Text/Pandoc/Html.hs"
-      component: "blog:exe:blog-server"
-
-    - path: "./server/Text/Pandoc/Walk.hs"
       component: "blog:exe:blog-server"
 
     - path: "./test"

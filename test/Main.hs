@@ -10,11 +10,9 @@ module Main (main) where
 import Barbies
 import Blog (ResourceId (..), renderResourceId)
 import qualified Blog.ID as ID
-import Control.Concurrent (forkIO)
 import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
-import Control.DeepSeq (rnf)
-import Control.Exception (evaluate, finally)
+import Control.Exception (finally)
 import Control.Monad (guard)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Morph (hoist)
@@ -63,10 +61,11 @@ import Network.TLS.Extra.Cipher (ciphersuite_default)
 import System.Directory (createDirectory, removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
-import System.IO (hGetContents)
+import System.IO (hClose, hGetContents)
 import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory)
-import System.Process (callProcess, cleanupProcess, createProcess, readProcess)
+import System.Process (callProcess, createProcess, readProcess, terminateProcess, waitForProcess)
 import qualified System.Process as Process
+import qualified Test.Blog.Store.Overlay
 import Test.Hspec (Spec, describe, hspec, it, runIO)
 import Test.Hspec.Hedgehog (hedgehog)
 
@@ -143,91 +142,98 @@ spec = do
       i <- forAll $ Gen.string (Range.singleton 32) (Gen.element $ ['a' .. 'f'] ++ ['0' .. '9'])
       fmap ID.toString (ID.fromString i) === Just i
 
+  Test.Blog.Store.Overlay.spec
+
   describe "state machine tests" $ do
-    (caStore, blogServerPath) <-
-      runIO $ do
-        let caCert = "tls/root.crt"
-        caStore <- do
-          mStore <- readCertificateStore caCert
-          case mStore of
-            Nothing -> do
-              putStrLn $ "error: failed to read CA certificate from " ++ caCert
-              exitFailure
-            Just store -> pure store
+    describe "server" $ do
+      (caStore, blogServerPath) <-
+        runIO $ do
+          let caCert = "tls/root.crt"
+          caStore <- do
+            mStore <- readCertificateStore caCert
+            case mStore of
+              Nothing -> do
+                putStrLn $ "error: failed to read CA certificate from " ++ caCert
+                exitFailure
+              Just store -> pure store
 
-        callProcess "cabal" ["build", "blog-server"]
-        blogServerPath <- filter (not . Char.isSpace) <$> readProcess "cabal" ["list-bin", "blog-server"] ""
+          callProcess "cabal" ["build", "blog-server"]
+          blogServerPath <- filter (not . Char.isSpace) <$> readProcess "cabal" ["list-bin", "blog-server"] ""
 
-        pure (caStore, blogServerPath)
+          pure (caStore, blogServerPath)
 
-    it "main" $ do
-      hedgehog $ do
-        manager <- liftIO $ httpManager caStore
+      it "main" $ do
+        hedgehog $ do
+          manager <- liftIO $ httpManager caStore
 
-        cs <- forAll $ Gen.sequential (Range.constant 0 200) initialState commands
-        tmpDir <-
-          liftIO $ getCanonicalTemporaryDirectory >>= \tmp -> createTempDirectory tmp "blog-server-tests"
-        footnote $ "test data: " ++ tmpDir
+          cs <- forAll $ Gen.sequential (Range.constant 0 200) initialState commands
+          tmpDir <-
+            liftIO $ getCanonicalTemporaryDirectory >>= \tmp -> createTempDirectory tmp "blog-server-tests"
+          footnote $ "test data: " ++ tmpDir
 
-        let dataDir = tmpDir </> "data"
-        liftIO $ createDirectory dataDir
+          let dataDir = tmpDir </> "data"
+          liftIO $ createDirectory dataDir
 
-        let
-          proc =
-            ( Process.proc
-                blogServerPath
-                [ "--data"
-                , dataDir
-                , "--cert"
-                , "tls/localhost.crt"
-                , "--key"
-                , "tls/localhost.key"
-                , "--port"
-                , "8080"
-                ]
-            )
-              { Process.std_in = Process.Inherit
-              , Process.std_out = Process.CreatePipe
-              , Process.std_err = Process.CreatePipe
-              }
-        process@(_mStdin, mStdout, mStderr, _processHandle) <- liftIO $ createProcess proc
+          let
+            proc =
+              ( Process.proc
+                  blogServerPath
+                  [ "--data"
+                  , dataDir
+                  , "--cert"
+                  , "tls/localhost.crt"
+                  , "--key"
+                  , "tls/localhost.key"
+                  , "--port"
+                  , "8080"
+                  ]
+              )
+                { Process.std_in = Process.Inherit
+                , Process.std_out = Process.CreatePipe
+                , Process.std_err = Process.CreatePipe
+                }
+          (_mStdin, mStdout, mStderr, processHandle) <- liftIO $ createProcess proc
 
-        readyVar <- liftIO newEmptyMVar
-        stdoutThread <-
-          case mStdout of
-            Nothing -> undefined
-            Just hStdout ->
-              liftIO . async $ do
-                let path = tmpDir </> "stdout"
-                contents <- hGetContents hStdout
-                _ <- forkIO . evaluate $ rnf contents
-                case stripPrefix "Running at" contents of
-                  Nothing -> putMVar readyVar $ Left "missing log start phrase"
-                  Just _suffix -> putMVar readyVar $ Right ()
-                writeFile path contents
-        stderrThread <-
-          case mStderr of
-            Nothing -> undefined
-            Just hStderr ->
-              liftIO . async $ do
-                let path = tmpDir </> "stderr"
-                contents <- hGetContents hStderr
-                _ <- forkIO . evaluate $ rnf contents
-                writeFile path contents
+          readyVar <- liftIO newEmptyMVar
+          stdoutThread <-
+            case mStdout of
+              Nothing -> undefined
+              Just hStdout ->
+                liftIO . async $ do
+                  let path = tmpDir </> "stdout"
+                  contents <- hGetContents hStdout
+                  case filter (isJust . stripPrefix "Running at") $ lines contents of
+                    _ : _ ->
+                      putMVar readyVar $ Right ()
+                    [] ->
+                      putMVar readyVar . Left $
+                        "missing log start phrase (got: " ++ show contents ++ ") (logs stored in " ++ tmpDir ++ ")"
+                  writeFile path contents
+                  hClose hStdout
+          stderrThread <-
+            case mStderr of
+              Nothing -> undefined
+              Just hStderr ->
+                liftIO . async $ do
+                  let path = tmpDir </> "stderr"
+                  contents <- hGetContents hStderr
+                  writeFile path contents
+                  hClose hStderr
 
-        let
-          cleanup = do
-            cleanupProcess process
-            wait stdoutThread
-            wait stderrThread
+          let
+            cleanup = do
+              terminateProcess processHandle
+              _ <- waitForProcess processHandle
+              wait stdoutThread
+              wait stderrThread
 
-        result <- liftIO $ takeMVar readyVar
-        either error pure result
+          result <- liftIO $ takeMVar readyVar
+          either error pure result
 
-        hoist (`finally` cleanup) $ do
-          runReaderT (executeSequential initialState cs) manager
+          hoist (`finally` cleanup) $ do
+            runReaderT (executeSequential initialState cs) manager
 
-        liftIO $ removeDirectoryRecursive tmpDir
+          liftIO $ removeDirectoryRecursive tmpDir
 
 data State (v :: Type -> Type)
   = State

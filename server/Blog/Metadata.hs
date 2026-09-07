@@ -23,8 +23,8 @@ import Blog
 import Blog.Diagnostic (DiagnosticReports)
 import Blog.Error (tomlResult)
 import Control.Monad.Error.Class (MonadError)
+import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
-import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Foldable (fold)
 import Data.List (find, intersperse)
 import Data.Map (Map)
@@ -66,15 +66,14 @@ parseResourceMetadata ::
   String ->
   -- | Resource name
   String ->
-  LazyByteString ->
+  ByteString ->
   m (Map Text MetadataValue)
 parseResourceMetadata config resTyName resName content = do
   let decoder = resourceMetadataDecoder config
   let resourceFile =
         fromString $
           "(" ++ renderResourceId (ResourceId resTyName resName) ++ ")"
-  let content' = LazyByteString.toStrict content
-  toml <- tomlResult resourceFile content $ Toml.parse content'
+  toml <- tomlResult resourceFile content $ Toml.parse content
   tomlResult resourceFile content $ Toml.decode toml decoder
 
 renderMetadataValueToml :: MetadataValue -> LazyByteString

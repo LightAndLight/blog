@@ -90,6 +90,7 @@ import Data.String (fromString)
 import Data.Text (Text)
 import Data.Traversable (for)
 import Prelude hiding (any)
+import Data.ByteString (ByteString)
 
 newtype Rules m = Rules [Rule m]
   deriving (Semigroup, Monoid)
@@ -183,7 +184,7 @@ trace s = ActionT $ do
   f <- asks aeTrace
   liftIO $ f s
 
-setDependencies :: Monad m => ResourceId -> Set ResourceId -> ActionT m ()
+setDependencies :: MonadIO m => ResourceId -> Set ResourceId -> ActionT m ()
 setDependencies a bs = do
   store <- askStore
   transactionId <- askTransactionId
@@ -264,9 +265,9 @@ instance Applicative (Input m) where
   (<*>) = IApply
 
 data InputQuantifier m :: Type -> Type where
-  IAny :: InputQuantifier m (ResourceInput m LazyByteString)
-  IOptional :: InputQuantifier m (Maybe (ResourceInput m LazyByteString))
-  IAll :: InputQuantifier m (ResourceInputs m LazyByteString)
+  IAny :: InputQuantifier m (ResourceInput m ByteString)
+  IOptional :: InputQuantifier m (Maybe (ResourceInput m ByteString))
+  IAll :: InputQuantifier m (ResourceInputs m ByteString)
 
 data ResourceInput m a
   = ResourceInput
@@ -372,14 +373,14 @@ instance Applicative InputTuples where
       )
 
 queryInputs ::
-  Monad m =>
+  MonadIO m =>
   Input m a ->
   Set ResourceId ->
   ActionT m (InputTuples a)
 queryInputs i = go i
   where
     go ::
-      Monad m =>
+      MonadIO m =>
       Input m a ->
       Set ResourceId ->
       ActionT m (InputTuples a)
@@ -511,7 +512,7 @@ queryInputs i = go i
                   }
               ]
 
-makeResource :: Monad m => ResourceId -> ActionT m (Maybe (ResourceInput m LazyByteString))
+makeResource :: MonadIO m => ResourceId -> ActionT m (Maybe (ResourceInput m ByteString))
 makeResource resId@(ResourceId resTyName resName) = do
   store <- askStore
   transactionId <- askTransactionId
@@ -631,7 +632,7 @@ iResource ::
   String ->
   -- | Resource name
   ResourceNamePattern ->
-  Input m (ResourceInput m LazyByteString)
+  Input m (ResourceInput m ByteString)
 iResource resTyName = IResource IAny resTyName
 
 iResourceOptional ::
@@ -639,7 +640,7 @@ iResourceOptional ::
   String ->
   -- | Resource name
   ResourceNamePattern ->
-  Input m (Maybe (ResourceInput m LazyByteString))
+  Input m (Maybe (ResourceInput m ByteString))
 iResourceOptional = IResource IOptional
 
 {-| Declare a bulk input of a particular resource type, matching the given pattern.
@@ -651,7 +652,7 @@ iResourceAll ::
   String ->
   -- | Resource name
   ResourceNamePattern ->
-  Input m (ResourceInputs m LazyByteString)
+  Input m (ResourceInputs m ByteString)
 iResourceAll = IResource IAll
 
 iAll :: Input m a -> Input m [a]

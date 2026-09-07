@@ -58,6 +58,44 @@ executable blog
     default-language: Haskell2010
     ghc-options:      -threaded
 
+library blog-server-lib
+    import:           warnings
+    hs-source-dirs:   server-lib
+    exposed-modules:
+        Blog.Store.Overlay
+        IO
+    build-depends:
+        base ^>=4.20.2.0,
+        base16-bytestring,
+        blog,
+        bytestring,
+        containers,
+        cryptohash-sha256,
+        deepseq,
+        diagnostica,
+        diagnostica-sage,
+        directory,
+        exceptions,
+        filepath,
+        http-types,
+        mtl >=2.3.2,
+        optparse-applicative,
+        pandoc,
+        pandoc-types,
+        sage,
+        stm,
+        syb,
+        tar,
+        temple,
+        text >=2.0,
+        time,
+        tomlin,
+        transformers,
+        wai,
+        warp,
+        warp-tls
+    default-language: Haskell2010
+
 executable blog-server
     import:           warnings
     main-is:          Main.hs
@@ -70,11 +108,11 @@ executable blog-server
         Blog.Route
         Blog.Rules
         Blog.Store
-        IO
     build-depends:
         base ^>=4.20.2.0,
         base16-bytestring,
         blog,
+        blog-server-lib,
         bytestring,
         containers,
         cryptohash-sha256,
@@ -111,16 +149,17 @@ test-suite blog-server-tests
     type:             exitcode-stdio-1.0
     hs-source-dirs:   test
     main-is:          Main.hs
+    other-modules:    Test.Blog.Store.Overlay
     build-depends:
         async,
         base,
         barbies,
         blog,
+        blog-server-lib,
         bytestring,
         containers,
         crypton-connection,
         crypton-x509-store,
-        deepseq,
         directory,
         filepath,
         hedgehog,

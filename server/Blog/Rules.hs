@@ -44,9 +44,9 @@ import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, tell)
 import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
-import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
 import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
@@ -210,7 +210,7 @@ loadTemplate ::
   MonadIO m =>
   (Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)) ->
   (Temple.TemplateRef -> String) ->
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   Build.ActionT
     m
     (Map.Map Temple.TemplateRef Temple.Core, [Temple.Binding], Temple.Core)
@@ -238,14 +238,14 @@ loadTemplate readTemplateRef renderTemplateRef iTemplate = do
     template'
 
 parseTemplate ::
-  MonadError DiagnosticReports m => String -> LazyByteString -> m (Temple.Template Temple.Offset)
+  MonadError DiagnosticReports m => String -> ByteString -> m (Temple.Template Temple.Offset)
 parseTemplate location input =
-  case Temple.parse (LazyByteString.toStrict input) of
+  case Temple.parse input of
     Left err ->
       throwError $
         DiagnosticReports
           (fromString location)
-          input
+          (LazyByteString.fromStrict input)
           (sageErrorReport err)
     Right x -> pure x
 
@@ -253,9 +253,9 @@ inferBindings ::
   (MonadError DiagnosticReports m, MonadIO m) =>
   (Temple.TemplateRef -> m (Maybe ByteString)) ->
   (Temple.TemplateRef -> String) ->
-  (Temple.TemplateRef -> m LazyByteString) ->
+  (Temple.TemplateRef -> m ByteString) ->
   -- | Location, content (for error reporting)
-  (String, LazyByteString) ->
+  (String, ByteString) ->
   Temple.TemplateRef ->
   Temple.Template Temple.Offset ->
   m (Map Temple.TemplateRef Temple.Core, [Temple.Binding], Temple.Core)
@@ -267,13 +267,13 @@ inferBindings readTemplateRef renderTemplateRef getTemplateRef (location, input)
       throwError
         =<< DiagnosticReports
           (fromString location)
-          input
+          (LazyByteString.fromStrict input)
           <$> templeTypeErrorReport renderTemplateRef getTemplateRef err
 
 templateDependency ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   () ->
   Build.ActionT m ()
 templateDependency iTemplate () = do
@@ -286,7 +286,7 @@ templateDependency iTemplate () = do
 
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
-      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+      Store.readResource (Build.resourceInputType iTemplate) name
 
     getTemplateRef (Temple.TemplateRef name) =
       fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
@@ -328,8 +328,8 @@ templateDependency iTemplate () = do
   Build.setDependencies (Build.resourceInputId iTemplate) templateDependencies
 
 articleAdjacency ::
-  Monad m =>
-  (Build.ResourceInputs m LazyByteString, Build.ResourceInputs m LazyByteString) ->
+  MonadIO m =>
+  (Build.ResourceInputs m ByteString, Build.ResourceInputs m ByteString) ->
   Build.ResourceOutput m String ->
   Build.ActionT m ()
 articleAdjacency (iArticles, iNotes) oAdjacency = do
@@ -357,7 +357,7 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
       )
   where
     getResourcesWithPublished ::
-      Monad m =>
+      MonadIO m =>
       Store (Build.ActionT m) ->
       Store.TransactionId ->
       Build.ResourceInputs m a ->
@@ -486,7 +486,7 @@ data TypeProviderError
 typeProviderErrorDiagnostic ::
   MonadIO m =>
   (Temple.TemplateRef -> String) ->
-  (Temple.TemplateRef -> m LazyByteString) ->
+  (Temple.TemplateRef -> m ByteString) ->
   -- | Error location name
   String ->
   TypeProviderError ->
@@ -507,7 +507,7 @@ typeProviderErrorDiagnostic renderTemplateRef getTemplateRef location err =
       pure $
         DiagnosticReports
           (fromString $ "(" ++ renderTemplateRef ref ++ ")")
-          content
+          (LazyByteString.fromStrict content)
           ( One $
               Diagnostic.emit
                 (Diagnostic.Offset $ Temple.getOffset offset)
@@ -747,18 +747,18 @@ contentPropertyTypeProvider =
                     <*> Store.readResource resTy (Text.unpack resName)
 
               let
-                format :: LazyByteString -> LazyByteString
+                format :: ByteString -> ByteString
                 format =
                   case mFormat of
                     Just (VString s) | s == fromString "text" -> id
-                    Just (VString s) | s == fromString "line" -> \x -> ByteString.Lazy.Char8.dropWhileEnd (`elem` "\r\n") x
+                    Just (VString s) | s == fromString "line" -> \x -> ByteString.Char8.dropWhileEnd (`elem` "\r\n") x
                     _ -> id
 
               case mContent of
                 Nothing ->
                   pure $ Temple.CString mempty
                 Just content ->
-                  pure $ Temple.CString [Temple.CPartText . LazyByteString.toStrict $ format content]
+                  pure $ Temple.CString [Temple.CPartText $ format content]
           else
             pure Nothing
     )
@@ -804,7 +804,7 @@ lookupPropertyTypeProvider =
                 throwError
                   . DiagnosticReports
                     (fromString $ "(" ++ renderResourceId resId ++ ")")
-                    content
+                    (LazyByteString.fromStrict content)
                   =<< templeTypeErrorReport (const undefined) (const undefined) err
 
           pure . Just $ \path propTy -> do
@@ -1068,13 +1068,13 @@ fromTocHeaders contents =
 loadMarkdown ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   Build.ActionT m (Set ResourceId, Pandoc)
 loadMarkdown input = do
   content <-
-    case Text.Lazy.Encoding.decodeUtf8' $ Build.resourceInputContent input of
+    case Text.Encoding.decodeUtf8' $ Build.resourceInputContent input of
       Left err -> error $ "TODO: " ++ show err
-      Right x -> pure $! LazyText.toStrict x
+      Right x -> pure x
 
   let result = Pandoc.runPure $ Pandoc.readMarkdown markdownReaderOptions content
   case result of
@@ -1186,11 +1186,8 @@ loadMarkdown input = do
         getTemplateRef = const $ error "impossible getTemplateRef"
 
       let location = renderResourceId (Build.resourceInputId input) ++ ", HTML fragment"
-      let content' = Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict content
-      template <-
-        parseTemplate
-          ("(" ++ location ++ ")")
-          content'
+      let content' = Text.Encoding.encodeUtf8 content
+      template <- parseTemplate ("(" ++ location ++ ")") content'
 
       let inputRef = Temple.TemplateRef "."
       -- TODO: register these deps
@@ -1254,7 +1251,7 @@ loadMetadata input = do
 markdownDependency ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   () ->
   Build.ActionT m ()
 markdownDependency input () = do
@@ -1265,14 +1262,14 @@ pandoc :: MonadError DiagnosticReports m => PandocPure a -> m a
 pandoc = either (throwError . DiagnosticSimple . Text.unpack . Pandoc.renderError) pure . Pandoc.runPure
 
 getAdjacency ::
-  Monad m =>
-  Build.ResourceInput m LazyByteString ->
+  MonadIO m =>
+  Build.ResourceInput m ByteString ->
   Build.ActionT m (Maybe [(Text, MetadataValue)], Maybe [(Text, MetadataValue)])
 getAdjacency iAdjacency = do
   let adjacencyFile = fromString $ "(" ++ renderResourceId (Build.resourceInputId iAdjacency) ++ ")"
   let adjacencyContent = Build.resourceInputContent iAdjacency
   toml <-
-    tomlResult adjacencyFile adjacencyContent . Toml.parse $ LazyByteString.toStrict adjacencyContent
+    tomlResult adjacencyFile adjacencyContent $ Toml.parse adjacencyContent
   let
     decoder =
       (,)
@@ -1345,7 +1342,7 @@ bindingParameterNotFound inputRef binding = do
 handleTypeProvider ::
   MonadIO m =>
   (Temple.TemplateRef -> String) ->
-  (Temple.TemplateRef -> Build.ActionT m LazyByteString) ->
+  (Temple.TemplateRef -> Build.ActionT m ByteString) ->
   -- | Location name (for error reporting)
   String ->
   ExceptT TypeProviderError (Build.ActionT m) a ->
@@ -1361,7 +1358,7 @@ handleTypeProvider renderTemplateRef getTemplateRef location ma = do
 renderTemplate ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   Map Text (BindingTypeProvider (Build.ActionT m)) ->
   Build.ActionT m LazyByteString
 renderTemplate iTemplate typeProviders = do
@@ -1370,7 +1367,7 @@ renderTemplate iTemplate typeProviders = do
   let
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
-      fmap LazyByteString.toStrict <$> Store.readResource (Build.resourceInputType iTemplate) name
+      Store.readResource (Build.resourceInputType iTemplate) name
 
   let
     renderTemplateRef (Temple.TemplateRef name) =
@@ -1425,9 +1422,9 @@ bindingTypeProvider provider readTemplateRef binding = do
 articleHtml ::
   forall m.
   MonadIO m =>
-  ( Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
+  ( Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
   ) ->
   (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
   Build.ActionT m ()
@@ -1491,9 +1488,9 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 noteHtml ::
   forall m.
   MonadIO m =>
-  ( Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
+  ( Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
   ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
@@ -1531,7 +1528,7 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
 pageDependency ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   () ->
   Build.ActionT m ()
 pageDependency iPage () = do
@@ -1541,8 +1538,8 @@ pageDependency iPage () = do
 pageHtml ::
   forall m.
   MonadIO m =>
-  ( Build.ResourceInput m LazyByteString
-  , Build.ResourceInput m LazyByteString
+  ( Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
   ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
@@ -1584,20 +1581,20 @@ pageHtml (iTemplate, iPage) oHtml = do
 data IndexItem m
   = IndexArticle
       -- | Article
-      (Build.ResourceInput m LazyByteString)
+      (Build.ResourceInput m ByteString)
       -- | Excerpt
-      (Maybe (Build.ResourceInput m LazyByteString))
+      (Maybe (Build.ResourceInput m ByteString))
   | IndexNote
       -- | Note
-      (Build.ResourceInput m LazyByteString)
+      (Build.ResourceInput m ByteString)
       -- | Rendered HTML
       Text
 
 indexHtml ::
   MonadIO m =>
-  ( Build.ResourceInput m LazyByteString
-  , [(Build.ResourceInput m LazyByteString, Maybe (Build.ResourceInput m LazyByteString))]
-  , [Build.ResourceInput m LazyByteString]
+  ( Build.ResourceInput m ByteString
+  , [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))]
+  , [Build.ResourceInput m ByteString]
   ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
@@ -1746,7 +1743,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                                       (fromString "Article")
                                       [ Temple.CRecord
                                           [ ( fromString "excerpt"
-                                            , Temple.CString [Temple.CPartText . LazyByteString.toStrict $ Build.resourceInputContent iExcerpt]
+                                            , Temple.CString [Temple.CPartText $ Build.resourceInputContent iExcerpt]
                                             )
                                           | Just iExcerpt <- [miExcerpt]
                                           ]
@@ -1795,7 +1792,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
 resourceRoute ::
   forall m.
   MonadIO m =>
-  Build.ResourceInput m LazyByteString ->
+  Build.ResourceInput m ByteString ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 resourceRoute iContent oRoute = do

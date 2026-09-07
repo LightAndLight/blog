@@ -12,7 +12,6 @@ where
 import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
 import Control.Monad.Error.Class (MonadError, throwError)
 import Data.ByteString (ByteString)
-import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.List (intercalate)
 import Data.String (fromString)
@@ -26,12 +25,13 @@ tomlResult ::
   MonadError DiagnosticReports m =>
   -- | File name
   ByteString ->
-  LazyByteString ->
+  -- | File contents
+  ByteString ->
   Either Toml.TomlError a ->
   m a
 tomlResult _file _body (Right x) = pure x
 tomlResult file body (Left err) =
-  throwError . DiagnosticReports file body $ tomlErrorReport err
+  throwError . DiagnosticReports file (LazyByteString.fromStrict body) $ tomlErrorReport err
 
 sageErrorReport :: Temple.ParseError -> Reports
 sageErrorReport =
@@ -162,7 +162,7 @@ templeTypeErrorMessage err =
 templeTypeErrorReport ::
   Monad m =>
   (Temple.TemplateRef -> String) ->
-  (Temple.TemplateRef -> m LazyByteString) ->
+  (Temple.TemplateRef -> m ByteString) ->
   Temple.TypeError Temple.Offset ->
   m Reports
 templeTypeErrorReport renderTemplateRef loadTemplateRef err =
@@ -218,4 +218,9 @@ templeTypeErrorReport renderTemplateRef loadTemplateRef err =
 
     inResource loc message ref reports = do
       contents <- loadTemplateRef ref
-      pure $ More (emit loc message) (fromString $ renderTemplateRef ref) contents reports
+      pure $
+        More
+          (emit loc message)
+          (fromString $ renderTemplateRef ref)
+          (LazyByteString.fromStrict contents)
+          reports

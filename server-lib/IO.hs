@@ -6,15 +6,19 @@ module IO
   , writeFile
   , copyFile
   , removeFile
+  , createDirectory
   , createDirectoryIfMissing
   , removeDirectory
   , removeDirectoryRecursive
+  , renamePath
   , listDirectory
   , getModificationTime
   , WithCallStack (..)
   ) where
 
 import Control.Exception (Exception, catch, throwIO)
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Time.Clock (UTCTime)
@@ -29,8 +33,8 @@ instance Show a => Show (WithCallStack a) where
 
 instance Exception a => Exception (WithCallStack a)
 
-readFile :: HasCallStack => FilePath -> IO LazyByteString
-readFile path = LazyByteString.readFile path `catch` (throwIO . WithCallStack @IOError callStack)
+readFile :: HasCallStack => FilePath -> IO ByteString
+readFile path = ByteString.readFile path `catch` (throwIO . WithCallStack @IOError callStack)
 
 writeFile :: HasCallStack => FilePath -> LazyByteString -> IO ()
 writeFile path content = LazyByteString.writeFile path content `catch` (throwIO . WithCallStack @IOError callStack)
@@ -40,6 +44,11 @@ copyFile from to = Directory.copyFile from to `catch` (throwIO . WithCallStack @
 
 removeFile :: HasCallStack => FilePath -> IO ()
 removeFile path = Directory.removeFile path `catch` (throwIO . WithCallStack @IOError callStack)
+
+createDirectory :: HasCallStack => FilePath -> IO ()
+createDirectory path =
+  Directory.createDirectory path
+    `catch` (throwIO . WithCallStack @IOError callStack)
 
 createDirectoryIfMissing :: HasCallStack => Bool -> FilePath -> IO ()
 createDirectoryIfMissing parent path =
@@ -51,6 +60,9 @@ removeDirectory path = Directory.removeDirectory path `catch` (throwIO . WithCal
 
 removeDirectoryRecursive :: HasCallStack => FilePath -> IO ()
 removeDirectoryRecursive path = Directory.removeDirectoryRecursive path `catch` (throwIO . WithCallStack @IOError callStack)
+
+renamePath :: HasCallStack => FilePath -> FilePath -> IO ()
+renamePath from to = Directory.renamePath from to `catch` (throwIO . WithCallStack @IOError callStack)
 
 listDirectory :: HasCallStack => FilePath -> IO [String]
 listDirectory path = Directory.listDirectory path `catch` (throwIO . WithCallStack @IOError callStack)

@@ -77,11 +77,23 @@ import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
 import Blog.Pandoc (markdownReaderOptions)
+import Blog.Store.Overlay
+  ( Overlay (..)
+  , overlayCommit
+  , overlayCreateDir
+  , overlayDoesDirectoryExist
+  , overlayDoesFileExist
+  , overlayGetFileModificationTime
+  , overlayListDir
+  , overlayReadFile
+  , overlayRemoveFile
+  , overlayWriteFile
+  )
 import qualified Codec.Archive.Tar as Tar
 import qualified Codec.Archive.Tar.Entry as Tar (entryTarPath, fileEntry)
 import Control.Exception (throwIO)
-import Control.Monad (unless, when)
-import Control.Monad.Catch (ExitCase (..), MonadCatch, MonadMask, catch, generalBracket, throwM)
+import Control.Monad (guard, unless, when)
+import Control.Monad.Catch (ExitCase (..), MonadCatch, MonadMask, catch, generalBracket)
 import Control.Monad.Error.Class (MonadError, throwError)
 import Control.Monad.Fix (mfix)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -92,10 +104,8 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
-import Data.Functor (void)
-import Data.List (union, (\\))
 import Data.Map (Map)
-import Data.Maybe (catMaybes, fromMaybe, isJust)
+import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Monoid (First (..))
 import qualified Data.Set as Set
 import Data.String (fromString)
@@ -105,17 +115,16 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime)
 import Data.Traversable (for)
-import GHC.Stack (HasCallStack)
+import GHC.Stack (HasCallStack, callStack, getCallStack, prettySrcLoc)
 import IO (WithCallStack (..))
 import qualified IO
 import System.Directory
   ( createDirectory
   , doesDirectoryExist
-  , doesFileExist
   , removeDirectoryRecursive
   , renameDirectory
   )
-import System.FilePath (splitDirectories, splitFileName, takeDirectory, (</>))
+import System.FilePath (splitDirectories, (</>))
 import System.IO.Error (isDoesNotExistError)
 import qualified Text.Pandoc as Pandoc
 import Text.Pandoc.Definition (Block (..))
@@ -212,35 +221,32 @@ fromDirectory storeDir = do
   IO.createDirectoryIfMissing True $ getTransactionDir storeDir
   pure Store{..}
   where
+    getOverlay xactId =
+      Overlay
+        { overlayCreate = getTransactionIdDir storeDir xactId </> changePart Create
+        , overlayUpdate = getTransactionIdDir storeDir xactId </> changePart Update
+        , overlayDelete = getTransactionIdDir storeDir xactId </> changePart Delete
+        , overlayBase = storeDir
+        }
+
     lookupResourceTypeImpl :: TransactionId -> String -> m (Maybe (ResourceType m))
     lookupResourceTypeImpl xactId resTyName
       | resTyName == "resource" = do
           let config = ResourceConfig (fromString "text/toml") mempty
           liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId "resource" config
       | otherwise = do
-          let resTyDir = storeDir </> resTyName
-          exists <- liftIO $ doesDirectoryExist resTyDir
+          let overlay = getOverlay xactId
+          let resourceConfigPath = "resource" </> resTyName
+          exists <- liftIO $ overlayDoesFileExist overlay resourceConfigPath
           if exists
             then do
               content <-
                 liftIO $
-                  IO.readFile (getTransactionIdDir storeDir xactId </> changePart Update </> "resource" </> resTyName)
-                    `catch` \err@(WithCallStack _cs err') ->
-                      if isDoesNotExistError err'
-                        then IO.readFile (storeDir </> "resource" </> resTyName)
-                        else throwIO err
+                  fromMaybe (error $ resourceConfigPath ++ " not found")
+                    <$> overlayReadFile overlay resourceConfigPath
               config <- parseResourceConfig resTyName content
               liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
-            else do
-              let xactDir = getTransactionIdDir storeDir xactId </> changePart Create
-              let xactResTyDir = xactDir </> resTyName
-              inCreated <- liftIO $ doesDirectoryExist xactResTyDir
-              if inCreated
-                then do
-                  content <- liftIO $ IO.readFile (xactDir </> "resource" </> resTyName)
-                  config <- parseResourceConfig resTyName content
-                  liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
-                else pure Nothing
+            else pure Nothing
 
     beginTransactionImpl :: Bool -> m TransactionId
     beginTransactionImpl defer = do
@@ -267,104 +273,15 @@ fromDirectory storeDir = do
       exists <- liftIO $ doesDirectoryExist xactDir
       if exists
         then liftIO $ do
-          mergeDirectoryCreate (xactDir </> changePart Create) storeDir
-          mergeDirectoryUpdate (xactDir </> changePart Update) storeDir
-          subtractDirectory (xactDir </> changePart Delete) storeDir
+          overlayCommit $ getOverlay xactId
           removeDirectoryRecursive xactDir
         else
           throwError . DiagnosticSimple $ "transaction not found: " ++ renderTransactionId xactId
 
-    -- \| Recursively copy the contents of the source directory into the target directory.
-    --
-    -- Afterward, the target directory's tree is a superset of the source directory.
-    --
-    -- An empty directory within the source directory results in a corresponding empty
-    -- directory in the target directory. So if that empty directory already exists in
-    -- the target directory, then the contents will be deleted.
-    mergeDirectoryCreate ::
-      HasCallStack =>
-      -- \| Source directory
-      FilePath ->
-      -- \| Target directory
-      FilePath ->
-      IO ()
-    mergeDirectoryCreate srcDir' tgtDir' = do
-      entries <- IO.listDirectory srcDir'
-      go entries srcDir' tgtDir'
-      where
-        go entries srcDir tgtDir =
-          for_ entries $ \entry -> do
-            let srcPath = srcDir </> entry
-            let tgtPath = tgtDir </> entry
-            isDir <- doesDirectoryExist srcPath
-            if isDir
-              then do
-                entries' <- IO.listDirectory srcPath
-                if null entries'
-                  then do
-                    IO.removeDirectory tgtPath `catch` \err'@(WithCallStack _cs err) -> unless (isDoesNotExistError err) $ throwIO err'
-                    IO.createDirectoryIfMissing False tgtPath
-                  else do
-                    IO.createDirectoryIfMissing False tgtPath
-                    go entries' srcPath tgtPath
-              else do
-                putStrLn $ "create: copy " ++ srcPath ++ " to " ++ tgtPath
-                IO.copyFile srcPath tgtPath
-
-    -- \| Recursively copy the contents of the source directory into the target directory.
-    --
-    -- Afterward, the target directory's tree is a superset of the source directory.
-    mergeDirectoryUpdate ::
-      HasCallStack =>
-      -- \| Source directory
-      FilePath ->
-      -- \| Target directory
-      FilePath ->
-      IO ()
-    mergeDirectoryUpdate srcDir tgtDir = do
-      entries <- IO.listDirectory srcDir
-      for_ entries $ \entry -> do
-        let srcPath = srcDir </> entry
-        let tgtPath = tgtDir </> entry
-        isDir <- doesDirectoryExist srcPath
-        if isDir
-          then do
-            IO.createDirectoryIfMissing False tgtPath
-            mergeDirectoryUpdate srcPath tgtPath
-          else do
-            putStrLn $ "update: copy " ++ srcPath ++ " to " ++ tgtPath
-            IO.copyFile srcPath tgtPath
-
-    -- \| Recursively remove the contents of the source directory from the target directory.
-    --
-    -- An empty directory in the source directory causes removal of the entire
-    -- corresponding directory in the target directory.
-    subtractDirectory ::
-      -- \| Source directory
-      FilePath ->
-      -- \| Target directory
-      FilePath ->
-      IO ()
-    subtractDirectory src tgt = void $ go src tgt
-      where
-        go srcDir tgtDir = do
-          entries <- IO.listDirectory srcDir
-          let !isEmpty = null entries
-          for_ entries $ \entry -> do
-            let srcPath = srcDir </> entry
-            let tgtPath = tgtDir </> entry
-            isDir <- doesDirectoryExist srcPath
-            if isDir
-              then do
-                wasEmpty <- go srcPath tgtPath
-                when wasEmpty $ IO.removeDirectoryRecursive tgtPath
-              else IO.removeFile tgtPath
-          pure isEmpty
-
     rollbackTransactionImpl :: TransactionId -> m ()
-    rollbackTransactionImpl (TransactionId xactId) = do
+    rollbackTransactionImpl xactId = do
       liftIO $
-        removeDirectoryRecursive (getTransactionDir storeDir </> ID.toString xactId)
+        removeDirectoryRecursive (getTransactionIdDir storeDir xactId)
           `catch` \err@(WithCallStack _cs err') -> unless (isDoesNotExistError err') $ throwIO err
 
     listTransactionsImpl :: m [TransactionId]
@@ -448,11 +365,11 @@ parseResourceConfig ::
   MonadError DiagnosticReports m =>
   -- | Resource type name
   String ->
-  LazyByteString ->
+  ByteString ->
   m ResourceConfig
 parseResourceConfig resTyName body = do
   let resourceFile = fromString $ "(resource:" ++ resTyName ++ ")"
-  toml <- tomlResult resourceFile body . Toml.parse $ LazyByteString.toStrict body
+  toml <- tomlResult resourceFile body $ Toml.parse body
   tomlResult resourceFile body $ Toml.decode toml resourceConfigDecoder
 
 lookupResourceType ::
@@ -464,7 +381,8 @@ lookupResourceType ::
 lookupResourceType = lookupResourceTypeImpl
 
 getResourceType ::
-  MonadError DiagnosticReports m =>
+  HasCallStack =>
+  (MonadError DiagnosticReports m, MonadIO m) =>
   Store m ->
   TransactionId ->
   -- | Resource type
@@ -474,7 +392,13 @@ getResourceType store xactId resTyName = do
   mResTy <- lookupResourceType store xactId resTyName
   case mResTy of
     Just x -> pure x
-    Nothing ->
+    Nothing -> do
+      liftIO . putStrLn $
+        "error: getResourceType failed "
+          ++ maybe
+            "(location unknown)"
+            (\(_fn, loc) -> "(" ++ prettySrcLoc loc ++ ")")
+            (listToMaybe $ getCallStack callStack)
       throwError . DiagnosticSimple $
         "resource type '" ++ resTyName ++ "' does not exist"
 
@@ -546,7 +470,8 @@ saveDeferred = saveDeferredImpl
 restoreDeferred :: Store m -> TransactionId -> m ()
 restoreDeferred = restoreDeferredImpl
 
-export :: MonadError DiagnosticReports m => Store m -> TransactionId -> m LazyByteString
+export ::
+  (MonadError DiagnosticReports m, MonadIO m) => Store m -> TransactionId -> m LazyByteString
 export store xactId = do
   resourceTy <- getResourceType store xactId "resource"
   tyIds <- listResource resourceTy
@@ -555,7 +480,7 @@ export store xactId = do
     content <-
       fromMaybe (error $ renderResourceId tyId ++ " does not exist")
         <$> readResource resourceTy resName
-    pure $ Tar.fileEntry (resTy </> resName) content
+    pure $ Tar.fileEntry (resTy </> resName) (LazyByteString.fromStrict content)
 
   entries <- for tyIds $ \(ResourceId _resTyName tyName) -> do
     resTy <- getResourceType store xactId tyName
@@ -565,7 +490,7 @@ export store xactId = do
         fromMaybe (error $ renderResourceId resId ++ " does not exist")
           <$> readResource resTy resName
 
-      let contentEntry = Tar.fileEntry (resTyName </> resName) content
+      let contentEntry = Tar.fileEntry (resTyName </> resName) (LazyByteString.fromStrict content)
 
       properties <- listProperties resTy resName
       propertyEntries <- fmap catMaybes . for properties $ \propName -> do
@@ -577,7 +502,10 @@ export store xactId = do
             propValue <-
               fromMaybe (error $ renderResourceId resId ++ ":" ++ propName ++ " does not exist")
                 <$> readProperty resTy resName propName
-            pure . Just $ Tar.fileEntry (resTyName </> propertiesPart resName </> propName) propValue
+            pure . Just $
+              Tar.fileEntry
+                (resTyName </> propertiesPart resName </> propName)
+                (LazyByteString.fromStrict propValue)
 
       dependencies <- listDependencies resTy resName
       dependencyEntries <- for dependencies $ \dependency -> do
@@ -631,7 +559,7 @@ import_ store xactId archive = do
 
               -- metadata is set on resource creation
               unless (propName == "metadata") $
-                case parsePropertyValue content of
+                case parsePropertyValue $ LazyByteString.toStrict content of
                   Left err ->
                     throwError $
                       DiagnosticReports
@@ -672,13 +600,13 @@ data ResourceType m
   { resourceTypeName :: !String
   , resourceTypeConfig :: !ResourceConfig
   , doesResourceExistImpl :: !(String -> m Bool)
-  , readResourceImpl :: !(String -> m (Maybe LazyByteString))
+  , readResourceImpl :: !(String -> m (Maybe ByteString))
   , writeResourceImpl :: !(String -> LazyByteString -> m Bool)
-  , readPropertyImpl :: !(String -> String -> m (Maybe LazyByteString))
+  , readPropertyImpl :: !(String -> String -> m (Maybe ByteString))
   , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
   , listPropertiesImpl :: !(String -> m [String])
   , listResourceImpl :: !(m [ResourceId])
-  , readResourceMetadataImpl :: !(String -> m (Maybe LazyByteString))
+  , readResourceMetadataImpl :: !(String -> m (Maybe ByteString))
   , readResourceModificationTimeImpl :: !(String -> m (Maybe UTCTime))
   , listDependenciesImpl :: !(String -> m [ResourceId])
   , listDependentsImpl :: !(String -> m [ResourceId])
@@ -706,14 +634,6 @@ hoistResourceType f ResourceType{..} =
     , removeDependencyImpl = \resNameSrc dependencyTarget -> f $ removeDependencyImpl resNameSrc dependencyTarget
     }
 
-orElseM :: Monad m => [m (Maybe a)] -> m (Maybe a)
-orElseM [] = pure Nothing
-orElseM (mma : mmas) = do
-  ma <- mma
-  case ma of
-    Just{} -> pure ma
-    Nothing -> orElseM mmas
-
 resourceTypeFromDirectory ::
   forall m.
   (MonadError DiagnosticReports m, MonadCatch m, MonadIO m) =>
@@ -734,402 +654,162 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         , ..
         }
   where
-    baseResTyDir = storeDir </> resTyName
-    xactResTyDir change = getTransactionIdDir storeDir xactId </> changePart change </> resTyName
+    getOverlay resTyName' =
+      Overlay
+        { overlayCreate = getTransactionIdDir storeDir xactId </> changePart Create </> resTyName'
+        , overlayUpdate = getTransactionIdDir storeDir xactId </> changePart Update </> resTyName'
+        , overlayDelete = getTransactionIdDir storeDir xactId </> changePart Delete </> resTyName'
+        , overlayBase = storeDir </> resTyName'
+        }
 
-    orIO :: [IO Bool] -> IO Bool
-    orIO [] = pure False
-    orIO (mb : mbs) = do
-      b <- mb
-      if b then pure True else orIO mbs
-
-    andIO :: [IO Bool] -> IO Bool
-    andIO [] = pure True
-    andIO (mb : mbs) = do
-      b <- mb
-      if b then andIO mbs else pure False
-
-    resolvePath :: FilePath -> IO (Maybe FilePath)
-    resolvePath path = do
-      removed <- doesFileExist $ xactResTyDir Delete </> path
-      if removed
-        then pure Nothing
-        else
-          orElseM
-            [ tryPath $ xactResTyDir Create </> path
-            , tryPath $ xactResTyDir Update </> path
-            , tryPath $ baseResTyDir </> path
-            ]
-      where
-        tryPath path' = do
-          exists <- doesFileExist $ path'
-          if exists then pure $ Just path' else pure Nothing
+    overlay = getOverlay resTyName
 
     doesResourceExistImpl :: String -> m Bool
-    doesResourceExistImpl resName = liftIO $ isJust <$> resolvePath resName
+    doesResourceExistImpl resName = liftIO $ overlayDoesFileExist overlay resName
 
-    readResourceImpl :: String -> m (Maybe LazyByteString)
-    readResourceImpl resName =
-      liftIO $ do
-        mPath <- resolvePath resName
-        case mPath of
-          Nothing -> pure Nothing
-          Just path -> Just <$> IO.readFile path
-
-    xactWriteFile ::
-      HasCallStack =>
-      -- \| File directory, relative to store directory
-      FilePath ->
-      -- \| File name
-      String ->
-      LazyByteString ->
-      IO ()
-    xactWriteFile dir name body = do
-      let xactDir = getTransactionIdDir storeDir xactId
-      let path = dir </> name
-
-      removed <- doesFileExist $ xactDir </> changePart Delete </> path
-      dir' <-
-        if removed
-          then do
-            IO.removeFile $ xactDir </> changePart Delete </> path
-            pure $ xactDir </> changePart Update </> dir
-          else do
-            updated <- doesFileExist $ storeDir </> path
-            if updated
-              then pure $ xactDir </> changePart Update </> dir
-              else pure $ xactDir </> changePart Create </> dir
-
-      IO.createDirectoryIfMissing True dir'
-      IO.writeFile (dir' </> name) body
-
-    xactCreateDir ::
-      HasCallStack =>
-      -- \| Directory, relative to store directory
-      FilePath ->
-      IO ()
-    xactCreateDir dir = do
-      let xactDir = getTransactionIdDir storeDir xactId
-
-      inRemoved <- doesDirectoryExist $ xactDir </> changePart Delete </> dir
-      if inRemoved
-        then do
-          isEmpty <- null <$> IO.listDirectory (xactDir </> changePart Delete </> dir)
-          if isEmpty
-            then do
-              IO.removeDirectory $ xactDir </> changePart Delete </> dir
-              IO.createDirectoryIfMissing True $ xactDir </> changePart Update </> dir
-            else
-              pure ()
-        else do
-          exists <- doesDirectoryExist $ storeDir </> dir
-          if exists
-            then pure ()
-            else IO.createDirectoryIfMissing True $ xactDir </> changePart Create </> dir
+    readResourceImpl :: String -> m (Maybe ByteString)
+    readResourceImpl resName = liftIO $ overlayReadFile overlay resName
 
     writeResourceImpl :: ResourceType m -> String -> LazyByteString -> m Bool
     writeResourceImpl self resName body = do
-      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> resName
-      if removed
-        then do
-          liftIO . IO.removeFile $ xactResTyDir Delete </> resName
-          doWrite Update
-        else do
-          updated <- liftIO . doesFileExist $ baseResTyDir </> resName
-          if updated
-            then
-              doWrite Update
-            else
-              doWrite Create
+      exists <- doesResourceExist self resName
+      mOldHash <-
+        if exists
+          then do
+            mValue <- lookupProperty self resName "sha256"
+            case mValue of
+              Nothing ->
+                pure Nothing
+              Just (VString s) ->
+                pure . Just $ Text.Encoding.encodeUtf8 s
+              Just value ->
+                error $
+                  renderResourceId (ResourceId resTyName resName)
+                    ++ ":sha256 is not a string (got "
+                    ++ show value
+                    ++ ")"
+          else do
+            liftIO $ overlayCreateDir overlay (propertiesPart resName)
+            pure Nothing
+
+      let changed = mOldHash /= Just newHash
+      when changed $ do
+        liftIO $ overlayWriteFile overlay resName body
+        setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
+        metadata <- extractMetadata resTyName config resName body
+        updateMetadata resName metadata
+
+      pure changed
       where
         newHash = Base16.encode $ Sha256.hashlazy body
 
-        getOldHash = do
-          mValue <- lookupProperty self resName "sha256"
-          case mValue of
-            Nothing ->
-              pure Nothing
-            Just (VString s) ->
-              pure . Just $ Text.Encoding.encodeUtf8 s
-            Just value ->
-              error $
-                renderResourceId (ResourceId resTyName resName)
-                  ++ ":sha256 is not a string (got "
-                  ++ show value
-                  ++ ")"
-
-        doWrite change
-          | resTyName == "resource" = do
-              _config <- parseResourceConfig resName body
-
-              let
-                onChange = do
-                  liftIO $ xactWriteFile "resource" resName body
-                  setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
-                  liftIO $ xactCreateDir resName
-
-              case change of
-                Delete ->
-                  pure True
-                Create -> do
-                  onChange
-                  pure True
-                Update -> do
-                  mOldHash <- getOldHash
-                  let changed = mOldHash /= Just newHash
-                  when changed onChange
-                  pure changed
-          | otherwise = do
-              let
-                onChange = do
-                  liftIO $ IO.createDirectoryIfMissing False (xactResTyDir change)
-                  metadata <- extractMetadata resTyName config resName body
-                  updateMetadata resName metadata
-                  liftIO $ xactWriteFile resTyName resName body
-                  setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
-
-              case change of
-                Delete ->
-                  pure True
-                Create -> do
-                  onChange
-                  pure True
-                Update -> do
-                  mOldHash <- getOldHash
-                  let changed = mOldHash /= Just newHash
-                  when changed onChange
-                  pure changed
-
     updateMetadata :: String -> Metadata -> m ()
     updateMetadata resName metadata = do
-      liftIO $ do
-        xactWriteFile
-          (resTyName </> propertiesPart resName)
-          "metadata"
+      liftIO $
+        overlayWriteFile
+          overlay
+          (propertiesPart resName </> "metadata")
           (LazyByteString.fromStrict $ metadataSource metadata)
 
-    readResourceMetadataImpl :: String -> m (Maybe LazyByteString)
+    readResourceMetadataImpl :: String -> m (Maybe ByteString)
     readResourceMetadataImpl resName =
-      liftIO $ do
-        removed <- doesFileExist $ xactResTyDir Delete </> resName
-        if removed
-          then pure Nothing
-          else
-            orElseM
-              [ doRead $ xactResTyDir Create </> propertiesPart resName </> "metadata"
-              , doRead $ xactResTyDir Update </> propertiesPart resName </> "metadata"
-              , doRead $ baseResTyDir </> propertiesPart resName </> "metadata"
-              ]
-      where
-        doRead path =
-          fmap Just (IO.readFile path)
-            `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure Nothing else throwIO err
+      liftIO $
+        overlayReadFile
+          overlay
+          (propertiesPart resName </> "metadata")
 
-    readPropertyImpl :: String -> String -> m (Maybe LazyByteString)
+    readPropertyImpl :: String -> String -> m (Maybe ByteString)
     readPropertyImpl resName propName =
-      liftIO $ do
-        mPath <- resolvePath $ propertiesPart resName </> propName
-        case mPath of
-          Nothing -> pure Nothing
-          Just path -> Just <$> IO.readFile path
+      liftIO $ overlayReadFile overlay (propertiesPart resName </> propName)
 
     setPropertyImpl :: String -> String -> MetadataValue -> m ()
-    setPropertyImpl resName key value = do
-      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> propertiesPart resName </> key
-      if removed
-        then do
-          liftIO . IO.removeFile $ xactResTyDir Delete </> propertiesPart resName </> key
-          doWrite Update
-        else do
-          updated <- liftIO . doesFileExist $ baseResTyDir </> propertiesPart resName </> key
-          if updated
-            then
-              doWrite Update
-            else
-              doWrite Create
-      where
-        doWrite change = do
-          liftIO $ IO.createDirectoryIfMissing True (xactResTyDir change </> propertiesPart resName)
-          let content = renderMetadataValueToml value
-          liftIO $ xactWriteFile (resTyName </> propertiesPart resName) key content
+    setPropertyImpl resName key value =
+      liftIO $ overlayWriteFile overlay (propertiesPart resName </> key) (renderMetadataValueToml value)
 
     listPropertiesImpl :: String -> m [String]
-    listPropertiesImpl resName = do
-      removed <- liftIO . doesFileExist $ xactResTyDir Delete </> resName
-      if removed
-        then pure []
-        else liftIO $ do
-          deleted <- doList $ xactResTyDir Delete </> propertiesPart resName
-          created <- doList $ xactResTyDir Create </> propertiesPart resName
-          existing <- doList $ baseResTyDir </> propertiesPart resName
-          pure $ (existing \\ (["dependencies", "dependents"] ++ deleted)) `union` created
-      where
-        doList path =
-          IO.listDirectory path
-            `catch` \(WithCallStack _cs err) ->
-              if isDoesNotExistError err
-                then pure []
-                else throwM err
+    listPropertiesImpl resName = liftIO $ overlayListDir overlay (Just $ propertiesPart resName)
 
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
-      liftIO $ do
-        mPath <- resolvePath resName
-        case mPath of
-          Nothing -> pure Nothing
-          Just path -> Just <$> IO.getModificationTime path
+      liftIO $ overlayGetFileModificationTime overlay resName
 
     listResourceImpl :: m [ResourceId]
     listResourceImpl =
       liftIO $ do
-        created <- doList $ xactResTyDir Create
-        removed <- doList $ xactResTyDir Delete
-        current <- doList baseResTyDir
+        entries <- overlayListDir overlay Nothing
         pure $
-          fmap (ResourceId resTyName) created
-            ++ fmap (ResourceId resTyName) (current \\ removed)
-      where
-        doList path = do
-          entries <-
-            IO.listDirectory path
-              `catch` \err@(WithCallStack _cs err') -> if isDoesNotExistError err' then pure [] else throwIO err
-          fmap catMaybes . for entries $ \entry -> do
-            isFile <- doesFileExist $ path </> entry
-            if isFile then pure $ Just entry else pure Nothing
+          mapMaybe
+            ( \entry -> do
+                let (_prefix, suffix) = break (== ':') entry
+                guard $ suffix /= ":properties"
+                pure $ ResourceId resTyName entry
+            )
+            entries
 
     listDependenciesImpl :: String -> m [ResourceId]
     listDependenciesImpl resName = do
-      entries <- liftIO $ do
-        removed <- doesFileExist $ xactResTyDir Delete </> resName
-        if removed
-          then pure []
-          else
-            fromMaybe []
-              <$> orElseM
-                [ doList $ xactResTyDir Create </> propertiesPart resName </> "dependencies"
-                , doList $ xactResTyDir Update </> propertiesPart resName </> "dependencies"
-                , doList $ baseResTyDir </> propertiesPart resName </> "dependencies"
-                ]
-      pure $ fmap readResourceId entries
-      where
-        doList path =
-          fmap Just (IO.listDirectory path)
-            `catch` \(WithCallStack _cs err) -> if isDoesNotExistError err then pure Nothing else throwIO err
+      liftIO $ do
+        entries <- overlayListDir overlay . Just $ propertiesPart resName </> "dependencies"
+        pure $ fmap readResourceId entries
 
     listDependentsImpl :: String -> m [ResourceId]
     listDependentsImpl resName = do
-      entries <- liftIO $ do
-        removed <- doesFileExist $ xactResTyDir Delete </> resName
-        if removed
-          then pure []
-          else
-            fromMaybe []
-              <$> orElseM
-                [ doList $ xactResTyDir Create </> propertiesPart resName </> "dependents"
-                , doList $ xactResTyDir Update </> propertiesPart resName </> "dependents"
-                , doList $ baseResTyDir </> propertiesPart resName </> "dependents"
-                ]
-      pure $ fmap readResourceId entries
-      where
-        doList path =
-          fmap Just (IO.listDirectory path)
-            `catch` \(WithCallStack _cs err) -> if isDoesNotExistError err then pure Nothing else throwIO err
-
-    xactRemoveFile ::
-      HasCallStack =>
-      -- \| File path, relative to store directory
-      FilePath ->
-      IO ()
-    xactRemoveFile path = do
-      missing <-
-        orIO
-          [ doesFileExist $ getTransactionIdDir storeDir xactId </> changePart Delete </> path
-          , fmap not . doesFileExist $ storeDir </> path
-          ]
-      if missing
-        then pure ()
-        else do
-          created <- doesFileExist $ getTransactionIdDir storeDir xactId </> changePart Create </> path
-          if created
-            then doRemove (getTransactionIdDir storeDir xactId) (changePart Create </> path)
-            else do
-              updated <- doesFileExist $ getTransactionIdDir storeDir xactId </> changePart Update </> path
-              when updated $ doRemove (getTransactionIdDir storeDir xactId) (changePart Update </> path)
-              do
-                IO.createDirectoryIfMissing True $
-                  getTransactionIdDir storeDir xactId </> changePart Delete </> takeDirectory path
-                IO.writeFile (getTransactionIdDir storeDir xactId </> changePart Delete </> path) mempty
-      where
-        doRemove base path' = do
-          isDir <- doesDirectoryExist $ base </> path'
-          if isDir
-            then IO.removeDirectory $ base </> path'
-            else IO.removeFile $ base </> path'
-          let path'' = takeDirectory path'
-          unless (null path'') $ do
-            entries <- IO.listDirectory $ base </> path''
-            when (null entries) $ doRemove base path''
+      liftIO $ do
+        entries <- overlayListDir overlay . Just $ propertiesPart resName </> "dependents"
+        pure $ fmap readResourceId entries
 
     createDependencyImpl :: String -> ResourceId -> m ()
     createDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
 
-      srcRemoved <-
-        liftIO $
-          orIO
-            [ doesFileExist $ xactResTyDir Delete </> resNameSrc
-            , andIO
-                [ fmap not . doesFileExist $ xactResTyDir Create </> resNameSrc
-                , fmap not . doesFileExist $ baseResTyDir </> resNameSrc
-                ]
-            ]
-      if srcRemoved
-        then
+      srcExists <- liftIO $ overlayDoesFileExist overlay resNameSrc
+      if srcExists
+        then liftIO $ do
+          let dir = propertiesPart resNameSrc </> "dependencies"
+          dirExists <- overlayDoesDirectoryExist overlay dir
+          unless dirExists $ overlayCreateDir overlay dir
+          overlayWriteFile
+            overlay
+            (dir </> renderResourceId dependencyTarget)
+            mempty
+        else
           throwError . DiagnosticSimple $
             "dependency source " ++ renderResourceId dependencySource ++ " does not exist"
-        else
-          liftIO $
-            xactWriteFile
-              (resTyName </> propertiesPart resNameSrc </> "dependencies")
-              (renderResourceId dependencyTarget)
-              mempty
 
-      tgtRemoved <-
-        liftIO $
-          orIO
-            [ doesFileExist $ xactResTyDir Delete </> resNameSrc
-            , andIO
-                [ fmap not . doesFileExist $ xactResTyDir Create </> resNameSrc
-                , fmap not . doesFileExist $ baseResTyDir </> resNameSrc
-                ]
-            ]
-      if tgtRemoved
-        then
+      let tgtOverlay = getOverlay resTyNameTgt
+      tgtExists <- liftIO $ overlayDoesFileExist tgtOverlay resNameTgt
+      if tgtExists
+        then liftIO $ do
+          let dir = propertiesPart resNameTgt </> "dependents"
+          dirExists <- overlayDoesDirectoryExist tgtOverlay dir
+          unless dirExists $ overlayCreateDir tgtOverlay dir
+          overlayWriteFile
+            tgtOverlay
+            (dir </> renderResourceId dependencySource)
+            mempty
+        else
           throwError . DiagnosticSimple $
             "dependency target " ++ renderResourceId dependencyTarget ++ " does not exist"
-        else
-          liftIO $
-            xactWriteFile
-              (resTyNameTgt </> propertiesPart resNameTgt </> "dependents")
-              (renderResourceId dependencySource)
-              mempty
 
     removeDependencyImpl :: String -> ResourceId -> m ()
     removeDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
 
-      liftIO $ do
-        let dependenciesDir = resTyName </> propertiesPart resNameSrc </> "dependencies"
-        xactRemoveFile $ dependenciesDir </> renderResourceId dependencyTarget
+      liftIO $
+        overlayRemoveFile
+          overlay
+          (propertiesPart resNameSrc </> "dependencies" </> renderResourceId dependencyTarget)
 
-      liftIO $ do
-        let dependentsDir = resTyNameTgt </> propertiesPart resNameTgt </> "dependents"
-        xactRemoveFile $ dependentsDir </> renderResourceId dependencySource
+      let tgtOverlay = getOverlay resTyNameTgt
+      liftIO $
+        overlayRemoveFile
+          tgtOverlay
+          (propertiesPart resNameTgt </> "dependents" </> renderResourceId dependencySource)
 
 doesResourceExist :: ResourceType m -> String -> m Bool
 doesResourceExist = doesResourceExistImpl
 
-readResource :: ResourceType m -> String -> m (Maybe LazyByteString)
+readResource :: ResourceType m -> String -> m (Maybe ByteString)
 readResource = readResourceImpl
 
 writeResource ::
@@ -1140,7 +820,7 @@ writeResource ::
   m Bool
 writeResource = writeResourceImpl
 
-readProperty :: ResourceType m -> String -> String -> m (Maybe LazyByteString)
+readProperty :: ResourceType m -> String -> String -> m (Maybe ByteString)
 readProperty = readPropertyImpl
 
 setProperty :: ResourceType m -> String -> String -> MetadataValue -> m ()
@@ -1152,7 +832,7 @@ listProperties = listPropertiesImpl
 listResource :: ResourceType m -> m [ResourceId]
 listResource = listResourceImpl
 
-readResourceMetadata :: ResourceType m -> String -> m (Maybe LazyByteString)
+readResourceMetadata :: ResourceType m -> String -> m (Maybe ByteString)
 readResourceMetadata = readResourceMetadataImpl
 
 readResourceModificationTime :: ResourceType m -> String -> m (Maybe UTCTime)
@@ -1176,11 +856,10 @@ createDependency = createDependencyImpl
 removeDependency :: ResourceType m -> String -> ResourceId -> m ()
 removeDependency = removeDependencyImpl
 
-parsePropertyValue :: LazyByteString -> Either Toml.ParseError Toml.TomlValue
-parsePropertyValue content =
+parsePropertyValue :: ByteString -> Either Toml.ParseError Toml.TomlValue
+parsePropertyValue =
   Sage.parse
     (Toml.valueParser Toml.TopLevel <* Sage.skipMany (Sage.satisfy Char.isSpace) <* Sage.eof)
-    (LazyByteString.toStrict content)
 
 lookupProperty ::
   MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe MetadataValue)
@@ -1195,7 +874,7 @@ lookupProperty resTy resName propName = do
           throwError $
             DiagnosticReports
               (fromString $ "(" ++ renderResourceId (ResourceId (resourceTypeName resTy) resName) ++ ")")
-              content
+              (LazyByteString.fromStrict content)
               (sageErrorReport err)
 
 data Metadata
@@ -1242,7 +921,7 @@ extractMetadataMarkdown resTyName config resName body = do
   let
     metadataBlock (CodeBlock (_ident, classes, _kvs) content)
       | fromString "toml+blog-metadata" `elem` classes =
-          Just . Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict content
+          Just $ Text.Encoding.encodeUtf8 content
       | otherwise = Nothing
     metadataBlock _ = Nothing
 
@@ -1254,7 +933,6 @@ extractMetadataMarkdown resTyName config resName body = do
         resourceFile =
           fromString $
             "(" ++ renderResourceId (ResourceId resTyName resName) ++ ":metadata)"
-      let content' = LazyByteString.toStrict content
-      toml <- tomlResult resourceFile content $ Toml.parse content'
+      toml <- tomlResult resourceFile content $ Toml.parse content
       values <- tomlResult resourceFile content $ Toml.decode toml decoder
-      pure $ Metadata content' values
+      pure $ Metadata content values

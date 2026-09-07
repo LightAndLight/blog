@@ -17,6 +17,7 @@ import qualified Blog.Route as Routes
 import qualified Blog.Rules
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Control.Applicative ((<**>))
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
 import Control.Exception (evaluate)
@@ -29,6 +30,7 @@ import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
+import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import qualified Data.Char as Char
@@ -140,14 +142,14 @@ initRoutes store = do
           mContent <- Store.readResource resTy (resourceName entry)
           content <- maybe (error $ "missing " ++ renderResourceId entry) pure mContent
           Routes.RouteEntry path resId <-
-            case Sage.parse (Route.routeEntryParser <* Sage.eof) $ LazyByteString.toStrict content of
+            case Sage.parse (Route.routeEntryParser <* Sage.eof) content of
               Right x ->
                 pure x
               Left err ->
                 throwError $
                   DiagnosticReports
                     (fromString $ renderResourceId entry)
-                    content
+                    (LazyByteString.fromStrict content)
                     (sageErrorReport err)
           liftIO $ insertRoute xactId path resId routesVar
 
@@ -160,7 +162,7 @@ initRoutes store = do
 
 main :: IO ()
 main = do
-  cli <- Options.execParser $ Options.info cliParser Options.fullDesc
+  cli <- Options.execParser $ Options.info (cliParser <**> Options.helper) Options.fullDesc
 
   hSetBuffering stdout LineBuffering
 
@@ -254,14 +256,14 @@ getRouteEntry ::
 getRouteEntry resTy resId = do
   mContent <- Store.readResource resTy (resourceName resId)
   content <- maybe (error $ "missing " ++ renderResourceId resId) pure mContent
-  case Sage.parse (Route.routeEntryParser <* Sage.eof) $ LazyByteString.toStrict content of
+  case Sage.parse (Route.routeEntryParser <* Sage.eof) content of
     Right x ->
       pure x
     Left err ->
       throwError $
         DiagnosticReports
           (fromString $ renderResourceId resId)
-          content
+          (LazyByteString.fromStrict content)
           (sageErrorReport err)
 
 evalRules ::
@@ -273,18 +275,24 @@ evalRules ::
   m [Build.Change]
 evalRules store routesVar xactId resIds = do
   changes <- Build.evalRules putStrLn store xactId Blog.Rules.rules resIds
-  routeResTy <- Store.getResourceType store xactId "route"
-  for_ changes $ \(Build.Change status changedId _reasons) ->
-    case resourceType changedId of
-      "route" -> do
-        case status of
-          Build.Created -> do
-            Routes.RouteEntry path value <- getRouteEntry routeResTy changedId
-            liftIO $ insertRoute xactId path value routesVar
-          Build.Updated -> do
-            Routes.RouteEntry path value <- getRouteEntry routeResTy changedId
-            liftIO $ insertRoute xactId path value routesVar
-      _ -> pure ()
+  mRouteResTy <- Store.lookupResourceType store xactId "route"
+  -- TODO: not sure if this is a good idea
+  case mRouteResTy of
+    Nothing ->
+      liftIO . putStrLn $
+        "warning: missing 'route' resource type (rules will not result in route updates)"
+    Just routeResTy ->
+      for_ changes $ \(Build.Change status changedId _reasons) ->
+        case resourceType changedId of
+          "route" -> do
+            case status of
+              Build.Created -> do
+                Routes.RouteEntry path value <- getRouteEntry routeResTy changedId
+                liftIO $ insertRoute xactId path value routesVar
+              Build.Updated -> do
+                Routes.RouteEntry path value <- getRouteEntry routeResTy changedId
+                liftIO $ insertRoute xactId path value routesVar
+          _ -> pure ()
   pure changes
 
 app ::
@@ -387,7 +395,7 @@ httpResourceGet store routesVar request = do
     Store.readResource resTy resName
   case mBody of
     Just body ->
-      pure $ Wai.responseLBS ok200 [] body
+      pure $ Wai.responseLBS ok200 [] (LazyByteString.fromStrict body)
     Nothing ->
       throwError $
         Wai.responseLBS
@@ -725,7 +733,7 @@ httpResourceLookup store routesVar request resTyName resName = do
 
   case mBody of
     Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "resource not found")
-    Just body -> pure $ Wai.responseLBS ok200 [] body
+    Just body -> pure $ Wai.responseLBS ok200 [] (LazyByteString.fromStrict body)
 
 httpResourceMetadataLookup ::
   (MonadMask m, MonadIO m) =>
@@ -746,7 +754,7 @@ httpResourceMetadataLookup store routesVar request resTyName resName = do
 
   case mBody of
     Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "metadata not found")
-    Just body -> pure $ Wai.responseLBS ok200 [] body
+    Just body -> pure $ Wai.responseLBS ok200 [] (LazyByteString.fromStrict body)
 
 httpResourcePropertiesUpdate ::
   (MonadMask m, MonadIO m) =>
@@ -830,7 +838,7 @@ httpResourcePropertyLookup store routesVar request resTyName resName propName = 
     Nothing ->
       pure $ Wai.responseLBS notFound404 [] (fromString "property not found")
     Just body ->
-      pure $ Wai.responseLBS ok200 [] body
+      pure $ Wai.responseLBS ok200 [] (LazyByteString.fromStrict body)
 
 httpRouteGet ::
   (MonadMask m, MonadIO m) =>
@@ -856,4 +864,4 @@ httpRouteGet store routesVar request path = do
             pure $ Wai.responseLBS notFound404 [] (fromString "not found")
           Just content -> do
             let contentType = Text.Encoding.encodeUtf8 . cfgContentType $ Store.resourceTypeConfig resTy
-            pure $ Wai.responseLBS ok200 [(hContentType, contentType)] content
+            pure $ Wai.responseLBS ok200 [(hContentType, contentType)] (LazyByteString.fromStrict content)
