@@ -12,8 +12,6 @@ import Blog.Diagnostic (DiagnosticReports (..), renderDiagnosticReports)
 import Blog.Error (sageErrorReport, tomlErrorReport)
 import Blog.Metadata (metadataValueFromToml)
 import qualified Blog.Route
-import qualified Blog.Route as Route
-import qualified Blog.Route as Routes
 import qualified Blog.Rules
 import Blog.Store (Store)
 import qualified Blog.Store as Store
@@ -108,7 +106,7 @@ readActiveRoutes :: Routes -> IO (Blog.Route.Routes ResourceId)
 readActiveRoutes = readTVarIO . routesActive
 
 beginRoutes :: Routes -> Store.TransactionId -> IO ()
-beginRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.insert xactId Routes.empty)
+beginRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.insert xactId Blog.Route.empty)
 
 commitRoutes :: Routes -> Store.TransactionId -> IO ()
 commitRoutes routes xactId = atomically $ do
@@ -125,11 +123,11 @@ rollbackRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (M
 insertRoute :: Store.TransactionId -> [Text] -> ResourceId -> Routes -> IO ()
 insertRoute xactId path value routes =
   atomically $
-    modifyTVar (routesPending routes) (Map.insertWith (<>) xactId (Routes.singleton path value))
+    modifyTVar (routesPending routes) (Map.insertWith (<>) xactId (Blog.Route.singleton path value))
 
 initRoutes :: Store (ExceptT DiagnosticReports IO) -> IO Routes
 initRoutes store = do
-  routesVar <- atomically $ Routes <$> newTVar Routes.empty <*> newTVar mempty
+  routesVar <- atomically $ Routes <$> newTVar Blog.Route.empty <*> newTVar mempty
 
   result <- runExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
     mResTy <- Store.lookupResourceType store xactId "route"
@@ -141,8 +139,8 @@ initRoutes store = do
         for_ entries $ \entry -> do
           mContent <- Store.readResource resTy (resourceName entry)
           content <- maybe (error $ "missing " ++ renderResourceId entry) pure mContent
-          Routes.RouteEntry path resId <-
-            case Sage.parse (Route.routeEntryParser <* Sage.eof) content of
+          Blog.Route.RouteEntry path resId <-
+            case Sage.parse (Blog.Route.routeEntryParser <* Sage.eof) content of
               Right x ->
                 pure x
               Left err ->
@@ -256,7 +254,7 @@ getRouteEntry ::
 getRouteEntry resTy resId = do
   mContent <- Store.readResource resTy (resourceName resId)
   content <- maybe (error $ "missing " ++ renderResourceId resId) pure mContent
-  case Sage.parse (Route.routeEntryParser <* Sage.eof) content of
+  case Sage.parse (Blog.Route.routeEntryParser <* Sage.eof) content of
     Right x ->
       pure x
     Left err ->
@@ -287,10 +285,10 @@ evalRules store routesVar xactId resIds = do
           "route" -> do
             case status of
               Build.Created -> do
-                Routes.RouteEntry path value <- getRouteEntry routeResTy changedId
+                Blog.Route.RouteEntry path value <- getRouteEntry routeResTy changedId
                 liftIO $ insertRoute xactId path value routesVar
               Build.Updated -> do
-                Routes.RouteEntry path value <- getRouteEntry routeResTy changedId
+                Blog.Route.RouteEntry path value <- getRouteEntry routeResTy changedId
                 liftIO $ insertRoute xactId path value routesVar
           _ -> pure ()
   pure changes
@@ -864,7 +862,7 @@ httpRouteGet store routesVar request path = do
 
   handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
     routes <- liftIO $ readActiveRoutes routesVar
-    case Routes.lookup path routes of
+    case Blog.Route.lookup path routes of
       Nothing ->
         pure $ Wai.responseLBS notFound404 [] (fromString "not found")
       Just resId -> do
