@@ -76,6 +76,7 @@ import Control.Monad.State.Strict (StateT, evalStateT, modify)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Writer.CPS (WriterT, execWriterT, runWriterT)
 import Control.Monad.Writer.Class (tell)
+import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import Data.Foldable (foldlM, for_, traverse_)
 import Data.Graph (graphFromEdges, topSort)
@@ -90,7 +91,6 @@ import Data.String (fromString)
 import Data.Text (Text)
 import Data.Traversable (for)
 import Prelude hiding (any)
-import Data.ByteString (ByteString)
 
 newtype Rules m = Rules [Rule m]
   deriving (Semigroup, Monoid)
@@ -142,7 +142,7 @@ data ActionEnv m
 data ActionSummary
   = ActionSummary
   { asPending :: ![ResourceId]
-  , asChanges :: ![Change]
+  , asChanges :: !(Map ResourceId Change)
   }
 
 instance Semigroup ActionSummary where
@@ -160,7 +160,7 @@ runActionT ::
   -- | Why the action was triggered
   [Reason] ->
   ActionT m a ->
-  m ([ResourceId], [Change], a)
+  m ([ResourceId], Map ResourceId Change, a)
 runActionT fTrace store transactionId reasons (ActionT ma) = do
   let env =
         ActionEnv
@@ -218,7 +218,7 @@ putResource resId@(ResourceId resTyName resName) content = do
   changed <- Store.writeResource resTy resName content
   when changed $ do
     let status = if existed then Updated else Created
-    let changes = [Change status resId reasons]
+    let changes = Map.singleton resId (Change status reasons)
     ActionT $ tell mempty{asChanges = changes, asPending = [resId]}
 
 setProperty :: MonadIO m => ResourceId -> String -> MetadataValue -> ActionT m ()
@@ -233,7 +233,7 @@ setProperty resId@(ResourceId resTyName resName) key value = do
   if exists
     then do
       Store.setProperty resTy resName key value
-      let changes = [Change Updated resId reasons]
+      let changes = Map.singleton resId (Change Updated reasons)
       ActionT $ tell mempty{asChanges = changes}
     else do
       throwError . DiagnosticSimple $
@@ -762,8 +762,6 @@ data Change
   = Change
       -- | What happened
       !Status
-      -- | Target resource
-      !ResourceId
       -- | Why the change occurred
       ![Reason]
   deriving (Show)
@@ -776,8 +774,8 @@ data Status
 data Reason = Reason !Status !ResourceId
   deriving (Show, Eq)
 
-renderChange :: Change -> String
-renderChange (Change status resId reasons) =
+renderChange :: ResourceId -> Change -> String
+renderChange resId (Change status reasons) =
   renderStatus status
     ++ " "
     ++ renderResourceId resId
@@ -831,7 +829,7 @@ evalRules ::
   Rules m ->
   -- | The created/updated resources
   [ResourceId] ->
-  m [Change]
+  m (Map ResourceId Change)
 evalRules fTrace store transactionId (Rules rs) resIds = do
   execWriterT . flip evalStateT (Set.fromList resIds) $ do
     dependents <- lift . lift . for resIds $ \resId -> do
@@ -856,7 +854,7 @@ evalRules fTrace store transactionId (Rules rs) resIds = do
 
     vertices = topSort graph
 
-    go :: StateT (Set ResourceId) (WriterT [Change] m) ()
+    go :: StateT (Set ResourceId) (WriterT (Map ResourceId Change) m) ()
     go = for_ vertices $ \vertex -> do
       let (r, _, _) = fromVertex vertex
       changedResources <- get

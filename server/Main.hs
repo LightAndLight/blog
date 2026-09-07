@@ -272,7 +272,7 @@ evalRules ::
   Routes ->
   Store.TransactionId ->
   [ResourceId] ->
-  m [Build.Change]
+  m (Map ResourceId Build.Change)
 evalRules store routesVar xactId resIds = do
   changes <- Build.evalRules putStrLn store xactId Blog.Rules.rules resIds
   mRouteResTy <- Store.lookupResourceType store xactId "route"
@@ -282,7 +282,7 @@ evalRules store routesVar xactId resIds = do
       liftIO . putStrLn $
         "warning: missing 'route' resource type (rules will not result in route updates)"
     Just routeResTy ->
-      for_ changes $ \(Build.Change status changedId _reasons) ->
+      for_ (Map.toList changes) $ \(changedId, Build.Change status _reasons) ->
         case resourceType changedId of
           "route" -> do
             case status of
@@ -403,6 +403,12 @@ httpResourceGet store routesVar request = do
           []
           (fromString $ "resource " ++ Text.unpack resTyName ++ ":" ++ resName ++ " does not exist")
 
+renderChangeList :: Map ResourceId Build.Change -> [LazyByteString]
+renderChangeList changes =
+  fmap
+    (\(changedId, change) -> fromString "* " <> fromString (Build.renderChange changedId change))
+    (Map.toList changes)
+
 httpResourceCreate ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
@@ -445,7 +451,7 @@ httpResourceCreate store routesVar request = do
                 []
                 ( ByteString.Lazy.Char8.unlines $
                     fromString ("created " ++ resTyName ++ ":" ++ resName)
-                      : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                      : renderChangeList changes
                 )
 
 httpResourceUpdate ::
@@ -513,7 +519,7 @@ httpResourceUpdate store routesVar request = do
                               ++ renderResourceId (ResourceId resTyName resName)
                               ++ if changed then "" else " (nothing changed)"
                           )
-                          : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                          : renderChangeList changes
                     )
           else
             pure . Wai.responseLBS preconditionFailed412 [] . fromString $
@@ -573,7 +579,7 @@ httpResourceTypeRefresh store routesVar request resTyName = do
             ( ByteString.Lazy.Char8.unlines $
                 fromString
                   ("refreshed " ++ Text.unpack resTyName ++ ":*" ++ if defer then " (ignoring defer)" else "")
-                  : fmap ((fromString "* " <>) . fromString . Build.renderChange) changes
+                  : renderChangeList changes
             )
 
 httpTransactionList :: Monad m => Store (ExceptT DiagnosticReports m) -> HandlerT m Wai.Response
@@ -624,10 +630,11 @@ httpTransactionCommit store routesVar request = do
           Store.saveDeferred store xactId
           evalRules store routesVar xactId resIds `onException` Store.restoreDeferred store xactId
         commit
-        pure . Wai.responseLBS ok200 [] $
-          fromString "resource changes:\n"
-            <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
-            <> fromString ("\ncommitted " ++ Store.renderTransactionId xactId)
+        pure . Wai.responseLBS ok200 [] . ByteString.Lazy.Char8.unlines $
+          fromString "resource changes:"
+            : ( renderChangeList changes
+                  ++ [mempty, fromString ("committed " ++ Store.renderTransactionId xactId)]
+              )
       else do
         commit
         pure . Wai.responseLBS ok200 [] . fromString $ "committed " ++ Store.renderTransactionId xactId
@@ -703,13 +710,15 @@ httpImport store routesVar request = do
 
         let
           response =
-            fromString "imported resources:\n"
-              <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
-              <> if null changes
-                then mempty
-                else
-                  fromString ("\nresource changes:\n")
-                    <> foldMap ((fromString "* " <>) . (<> fromString "\n") . fromString . Build.renderChange) changes
+            ByteString.Lazy.Char8.unlines $
+              fromString "imported resources:"
+                : ( fmap (\resId -> fromString $ "* " <> renderResourceId resId) imported
+                      <> if null changes
+                        then []
+                        else
+                          [mempty, fromString ("resource changes:")]
+                            <> renderChangeList changes
+                  )
 
         pure $ Wai.responseLBS ok200 [] response
 
@@ -805,13 +814,15 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName = do
 
         let
           response =
-            fromString "updated properties:\n"
-              <> foldMap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
-              <> if null changes
-                then mempty
-                else
-                  fromString ("\nresource changes:\n")
-                    <> foldMap ((fromString "* " <>) . fromString . Build.renderChange) changes
+            ByteString.Lazy.Char8.unlines $
+              fromString "updated properties:"
+                : ( fmap (\propName -> fromString $ "* " <> Text.unpack propName <> "\n") names
+                      ++ if null changes
+                        then []
+                        else
+                          [mempty, fromString ("resource changes:")]
+                            ++ renderChangeList changes
+                  )
 
         pure $ Wai.responseLBS ok200 [] response
 
