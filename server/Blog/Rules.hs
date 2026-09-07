@@ -370,7 +370,7 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
       inputs' <- Store.listResource resTy
       for inputs' $ \input -> do
         metadata <- do
-          mMetadata <- Store.readResourceMetadata resTy $ resourceName input
+          mMetadata <- Store.readProperty resTy (resourceName input) "metadata"
           case mMetadata of
             Nothing ->
               throwError . DiagnosticSimple $ renderResourceId input ++ " has no metadata"
@@ -699,7 +699,7 @@ metadataPropertyTypeProvider =
   PropertyTypeProvider $ \resTy resName propName -> do
     -- TODO: this will parse out metadata for every property. It should be parsed only once.
     metadata <- do
-      mMetadata <- Store.readResourceMetadata resTy $ Text.unpack resName
+      mMetadata <- Store.readProperty resTy (Text.unpack resName) "metadata"
       case mMetadata of
         Nothing ->
           pure mempty
@@ -1239,7 +1239,7 @@ loadMetadata input = do
   let resId = Build.resourceInputId input
   let resTy = Build.resourceInputType input
   let resName = resourceName resId
-  mContent <- Store.readResourceMetadata resTy resName
+  mContent <- Store.readProperty resTy resName "metadata"
   content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
   parseResourceMetadata
     (Store.resourceTypeConfig resTy)
@@ -1283,7 +1283,7 @@ getAdjacency iAdjacency = do
       xactId <- Build.askTransactionId
 
       resTy <- Store.getResourceType store xactId resTyName
-      mContent <- Store.readResourceMetadata resTy resName
+      mContent <- Store.readProperty resTy resName "metadata"
       content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
       metadata <-
         parseResourceMetadata

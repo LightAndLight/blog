@@ -757,7 +757,7 @@ httpResourceMetadataLookup store routesVar request resTyName resName = do
 
   mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
     resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
-    Store.readResourceMetadata resTy (Text.unpack resName)
+    Store.readProperty resTy (Text.unpack resName) "metadata"
 
   case mBody of
     Nothing -> throwError $ Wai.responseLBS notFound404 [] (fromString "metadata not found")

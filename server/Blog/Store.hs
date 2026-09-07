@@ -50,7 +50,6 @@ module Blog.Store
   , setProperty
   , readProperty
   , listResource
-  , readResourceMetadata
   , readResourceModificationTime
   , listDependencies
   , listDependents
@@ -604,7 +603,6 @@ data ResourceType m
   , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
   , listPropertiesImpl :: !(String -> m [String])
   , listResourceImpl :: !(m [ResourceId])
-  , readResourceMetadataImpl :: !(String -> m (Maybe ByteString))
   , readResourceModificationTimeImpl :: !(String -> m (Maybe UTCTime))
   , listDependenciesImpl :: !(String -> m [ResourceId])
   , listDependentsImpl :: !(String -> m [ResourceId])
@@ -624,7 +622,6 @@ hoistResourceType f ResourceType{..} =
     , setPropertyImpl = \resName key value -> f $ setPropertyImpl resName key value
     , listPropertiesImpl = f . listPropertiesImpl
     , listResourceImpl = f listResourceImpl
-    , readResourceMetadataImpl = f . readResourceMetadataImpl
     , readResourceModificationTimeImpl = f . readResourceModificationTimeImpl
     , listDependenciesImpl = f . listDependenciesImpl
     , listDependentsImpl = f . listDependentsImpl
@@ -708,13 +705,6 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           overlay
           (propertiesPart resName </> "metadata")
           (LazyByteString.fromStrict metadata)
-
-    readResourceMetadataImpl :: String -> m (Maybe ByteString)
-    readResourceMetadataImpl resName =
-      liftIO $
-        overlayReadFile
-          overlay
-          (propertiesPart resName </> "metadata")
 
     readPropertyImpl :: String -> String -> m (Maybe ByteString)
     readPropertyImpl resName propName =
@@ -829,9 +819,6 @@ listProperties = listPropertiesImpl
 
 listResource :: ResourceType m -> m [ResourceId]
 listResource = listResourceImpl
-
-readResourceMetadata :: ResourceType m -> String -> m (Maybe ByteString)
-readResourceMetadata = readResourceMetadataImpl
 
 readResourceModificationTime :: ResourceType m -> String -> m (Maybe UTCTime)
 readResourceModificationTime = readResourceModificationTimeImpl

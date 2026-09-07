@@ -523,7 +523,7 @@ makeResource resTy resName = do
       pure Nothing
     Just content -> do
       metadata <- do
-        mMetadataContent <- Store.readResourceMetadata resTy resName
+        mMetadataContent <- Store.readProperty resTy resName "metadata"
         maybe
           (pure mempty)
           (parseResourceMetadata (Store.resourceTypeConfig resTy) resTyName resName)
