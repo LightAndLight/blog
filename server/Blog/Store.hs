@@ -83,7 +83,7 @@ import Blog.Store.Overlay
   , overlayCreateDir
   , overlayDoesDirectoryExist
   , overlayDoesFileExist
-  , overlayGetFileModificationTime
+  , overlayGetModificationTime
   , overlayListDir
   , overlayReadFile
   , overlayRemoveFile
@@ -731,7 +731,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
 
     readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
-      liftIO $ overlayGetFileModificationTime overlay resName
+      liftIO $ overlayGetModificationTime overlay resName
 
     listResourceImpl :: m [ResourceId]
     listResourceImpl =

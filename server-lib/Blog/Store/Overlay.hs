@@ -2,7 +2,7 @@ module Blog.Store.Overlay
   ( Overlay (..)
   , overlayReadFile
   , overlayDoesFileExist
-  , overlayGetFileModificationTime
+  , overlayGetModificationTime
   , overlayWriteFile
   , overlayRemoveFile
   , overlayListDir
@@ -161,33 +161,17 @@ listRecursive base =
 
 overlayDoesFileExist :: Overlay -> FilePath -> IO Bool
 overlayDoesFileExist overlay path = do
-  created <- doesFileExist $ overlayCreate overlay </> path
-  if created
-    then pure True
-    else do
-      deleted <- overlayDeleted overlay path
-      if deleted
-        then pure False
-        else doesFileExist $ overlayBase overlay </> path
+  mPath <- overlayResolve overlay path
+  case mPath of
+    Nothing -> pure False
+    Just path' -> doesFileExist path'
 
-overlayGetFileModificationTime :: Overlay -> FilePath -> IO (Maybe UTCTime)
-overlayGetFileModificationTime overlay path = do
-  created <- doesFileExist $ overlayCreate overlay </> path
-  if created
-    then Just <$> IO.getModificationTime (overlayCreate overlay </> path)
-    else do
-      deleted <- overlayDeleted overlay path
-      if deleted
-        then pure Nothing
-        else do
-          updated <- doesFileExist $ overlayUpdate overlay </> path
-          if updated
-            then Just <$> IO.getModificationTime (overlayUpdate overlay </> path)
-            else do
-              exists <- doesFileExist $ overlayBase overlay </> path
-              if exists
-                then Just <$> IO.getModificationTime (overlayBase overlay </> path)
-                else pure Nothing
+overlayGetModificationTime :: Overlay -> FilePath -> IO (Maybe UTCTime)
+overlayGetModificationTime overlay path = do
+  mPath <- overlayResolve overlay path
+  case mPath of
+    Nothing -> pure Nothing
+    Just path' -> Just <$> IO.getModificationTime path'
 
 overlayReadFile ::
   HasCallStack =>
