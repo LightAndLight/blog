@@ -317,19 +317,39 @@ app store routesVar request respond = do
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "POST" -> httpLogin store routesVar request
               _ -> methodNotAllowed
-      [part]
-        | part == fromString ".resource" ->
+      part : parts | part == fromString ".resource" ->
+        case parts of
+          [] ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "GET" -> httpResourceGet store routesVar request
               "POST" -> httpResourceCreate store routesVar request
               "PUT" -> httpResourceUpdate store routesVar request
               _ -> methodNotAllowed
-      [part, resTyName]
-        | part == fromString ".resource" ->
+          [resTyName] ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "GET" -> httpResourceTypeList store routesVar request resTyName
               "REFRESH" -> httpResourceTypeRefresh store routesVar request resTyName
               _ -> methodNotAllowed
+          [resTyName, resName] ->
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "GET" -> httpResourceLookup store routesVar request resTyName resName
+              _ -> methodNotAllowed
+          [resTyName, resName, part']
+            | part' == fromString "metadata" ->
+                case ByteString.Char8.unpack $ Wai.requestMethod request of
+                  "GET" -> httpResourceMetadataLookup store routesVar request resTyName resName
+                  _ -> methodNotAllowed
+            | part' == fromString "property" -> do
+                case ByteString.Char8.unpack $ Wai.requestMethod request of
+                  "PATCH" -> httpResourcePropertiesUpdate store routesVar request resTyName resName
+                  _ -> methodNotAllowed
+          [resTyName, resName, part', propName]
+            | part' == fromString "property" -> do
+                case ByteString.Char8.unpack $ Wai.requestMethod request of
+                  "GET" -> httpResourcePropertyLookup store routesVar request resTyName resName propName
+                  _ -> methodNotAllowed
+          _ ->
+            throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part]
         | part == fromString ".transaction" ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
@@ -360,28 +380,6 @@ app store routesVar request respond = do
         | part == fromString ".import" ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "PUT" -> httpImport store routesVar request
-              _ -> methodNotAllowed
-      [part, resTyName, resName]
-        | part == fromString ".resource" ->
-            case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "GET" -> httpResourceLookup store routesVar request resTyName resName
-              _ -> methodNotAllowed
-      [part, resTyName, resName, part']
-        | part == fromString ".resource"
-        , part' == fromString "metadata" ->
-            case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "GET" -> httpResourceMetadataLookup store routesVar request resTyName resName
-              _ -> methodNotAllowed
-        | part == fromString ".resource"
-        , part' == fromString "property" -> do
-            case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "PATCH" -> httpResourcePropertiesUpdate store routesVar request resTyName resName
-              _ -> methodNotAllowed
-      [part, resTyName, resName, part', propName]
-        | part == fromString ".resource"
-        , part' == fromString "property" -> do
-            case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "GET" -> httpResourcePropertyLookup store routesVar request resTyName resName propName
               _ -> methodNotAllowed
       path -> do
         case ByteString.Char8.unpack $ Wai.requestMethod request of
