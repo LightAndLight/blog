@@ -46,6 +46,7 @@ module Blog.Store
   , doesResourceExist
   , readResource
   , writeResource
+  , removeResource
   , lookupProperty
   , setProperty
   , readProperty
@@ -85,6 +86,7 @@ import Blog.Store.Overlay
   , overlayGetModificationTime
   , overlayListDir
   , overlayReadFile
+  , overlayRemoveDir
   , overlayRemoveFile
   , overlayWriteFile
   )
@@ -103,6 +105,7 @@ import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
+import Data.List (intercalate)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Monoid (First (..))
 import qualified Data.Set as Set
@@ -599,6 +602,7 @@ data ResourceType m
   , doesResourceExistImpl :: !(String -> m Bool)
   , readResourceImpl :: !(String -> m (Maybe ByteString))
   , writeResourceImpl :: !(String -> LazyByteString -> m Bool)
+  , removeResourceImpl :: !(String -> m ())
   , readPropertyImpl :: !(String -> String -> m (Maybe ByteString))
   , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
   , listPropertiesImpl :: !(String -> m [String])
@@ -618,6 +622,7 @@ hoistResourceType f ResourceType{..} =
     , doesResourceExistImpl = f . doesResourceExistImpl
     , readResourceImpl = f . readResourceImpl
     , writeResourceImpl = \resName content -> f $ writeResourceImpl resName content
+    , removeResourceImpl = \resName -> f $ removeResourceImpl resName
     , readPropertyImpl = \resName propName -> f $ readPropertyImpl resName propName
     , setPropertyImpl = \resName key value -> f $ setPropertyImpl resName key value
     , listPropertiesImpl = f . listPropertiesImpl
@@ -646,6 +651,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         { resourceTypeName = resTyName
         , resourceTypeConfig = config
         , writeResourceImpl = writeResourceImpl self
+        , removeResourceImpl = removeResourceImpl self
         , ..
         }
   where
@@ -705,6 +711,25 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           overlay
           (propertiesPart resName </> "metadata")
           (LazyByteString.fromStrict metadata)
+
+    removeResourceImpl :: ResourceType m -> String -> m ()
+    removeResourceImpl self resName = do
+      exists <- doesResourceExist self resName
+      if exists
+        then do
+          dependents <- listDependents self resName
+          unless (null dependents) $
+            throwError . DiagnosticSimple $
+              "resource "
+                ++ renderResourceId (ResourceId resTyName resName)
+                ++ " still has dependents: "
+                ++ intercalate ", " (fmap renderResourceId dependents)
+          liftIO $ do
+            overlayRemoveFile overlay resName
+            overlayRemoveDir overlay (propertiesPart resName)
+        else
+          throwError . DiagnosticSimple $
+            "resource " ++ renderResourceId (ResourceId resTyName resName) ++ " does not exist"
 
     readPropertyImpl :: String -> String -> m (Maybe ByteString)
     readPropertyImpl resName propName =
@@ -807,6 +832,12 @@ writeResource ::
   -- | The resource's contents changed
   m Bool
 writeResource = writeResourceImpl
+
+removeResource ::
+  ResourceType m ->
+  String ->
+  m ()
+removeResource = removeResourceImpl
 
 readProperty :: ResourceType m -> String -> String -> m (Maybe ByteString)
 readProperty = readPropertyImpl
