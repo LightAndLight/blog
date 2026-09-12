@@ -17,6 +17,7 @@ library
         Blog
         Blog.ID
         Blog.Password
+        Blog.Session
     build-depends:
         argon2,
         base ^>=4.20.2.0,
