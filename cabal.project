@@ -5,6 +5,11 @@ tests: True
 
 source-repository-package
   type: git
+  location: https://github.com/LightAndLight/argon2.git
+  tag: d66e37f1eb3ed10e4df91f9129ab7cbde883c068
+
+source-repository-package
+  type: git
   location: https://github.com/LightAndLight/diagnostica.git
   tag: ae00004b101bde236abedba7ce480d289707356d
 

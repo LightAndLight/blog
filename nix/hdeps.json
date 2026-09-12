@@ -1,4 +1,10 @@
 {
+  "argon2": {
+    "type": "github",
+    "owner": "LightAndLight",
+    "repository": "argon2",
+    "commit": "d66e37f1eb3ed10e4df91f9129ab7cbde883c068"
+  },
   "diagnostica": {
     "type": "github",
     "owner": "LightAndLight",
