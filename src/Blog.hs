@@ -152,7 +152,7 @@ data MetadataValue
   | VList ![MetadataValue]
   | VConstructor !Text ![MetadataValue]
   | VRecord ![(Text, MetadataValue)]
-  deriving (Show)
+  deriving (Show, Eq)
 
 metadataValueString :: HasCallStack => MetadataValue -> Text
 metadataValueString (VString s) = s
