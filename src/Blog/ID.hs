@@ -3,9 +3,11 @@
 -- | <https://www.rfc-editor.org/info/rfc9562/#section-5.4>
 module Blog.ID
   ( ID
+  , generate
   , toString
   , fromString
-  , generate
+  , toBytes
+  , fromBytes
   )
 where
 
@@ -25,11 +27,8 @@ instance Show ID where
     where
       app_prec = 10
 
-toString :: ID -> String
-toString (ID a b) =
-  foldMap
-    (\byte -> showHex (byte `shiftR` 4) "" ++ showHex (byte .&. 0xF) "")
-    [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15]
+toBytes :: ID -> [Word8]
+toBytes (ID a b) = [b0, b1, b2, b3, b4, b5, b6, b7, b8, b9, b10, b11, b12, b13, b14, b15]
   where
     from word ix =
       fromIntegral (word `shiftR` (8 * ix)) :: Word8
@@ -51,6 +50,12 @@ toString (ID a b) =
     b13 = from b 2
     b14 = from b 1
     b15 = from b 0
+
+toString :: ID -> String
+toString x =
+  foldMap
+    (\byte -> showHex (byte `shiftR` 4) "" ++ showHex (byte .&. 0xF) "")
+    (toBytes x)
 
 fromBytes :: [Word8] -> Maybe ID
 fromBytes bytes = do
