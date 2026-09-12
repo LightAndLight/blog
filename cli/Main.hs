@@ -1,49 +1,68 @@
 module Main (main) where
 
 import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
+import qualified Blog.ID as ID
+import Blog.Password (hashPassword)
+import Blog.Session (sessionIdCookieName)
 import Control.Applicative (many, optional, (<**>), (<|>))
-import Control.Exception (catch, finally, throwIO)
+import Control.Exception (bracket, catch, finally, throwIO)
 import Control.Monad (unless, void, when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (for_)
+import Data.List (find)
 import Data.Maybe (isNothing)
 import Data.String (fromString)
 import Data.Text (Text)
+import qualified Data.Text.IO as Text
 import qualified Data.Text.Lazy.Builder as Text.Lazy.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Format (defaultTimeLocale, formatTime, rfc822DateFormat)
+import Data.Time.Format.ISO8601 (iso8601Show)
 import Data.X509.CertificateStore (CertificateStore, readCertificateStore)
 import GHC.Stack (HasCallStack)
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Http
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import qualified Network.HTTP.Client.TLS as Http.Tls
-import Network.HTTP.Types.Header (RequestHeaders, ResponseHeaders, hIfUnmodifiedSince)
+import Network.HTTP.Types.Header (RequestHeaders, ResponseHeaders, hContentType, hIfUnmodifiedSince)
 import Network.HTTP.Types.Status (statusCode)
 import qualified Network.TLS as Tls
 import Network.TLS.Extra.Cipher (ciphersuite_default)
 import qualified Options.Applicative as Options
 import System.Directory
   ( createDirectoryIfMissing
+  , doesDirectoryExist
   , doesFileExist
   , getModificationTime
   , listDirectory
+  , removeDirectoryRecursive
   , removeFile
   )
 import System.Environment (lookupEnv)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
+import System.IO (hFlush, stdout)
 import System.IO.Error (isDoesNotExistError)
+import System.Posix.IO (OpenMode (..), closeFd, defaultFileFlags, openFd)
+import System.Posix.Terminal
+  ( TerminalMode (..)
+  , TerminalState (..)
+  , getTerminalAttributes
+  , setTerminalAttributes
+  , withoutMode
+  )
 import System.Process (callProcess)
 import qualified Text.Diagnostic as Diagnostic
 import qualified Text.Diagnostic.Sage
 import qualified Text.Sage as Sage
 import qualified Toml
+import Web.FormUrlEncoded (urlEncodeAsFormStable)
 
 data Cli
   = Cli
@@ -60,7 +79,8 @@ data ViewTarget
   | ViewContent
 
 data Command
-  = Begin
+  = Login
+  | Begin
       -- | Defer rules until commit
       Bool
   | Commit
@@ -123,7 +143,8 @@ cliParser =
           Options.long "cacert" <> Options.metavar "FILE" <> Options.help "TLS CA certificate"
       )
     <*> Options.hsubparser
-      ( Options.command "begin" (Options.info beginParser $ Options.progDesc "Begin a transaction")
+      ( Options.command "login" (Options.info loginParser $ Options.progDesc "Authenticate with the server")
+          <> Options.command "begin" (Options.info beginParser $ Options.progDesc "Begin a transaction")
           <> Options.command "commit" (Options.info commitParser $ Options.progDesc "Commit a transaction")
           <> Options.command
             "rollback"
@@ -149,6 +170,9 @@ cliParser =
             (Options.info importParser $ Options.progDesc "Import an archive")
       )
   where
+    loginParser =
+      pure Login
+
     beginParser =
       Begin
         <$> Options.switch (Options.long "defer" <> Options.help "Defer rules until commit")
@@ -309,6 +333,8 @@ main = do
   let baseUrl = cliBaseUrl cli
   manager <- httpManager mCertificateStore
   case cliCommand cli of
+    Login ->
+      login baseUrl manager
     Begin defer ->
       begin baseUrl manager defer
     Commit xactId ->
@@ -386,23 +412,39 @@ http ::
   RequestHeaders ->
   LazyByteString ->
   IO (ResponseHeaders, Response LazyByteString)
-http manager url method headers body = do
+http manager baseUrl method headers body = do
+  (_cookies, responseHeaders, response) <- httpWithCookies manager mempty baseUrl method headers body
+  pure (responseHeaders, response)
+
+httpWithCookies ::
+  Http.Manager ->
+  [Http.Cookie] ->
+  -- | URL
+  String ->
+  -- | Method
+  ByteString ->
+  RequestHeaders ->
+  LazyByteString ->
+  IO ([Http.Cookie], ResponseHeaders, Response LazyByteString)
+httpWithCookies manager cookies url method headers body = do
   request <- do
     request <- Http.parseRequest url
     pure
       request
-        { Http.method = method
+        { Http.cookieJar = Just $ Http.createCookieJar cookies
+        , Http.method = method
         , Http.requestHeaders = headers
         , Http.requestBody = Http.RequestBodyLBS body
         }
   response <- Http.httpLbs request manager
   let body' = Http.responseBody response
+  let cookies' = Http.destroyCookieJar $ Http.responseCookieJar response
   case statusCode $ Http.responseStatus response of
-    404 -> pure (Http.responseHeaders response, NotFound body')
-    409 -> pure (Http.responseHeaders response, Conflict)
-    412 -> pure (Http.responseHeaders response, PreconditionFailed)
-    200 -> pure (Http.responseHeaders response, Ok body')
-    201 -> pure (Http.responseHeaders response, Created body')
+    404 -> pure (cookies', Http.responseHeaders response, NotFound body')
+    409 -> pure (cookies', Http.responseHeaders response, Conflict)
+    412 -> pure (cookies', Http.responseHeaders response, PreconditionFailed)
+    200 -> pure (cookies', Http.responseHeaders response, Ok body')
+    201 -> pure (cookies', Http.responseHeaders response, Created body')
     _status -> do
       putStrLn $ ByteString.Lazy.Char8.unpack body'
       exitFailure
@@ -423,6 +465,16 @@ httpPost ::
   LazyByteString ->
   IO (ResponseHeaders, Response LazyByteString)
 httpPost manager url = http manager url (fromString "POST")
+
+httpPostWithCookies ::
+  Http.Manager ->
+  [Http.Cookie] ->
+  -- | URL
+  String ->
+  RequestHeaders ->
+  LazyByteString ->
+  IO ([Http.Cookie], ResponseHeaders, Response LazyByteString)
+httpPostWithCookies manager cookies url = httpWithCookies manager cookies url (fromString "POST")
 
 httpPut ::
   Http.Manager ->
@@ -468,11 +520,14 @@ getPager = requireEnv "PAGER"
 getDataHome :: IO FilePath
 getDataHome = do
   mDataHome <- lookupEnv "XDG_DATA_HOME"
-  case mDataHome of
-    Just dataHome -> pure dataHome
-    Nothing -> do
-      home <- requireEnv "HOME"
-      pure $ home </> ".local" </> "share"
+  dir <-
+    case mDataHome of
+      Just dataHome ->
+        pure dataHome
+      Nothing -> do
+        home <- requireEnv "HOME"
+        pure $ home </> ".local" </> "share"
+  pure $ dir </> "blog"
 
 resourceIdHeaders :: ResourceId -> RequestHeaders
 resourceIdHeaders resourceId =
@@ -487,6 +542,52 @@ transactionIdHeaders :: ByteString -> RequestHeaders
 transactionIdHeaders xactId =
   [ (fromString "X-Blog-TransactionId", xactId)
   ]
+
+requestInput ::
+  -- | Prompt
+  String ->
+  IO String
+requestInput prompt = putStr prompt *> hFlush stdout *> getLine
+
+requestInputSensitive ::
+  -- | Prompt
+  String ->
+  IO String
+requestInputSensitive prompt =
+  bracket (openFd "/dev/tty" ReadWrite defaultFileFlags) closeFd $ \tty -> do
+    attrs <- getTerminalAttributes tty
+    setTerminalAttributes tty (withoutMode attrs EnableEcho) Immediately
+
+    (putStr prompt *> hFlush stdout *> getLine)
+      `finally` (setTerminalAttributes tty attrs Immediately <* putChar '\n')
+
+login :: String -> Http.Manager -> IO ()
+login baseUrl manager = do
+  username <- requestInput "username: "
+  password <- requestInputSensitive "password: "
+
+  let headers = [(hContentType, fromString "application/xxx-form-urlencoded")]
+  let body = urlEncodeAsFormStable [("username", username), ("password", password)]
+  (cookies, _responseHeaders, response) <-
+    httpPostWithCookies manager [] (baseUrl ++ "/.login") headers body
+  body' <- expectOk response
+
+  case find ((fromString sessionIdCookieName ==) . Http.cookie_name) cookies of
+    Nothing -> do
+      putStrLn $ "error: log in failed (no session cookie received)"
+      exitFailure
+    Just sessionCookie -> do
+      dataHome <- getDataHome
+      let dir = dataHome </> ":session"
+
+      do
+        exists <- doesDirectoryExist dir
+        when exists $ removeDirectoryRecursive dir
+      createDirectoryIfMissing True dir
+
+      ByteString.writeFile (dir </> "id") $ Http.cookie_value sessionCookie
+      writeFile (dir </> "expires") $ iso8601Show (Http.cookie_expiry_time sessionCookie)
+      ByteString.Lazy.Char8.putStrLn body'
 
 begin :: String -> Http.Manager -> Bool -> IO ()
 begin baseUrl manager defer = do
@@ -522,10 +623,10 @@ view baseUrl manager viewTarget resourceId = do
     resourceDirLocal =
       case viewTarget of
         ViewMetadata ->
-          dataHome </> "blog" </> resourceType resourceId </> propertiesPart (resourceName resourceId)
+          dataHome </> resourceType resourceId </> propertiesPart (resourceName resourceId)
         ViewProperty _propName ->
-          dataHome </> "blog" </> resourceType resourceId </> propertiesPart (resourceName resourceId)
-        ViewContent -> dataHome </> "blog" </> resourceType resourceId
+          dataHome </> resourceType resourceId </> propertiesPart (resourceName resourceId)
+        ViewContent -> dataHome </> resourceType resourceId
   createDirectoryIfMissing True resourceDirLocal
 
   let
@@ -592,7 +693,7 @@ list baseUrl manager resourceTyName = do
   dataHome <- getDataHome
   pager <- getPager
 
-  let resourceDirLocal = dataHome </> "blog" </> "resource" </> (resourceTyName ++ ":temp")
+  let resourceDirLocal = dataHome </> "resource" </> (resourceTyName ++ ":temp")
   createDirectoryIfMissing True resourceDirLocal
 
   let resourcePathLocal = resourceDirLocal </> "list"
@@ -803,7 +904,7 @@ edit baseUrl manager resourceId = do
   dataHome <- getDataHome
   editor <- getEditor
 
-  let resourceDirLocal = dataHome </> "blog" </> resourceType resourceId
+  let resourceDirLocal = dataHome </> resourceType resourceId
   createDirectoryIfMissing True resourceDirLocal
 
   let resourcePathLocal = resourceDirLocal </> resourceName resourceId
