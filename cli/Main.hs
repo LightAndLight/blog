@@ -132,6 +132,9 @@ data Command
   | Import
       -- | Archive to import
       FilePath
+  | SeedUser
+      -- | Directory in which to create the user
+      FilePath
 
 cliParser :: Options.Parser Cli
 cliParser =
@@ -168,6 +171,9 @@ cliParser =
           <> Options.command
             "import"
             (Options.info importParser $ Options.progDesc "Import an archive")
+          <> Options.command
+            "seed-user"
+            (Options.info seedUserParser $ Options.progDesc "Generate a user locally")
       )
   where
     loginParser =
@@ -272,6 +278,11 @@ cliParser =
         <$> Options.strArgument
           (Options.metavar "FILE" <> Options.help "Archive to import")
 
+    seedUserParser =
+      SeedUser
+        <$> Options.strArgument
+          (Options.metavar "DIR" <> Options.help "Directory in which to create the user")
+
 parseResourceId ::
   -- | Input
   String ->
@@ -368,6 +379,8 @@ main = do
       refreshAll baseUrl manager resTy
     Import path ->
       import_ baseUrl manager path
+    SeedUser dir ->
+      seedUser dir
 
 -- <https://stackoverflow.com/a/41816183>
 httpManager :: Maybe CertificateStore -> IO Http.Manager
@@ -994,3 +1007,26 @@ import_ baseUrl manager path = do
     httpPut manager (baseUrl ++ "/.import") headers content
 
   ByteString.Lazy.Char8.putStrLn =<< expectOk response
+
+seedUser ::
+  -- | Directory in which to create the user
+  FilePath ->
+  IO ()
+seedUser dir = do
+  username <- requestInput "username: "
+
+  password <- requestInputSensitive "password: "
+  password' <- requestInputSensitive "confirm password: "
+
+  unless (password == password') $ do
+    putStrLn "error: passwords don't match"
+    exitFailure
+
+  salt <- ID.generate
+
+  createDirectoryIfMissing True dir
+  let file = dir </> username
+  Text.writeFile file $
+    hashPassword (ByteString.pack $ ID.toBytes salt) (fromString password)
+
+  putStrLn $ "created " ++ file
