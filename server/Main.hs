@@ -6,26 +6,30 @@
 
 module Main (main) where
 
-import Blog (ResourceId (..), cfgContentType, renderResourceId)
+import Blog (MetadataValue (..), ResourceId (..), cfgContentType, renderResourceId)
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..), renderDiagnosticReports)
 import Blog.Error (sageErrorReport, tomlErrorReport)
+import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml)
 import qualified Blog.Route
 import qualified Blog.Rules
+import Blog.Session (sessionIdCookieName)
 import Blog.Store (Store)
 import qualified Blog.Store as Store
 import Control.Applicative ((<**>))
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
 import Control.Exception (evaluate)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Control.Monad.Catch (MonadCatch, MonadMask, onException)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
+import Crypto.Argon2 (Argon2Status (..))
+import qualified Crypto.Argon2 as Argon2
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
@@ -40,18 +44,25 @@ import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
+import qualified Data.Text.Lazy as LazyText
+import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
+import qualified Data.Text.Short as ShortText
 import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
+import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
 import GHC.Stack (HasCallStack)
-import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified)
+import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified, hSetCookie)
 import Network.HTTP.Types.Status
   ( badRequest400
   , created201
+  , internalServerError500
   , methodNotAllowed405
   , notFound404
+  , notImplemented501
   , ok200
   , preconditionFailed412
+  , unsupportedMediaType415
   )
 import qualified Network.Wai as Wai
 import qualified Network.Wai.Handler.Warp as Warp
@@ -65,6 +76,7 @@ import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import qualified Text.Sage as Sage
 import qualified Toml
+import Web.FormUrlEncoded (Form (..), urlDecodeAsForm)
 
 data Cli
   = Cli
@@ -301,6 +313,11 @@ app store routesVar request respond = do
   handleT respond $
     case Wai.pathInfo request of
       [part]
+        | part == fromString ".login" ->
+            case ByteString.Char8.unpack $ Wai.requestMethod request of
+              "POST" -> httpLogin store routesVar request
+              _ -> methodNotAllowed
+      [part]
         | part == fromString ".resource" ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "GET" -> httpResourceGet store routesVar request
@@ -406,6 +423,144 @@ renderChangeList changes =
   fmap
     (\(changedId, change) -> fromString "* " <> fromString (Build.renderChange changedId change))
     (Map.toList changes)
+
+httpLogin ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  HandlerT m Wai.Response
+httpLogin store routesVar request = do
+  let contentType = "application/xxx-form-urlencoded"
+  case lookup (fromString "Content-Type") $ Wai.requestHeaders request of
+    Just value | value == fromString contentType -> pure ()
+    _ ->
+      throwError $
+        Wai.responseLBS
+          unsupportedMediaType415
+          []
+          (fromString $ "error: unsupported Content-Type (expected " ++ contentType ++ ")")
+
+  result <- liftIO $ urlDecodeAsForm <$> Wai.consumeRequestBodyLazy request
+  case result of
+    Left err ->
+      throwError $
+        Wai.responseLBS
+          badRequest400
+          []
+          (Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict err)
+    Right (Form form) -> do
+      let
+        getFormField key =
+          case Map.lookup (fromString key) form of
+            Nothing ->
+              throwError $
+                Wai.responseLBS
+                  badRequest400
+                  []
+                  (fromString $ "error: missing field '" ++ key ++ "'")
+            Just [] ->
+              throwError $
+                Wai.responseLBS
+                  badRequest400
+                  []
+                  (fromString $ "error: not enough values for '" ++ key ++ "'")
+            Just (_ : _ : _) ->
+              throwError $
+                Wai.responseLBS
+                  badRequest400
+                  []
+                  (fromString $ "error: too many values for '" ++ key ++ "'")
+            Just [value] ->
+              pure value
+
+      username <- getFormField "username"
+      password <- getFormField "password"
+
+      handleExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
+        let
+          missingResource resTyName = do
+            liftIO . putStrLn $ "warning: no '" ++ resTyName ++ "' resource type (skipping login)"
+            pure $
+              Wai.responseLBS
+                notImplemented501
+                []
+                (fromString $ "error: server has no '" ++ resTyName ++ "' resource type")
+
+        mUserTy <- Store.lookupResourceType store xactId "user"
+        case mUserTy of
+          Nothing -> missingResource "user"
+          Just userTy -> do
+            mSessionTy <- Store.lookupResourceType store xactId "session"
+            case mSessionTy of
+              Nothing -> missingResource "session"
+              Just sessionTy -> do
+                let
+                  authenticationFailure =
+                    Wai.responseLBS
+                      badRequest400
+                      []
+                      (fromString "error: invalid username/password")
+
+                mUser <- Store.readResource userTy $ Text.unpack username
+                case mUser of
+                  Nothing -> pure authenticationFailure
+                  Just hashInfo ->
+                    case ShortText.fromByteString hashInfo of
+                      Nothing -> do
+                        liftIO . putStrLn $ "error: ShortText.fromByteString failed on " ++ show hashInfo
+                        pure $
+                          Wai.responseLBS
+                            internalServerError500
+                            []
+                            (fromString "error: internal server error")
+                      Just hashInfo' -> do
+                        case Argon2.verifyEncoded hashInfo' (Text.Encoding.encodeUtf8 password) of
+                          Argon2Ok -> do
+                            do
+                              -- Clean up expired sessions on login, rather than
+                              -- setting up a recurring task.
+                              now <- liftIO getCurrentTime
+
+                              sessions <- Store.listResource sessionTy
+                              for_ sessions $ \session -> do
+                                expires <- Store.lookupProperty sessionTy (resourceName session) "expires"
+
+                                let
+                                  expired
+                                    | Just (VString expires') <- expires
+                                    , Just expires'' <- iso8601ParseM (Text.unpack expires') =
+                                        now >= expires''
+                                    | otherwise = False
+                                when expired $ Store.removeResource sessionTy (resourceName session)
+
+                            sessionId <- liftIO ID.generate
+
+                            _updated <-
+                              Store.writeResource sessionTy (ID.toString sessionId)
+                                . Text.Lazy.Encoding.encodeUtf8
+                                $ LazyText.fromStrict username
+
+                            let days = 3600 * 24 :: Int
+
+                            pure $
+                              Wai.responseLBS
+                                ok200
+                                [
+                                  ( hSetCookie
+                                  , fromString $
+                                      sessionIdCookieName
+                                        ++ "="
+                                        ++ ID.toString sessionId
+                                        ++ "; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age="
+                                        ++ show (30 * days)
+                                  )
+                                ]
+                                (fromString "logged in")
+                          err -> do
+                            unless (err == Argon2VerifyMismatch) $ do
+                              liftIO . putStrLn $ "error: Argon2.verifyEncoded failed: " ++ show err
+                            pure authenticationFailure
 
 httpResourceCreate ::
   (MonadMask m, MonadIO m) =>

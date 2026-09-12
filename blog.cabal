@@ -113,6 +113,7 @@ executable blog-server
         Blog.Rules
         Blog.Store
     build-depends:
+        argon2,
         base ^>=4.20.2.0,
         base16-bytestring,
         blog,
@@ -126,6 +127,7 @@ executable blog-server
         directory,
         exceptions,
         filepath,
+        http-api-data,
         http-types,
         mtl >=2.3.2,
         optparse-applicative,
@@ -137,6 +139,8 @@ executable blog-server
         tar,
         temple,
         text >=2.0,
+        -- `text-short` is required to use `argon2`
+        text-short,
         time,
         tomlin,
         transformers,
