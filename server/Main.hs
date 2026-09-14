@@ -51,7 +51,6 @@ import qualified Data.Char as Char
 import Data.Foldable (for_)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -63,7 +62,6 @@ import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Traversable (for)
-import GHC.Stack (HasCallStack)
 import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified, hSetCookie)
 import Network.HTTP.Types.Status
   ( badRequest400
@@ -265,8 +263,7 @@ parseTransactionId value =
     Just x -> pure x
 
 withTransaction ::
-  HasCallStack =>
-  (MonadMask m, MonadIO m) =>
+  (MonadError DiagnosticReports m, MonadMask m, MonadIO m) =>
   Store m ->
   Routes ->
   Maybe Store.TransactionId ->
@@ -282,8 +279,10 @@ withTransaction store routes Nothing f =
     (\xactId -> f xactId False)
 withTransaction store _routes (Just xactId) f = do
   transaction <-
-    fromMaybe (error $ "transaction not found: " ++ Store.renderTransactionId xactId)
-      <$> Store.lookupTransaction store xactId
+    maybe
+      (throwError . DiagnosticSimple $ "transaction not found: " ++ Store.renderTransactionId xactId)
+      pure
+      =<< Store.lookupTransaction store xactId
   f xactId $ Store.xactDefer transaction
 
 getRouteEntry ::
