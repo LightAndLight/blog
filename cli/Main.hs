@@ -1,13 +1,16 @@
 module Main (main) where
 
 import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
+import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Password (hashPassword)
 import Blog.Session (sessionIdCookieName)
-import Control.Applicative (many, optional, (<**>), (<|>))
+import Control.Applicative (empty, many, optional, (<**>), (<|>))
 import Control.Exception (bracket, catch, finally, throwIO)
 import Control.Monad (unless, void, when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
 import qualified Data.ByteString.Char8 as ByteString.Char8
@@ -16,22 +19,23 @@ import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (for_)
 import Data.List (find)
-import Data.Maybe (isNothing)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text.IO as Text
 import qualified Data.Text.Lazy.Builder as Text.Lazy.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
+import Data.Time.Clock (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, rfc822DateFormat)
-import Data.Time.Format.ISO8601 (iso8601Show)
+import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.X509.CertificateStore (CertificateStore, readCertificateStore)
 import GHC.Stack (HasCallStack)
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Http
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import qualified Network.HTTP.Client.TLS as Http.Tls
-import Network.HTTP.Types.Header (RequestHeaders, ResponseHeaders, hContentType, hIfUnmodifiedSince)
-import Network.HTTP.Types.Status (statusCode)
+import Network.HTTP.Types.Header (RequestHeaders, hContentType, hIfUnmodifiedSince)
+import Network.HTTP.Types.Status (statusCode, unauthorized401)
 import qualified Network.TLS as Tls
 import Network.TLS.Extra.Cipher (ciphersuite_default)
 import qualified Options.Applicative as Options
@@ -331,6 +335,9 @@ parseProperties = traverse (uncurry parseProperty) . zip [0 ..]
 main :: IO ()
 main = do
   cli <- Options.execParser $ Options.info (cliParser <**> Options.helper) Options.fullDesc
+
+  let baseUrl = cliBaseUrl cli
+
   mCertificateStore <-
     case cliCaCert cli of
       Nothing -> pure Nothing
@@ -341,44 +348,46 @@ main = do
             putStrLn $ "error: failed to read CA certificate from " ++ caCert
             exitFailure
           Just store -> pure $ Just store
-  let baseUrl = cliBaseUrl cli
   manager <- httpManager mCertificateStore
+
+  mSessionId <- getSessionId
+
   case cliCommand cli of
     Login ->
       login baseUrl manager
     Begin defer ->
-      begin baseUrl manager defer
+      begin baseUrl manager mSessionId defer
     Commit xactId ->
-      commit baseUrl manager $ fromString xactId
+      commit baseUrl manager mSessionId $ fromString xactId
     Rollback xactId ->
-      rollback baseUrl manager $ fromString xactId
+      rollback baseUrl manager mSessionId $ fromString xactId
     ListTransactions ->
-      listTransactions baseUrl manager
+      listTransactions baseUrl manager mSessionId
     View viewTarget resourceId -> do
       resourceId' <- parseResourceId resourceId
-      view baseUrl manager viewTarget resourceId'
+      view baseUrl manager mSessionId viewTarget resourceId'
     List resourceTyName ->
-      list baseUrl manager resourceTyName
+      list baseUrl manager mSessionId resourceTyName
     Create mXactId mSrcFile properties resourceId -> do
       let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
-      create baseUrl manager mXactId' mSrcFile properties' resourceId'
+      create baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
     CreateAll mXactId srcDir resTy -> do
       let mXactId' = fmap fromString mXactId
-      createAll baseUrl manager mXactId' srcDir resTy
+      createAll baseUrl manager mSessionId mXactId' srcDir resTy
     Update mXactId mSrcFile properties resourceId -> do
       let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
-      update baseUrl manager mXactId' mSrcFile properties' resourceId'
+      update baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
     Edit resourceId -> do
       resourceId' <- parseResourceId resourceId
-      edit baseUrl manager resourceId'
+      edit baseUrl manager mSessionId resourceId'
     RefreshAll resTy ->
-      refreshAll baseUrl manager resTy
+      refreshAll baseUrl manager mSessionId resTy
     Import path ->
-      import_ baseUrl manager path
+      import_ baseUrl manager mSessionId path
     SeedUser dir ->
       seedUser dir
 
@@ -401,33 +410,16 @@ httpManager (Just caStore) =
     serverName = mempty
     serverId = mempty
 
-data Response a
-  = NotFound a
-  | PreconditionFailed
-  | Conflict
-  | Created a
-  | Ok a
-  deriving (Show)
+expectOk :: (HasCallStack, Show body) => Http.Response body -> IO body
+expectOk response
+  | statusCode (Http.responseStatus response) == 200 = pure $ Http.responseBody response
+  | otherwise = unexpected response
 
-expectOk :: (HasCallStack, Show a) => Response a -> IO a
-expectOk (Ok a) = pure a
-expectOk x = unexpected x
-
-unexpected :: (HasCallStack, Show a) => Response a -> IO b
+unexpected :: (HasCallStack, Show a) => Http.Response a -> IO b
 unexpected x = error $ "unexpected response: " ++ show x
 
-http ::
-  Http.Manager ->
-  -- | URL
-  String ->
-  -- | Method
-  ByteString ->
-  RequestHeaders ->
-  LazyByteString ->
-  IO (ResponseHeaders, Response LazyByteString)
-http manager baseUrl method headers body = do
-  (_cookies, responseHeaders, response) <- httpWithCookies manager mempty baseUrl method headers body
-  pure (responseHeaders, response)
+getResponseCookies :: Http.Response body -> [Http.Cookie]
+getResponseCookies = Http.destroyCookieJar . Http.responseCookieJar
 
 httpWithCookies ::
   Http.Manager ->
@@ -438,7 +430,7 @@ httpWithCookies ::
   ByteString ->
   RequestHeaders ->
   LazyByteString ->
-  IO ([Http.Cookie], ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpWithCookies manager cookies url method headers body = do
   request <- do
     request <- Http.parseRequest url
@@ -450,24 +442,30 @@ httpWithCookies manager cookies url method headers body = do
         , Http.requestBody = Http.RequestBodyLBS body
         }
   response <- Http.httpLbs request manager
-  let body' = Http.responseBody response
-  let cookies' = Http.destroyCookieJar $ Http.responseCookieJar response
-  case statusCode $ Http.responseStatus response of
-    404 -> pure (cookies', Http.responseHeaders response, NotFound body')
-    409 -> pure (cookies', Http.responseHeaders response, Conflict)
-    412 -> pure (cookies', Http.responseHeaders response, PreconditionFailed)
-    200 -> pure (cookies', Http.responseHeaders response, Ok body')
-    201 -> pure (cookies', Http.responseHeaders response, Created body')
-    _status -> do
-      putStrLn $ ByteString.Lazy.Char8.unpack body'
-      exitFailure
+
+  when (Http.responseStatus response == unauthorized401) $ do
+    putStrLn $ "error: " ++ ByteString.Lazy.Char8.unpack (Http.responseBody response)
+    exitFailure
+
+  pure response
+
+http ::
+  Http.Manager ->
+  -- | URL
+  String ->
+  -- | Method
+  ByteString ->
+  RequestHeaders ->
+  LazyByteString ->
+  IO (Http.Response LazyByteString)
+http manager = httpWithCookies manager []
 
 httpGet ::
   Http.Manager ->
   -- | URL
   String ->
   RequestHeaders ->
-  IO (ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpGet manager url headers = http manager url (fromString "GET") headers mempty
 
 httpPost ::
@@ -476,7 +474,7 @@ httpPost ::
   String ->
   RequestHeaders ->
   LazyByteString ->
-  IO (ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpPost manager url = http manager url (fromString "POST")
 
 httpPostWithCookies ::
@@ -486,7 +484,7 @@ httpPostWithCookies ::
   String ->
   RequestHeaders ->
   LazyByteString ->
-  IO ([Http.Cookie], ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpPostWithCookies manager cookies url = httpWithCookies manager cookies url (fromString "POST")
 
 httpPut ::
@@ -495,7 +493,7 @@ httpPut ::
   String ->
   RequestHeaders ->
   LazyByteString ->
-  IO (ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpPut manager url = http manager url (fromString "PUT")
 
 httpPatch ::
@@ -504,7 +502,7 @@ httpPatch ::
   String ->
   RequestHeaders ->
   LazyByteString ->
-  IO (ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpPatch manager url = http manager url (fromString "PATCH")
 
 httpRefresh ::
@@ -512,7 +510,7 @@ httpRefresh ::
   -- | URL
   String ->
   RequestHeaders ->
-  IO (ResponseHeaders, Response LazyByteString)
+  IO (Http.Response LazyByteString)
 httpRefresh manager url headers = http manager url (fromString "REFRESH") headers mempty
 
 requireEnv :: String -> IO String
@@ -556,6 +554,12 @@ transactionIdHeaders xactId =
   [ (fromString "X-Blog-TransactionId", xactId)
   ]
 
+sessionCookieHeaders :: Maybe ID -> RequestHeaders
+sessionCookieHeaders Nothing = []
+sessionCookieHeaders (Just sessionId) =
+  [ (fromString "Cookie", fromString $ sessionIdCookieName ++ "=" ++ ID.toString sessionId)
+  ]
+
 requestInput ::
   -- | Prompt
   String ->
@@ -574,6 +578,25 @@ requestInputSensitive prompt =
     (putStr prompt *> hFlush stdout *> getLine)
       `finally` (setTerminalAttributes tty attrs Immediately <* putChar '\n')
 
+getSessionId :: IO (Maybe ID)
+getSessionId = runMaybeT $ do
+  dataHome <- liftIO getDataHome
+  let dir = dataHome </> ":session"
+
+  expires <-
+    MaybeT $
+      fmap Just (readFile $ dir </> "expires")
+        `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+
+  now <- liftIO getCurrentTime
+  case iso8601ParseM expires of
+    Just expires' | now < expires' -> do
+      content <- liftIO $ readFile (dir </> "id")
+      pure . fromMaybe (error $ "invalid ID: " ++ show content) $ ID.fromString content
+    _ -> do
+      liftIO $ removeDirectoryRecursive dir
+      empty
+
 login :: String -> Http.Manager -> IO ()
 login baseUrl manager = do
   username <- requestInput "username: "
@@ -581,8 +604,8 @@ login baseUrl manager = do
 
   let headers = [(hContentType, fromString "application/xxx-form-urlencoded")]
   let body = urlEncodeAsFormStable [("username", username), ("password", password)]
-  (cookies, _responseHeaders, response) <-
-    httpPostWithCookies manager [] (baseUrl ++ "/.login") headers body
+  response <- httpPostWithCookies manager [] (baseUrl ++ "/.login") headers body
+  let cookies = getResponseCookies response
   body' <- expectOk response
 
   case find ((fromString sessionIdCookieName ==) . Http.cookie_name) cookies of
@@ -602,33 +625,59 @@ login baseUrl manager = do
       writeFile (dir </> "expires") $ iso8601Show (Http.cookie_expiry_time sessionCookie)
       ByteString.Lazy.Char8.putStrLn body'
 
-begin :: String -> Http.Manager -> Bool -> IO ()
-begin baseUrl manager defer = do
-  xactId <- beginTransaction baseUrl manager defer
+begin ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  Bool ->
+  IO ()
+begin baseUrl manager mSessionId defer = do
+  xactId <- beginTransaction baseUrl manager mSessionId defer
   ByteString.Char8.putStrLn $ fromString "began " <> xactId
 
-commit :: String -> Http.Manager -> ByteString -> IO ()
-commit baseUrl manager xactId = do
-  commitTransaction baseUrl manager xactId
+commit ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  ByteString ->
+  IO ()
+commit baseUrl manager mSessionId xactId = do
+  commitTransaction baseUrl manager mSessionId xactId
   ByteString.Char8.putStrLn $ fromString "committed " <> xactId
 
-rollback :: String -> Http.Manager -> ByteString -> IO ()
-rollback baseUrl manager xactId = do
-  rollbackTransaction baseUrl manager xactId
+rollback ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  ByteString ->
+  IO ()
+rollback baseUrl manager mSessionId xactId = do
+  rollbackTransaction baseUrl manager mSessionId xactId
   ByteString.Char8.putStrLn $ fromString "rolled back " <> xactId
 
-listTransactions :: String -> Http.Manager -> IO ()
-listTransactions baseUrl manager = do
-  (_responseHeaders, response) <- httpGet manager (baseUrl ++ "/.transaction") []
+listTransactions ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  IO ()
+listTransactions baseUrl manager mSessionId = do
+  let headers = sessionCookieHeaders mSessionId
+  response <- httpGet manager (baseUrl ++ "/.transaction") headers
   ByteString.Lazy.Char8.putStr =<< expectOk response
 
 view ::
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   ViewTarget ->
   ResourceId ->
   IO ()
-view baseUrl manager viewTarget resourceId = do
+view baseUrl manager mSessionId viewTarget resourceId = do
   dataHome <- getDataHome
   pager <- getPager
 
@@ -649,7 +698,7 @@ view baseUrl manager viewTarget resourceId = do
         ViewProperty propName -> resourceDirLocal </> propName
         ViewContent -> resourceDirLocal </> resourceName resourceId
 
-  (_responseHeaders, rBody) <- do
+  response <- do
     mLocalModificationTime <-
       fmap Just (getModificationTime resourcePathLocal)
         `catch` \err ->
@@ -658,7 +707,8 @@ view baseUrl manager viewTarget resourceId = do
             else throwIO err
     let
       headers =
-        resourceIdHeaders resourceId
+        sessionCookieHeaders mSessionId
+          ++ resourceIdHeaders resourceId
           ++ [ ( hIfUnmodifiedSince
                , fromString $ formatTime defaultTimeLocale rfc822DateFormat localModificationTime
                )
@@ -682,27 +732,29 @@ view baseUrl manager viewTarget resourceId = do
 
     httpGet manager url headers
 
-  case rBody of
-    PreconditionFailed -> do
+  case statusCode $ Http.responseStatus response of
+    412 -> do
       putStrLn "error: the local copy of this resource is out of date"
       exitFailure
-    NotFound body -> do
-      ByteString.Lazy.Char8.putStrLn body
+    404 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
       exitFailure
-    Ok body -> do
-      LazyByteString.writeFile resourcePathLocal body
+    200 -> do
+      LazyByteString.writeFile resourcePathLocal $ Http.responseBody response
     _ ->
-      unexpected rBody
+      unexpected response
 
   callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
 
 list ::
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Resource type
   String ->
   IO ()
-list baseUrl manager resourceTyName = do
+list baseUrl manager mSessionId resourceTyName = do
   dataHome <- getDataHome
   pager <- getPager
 
@@ -711,32 +763,38 @@ list baseUrl manager resourceTyName = do
 
   let resourcePathLocal = resourceDirLocal </> "list"
 
-  (_responseHeaders, rBody) <- do
-    let
-      headers = []
-      url = baseUrl ++ "/.resource/" ++ resourceTyName
+  response <- do
+    let headers = sessionCookieHeaders mSessionId
+    httpGet manager (baseUrl ++ "/.resource/" ++ resourceTyName) headers
 
-    httpGet manager url headers
-
-  case rBody of
-    NotFound{} -> do
+  case statusCode $ Http.responseStatus response of
+    404 -> do
       putStrLn $ "error: resource type " ++ resourceTyName ++ " not found"
       exitFailure
-    Ok body -> do
-      LazyByteString.writeFile resourcePathLocal body
+    200 -> do
+      LazyByteString.writeFile resourcePathLocal $ Http.responseBody response
     _ ->
-      unexpected rBody
+      unexpected response
 
   callProcess pager [resourcePathLocal] `finally` removeFile resourcePathLocal
 
-withTransaction' :: String -> Http.Manager -> Maybe ByteString -> (ByteString -> IO a) -> IO a
-withTransaction' baseUrl manager Nothing f = withTransaction baseUrl manager f
-withTransaction' _baseUrl _manager (Just xactId) f = f xactId
+withTransaction' ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  Maybe ByteString ->
+  (ByteString -> IO a) ->
+  IO a
+withTransaction' baseUrl manager mSessionId Nothing f = withTransaction baseUrl manager mSessionId f
+withTransaction' _baseUrl _manager _mSessionId (Just xactId) f = f xactId
 
 create ::
   -- | Base URL
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Transaction ID
   Maybe ByteString ->
   -- | Source file
@@ -744,34 +802,38 @@ create ::
   [Property] ->
   ResourceId ->
   IO ()
-create baseUrl manager mXactId mSrcFile properties resourceId = do
+create baseUrl manager mSessionId mXactId mSrcFile properties resourceId = do
   let
     withTransaction'' f
-      | isNothing mXactId && not (null properties) = withTransaction baseUrl manager (f . Just)
+      | isNothing mXactId && not (null properties) = withTransaction baseUrl manager mSessionId (f . Just)
       | otherwise = f mXactId
 
   withTransaction'' $ \mXactId' -> do
     do
-      let headers = resourceIdHeaders resourceId ++ foldMap transactionIdHeaders mXactId'
-      (_responseHeaders, response) <- do
+      let
+        headers =
+          sessionCookieHeaders mSessionId
+            ++ resourceIdHeaders resourceId
+            ++ foldMap transactionIdHeaders mXactId'
+      response <- do
         body <-
           case mSrcFile of
             Nothing -> pure mempty
             Just srcFile -> LazyByteString.readFile srcFile
         httpPost manager (baseUrl ++ "/.resource") headers body
 
-      case response of
-        Conflict -> do
+      case statusCode $ Http.responseStatus response of
+        409 -> do
           putStrLn $ "error: " ++ renderResourceId resourceId ++ " already exists"
           exitFailure
-        Created a -> do
-          ByteString.Lazy.Char8.putStrLn a
+        201 -> do
+          ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
         _ ->
           unexpected response
 
     unless (null properties) $ do
-      let headers = foldMap transactionIdHeaders mXactId'
-      (_responseHeaders, response) <- do
+      let headers = sessionCookieHeaders mSessionId ++ foldMap transactionIdHeaders mXactId'
+      response <- do
         let body = renderProperties properties
         httpPatch
           manager
@@ -785,13 +847,18 @@ beginTransaction ::
   -- | Base URL
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Defer rules until commit
   Bool ->
   -- | Transaction ID
   IO ByteString
-beginTransaction baseUrl manager defer = do
-  let headers = [(fromString "X-Blog-Transaction-Defer", fromString "true") | defer]
-  (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/begin") headers mempty
+beginTransaction baseUrl manager mSessionId defer = do
+  let
+    headers =
+      sessionCookieHeaders mSessionId
+        ++ [(fromString "X-Blog-Transaction-Defer", fromString "true") | defer]
+  response <- httpPost manager (baseUrl ++ "/.transaction/begin") headers mempty
 
   LazyByteString.toStrict <$> expectOk response
 
@@ -799,25 +866,28 @@ commitTransaction ::
   -- | Base URL
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Transaction ID
   ByteString ->
   IO ()
-commitTransaction baseUrl manager xactId = do
-  let headers = transactionIdHeaders xactId
-  (_responseHeaders, response) <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
+commitTransaction baseUrl manager mSessionId xactId = do
+  let headers = sessionCookieHeaders mSessionId ++ transactionIdHeaders xactId
+  response <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
 
   void $ expectOk response
 
 rollbackTransaction ::
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Transaction ID
   ByteString ->
   IO ()
-rollbackTransaction baseUrl manager xactId = do
-  let headers = transactionIdHeaders xactId
-  (_responseHeaders, response) <-
-    httpPost manager (baseUrl ++ "/.transaction/rollback") headers mempty
+rollbackTransaction baseUrl manager mSessionId xactId = do
+  let headers = sessionCookieHeaders mSessionId ++ transactionIdHeaders xactId
+  response <- httpPost manager (baseUrl ++ "/.transaction/rollback") headers mempty
 
   void $ expectOk response
 
@@ -826,43 +896,47 @@ withTransaction ::
   -- | Base URL
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   {-| Arguments:
 
   * Transaction ID
   -}
   (ByteString -> IO b) ->
   IO b
-withTransaction baseUrl manager f = do
-  (a, ()) <- generalBracket (beginTransaction baseUrl manager False) exit $ f
+withTransaction baseUrl manager mSessionId f = do
+  (a, ()) <- generalBracket (beginTransaction baseUrl manager mSessionId False) exit $ f
   pure a
   where
-    exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl manager xactId
-    exit xactId (ExitCaseException _err) = rollbackTransaction baseUrl manager xactId
-    exit xactId ExitCaseAbort = rollbackTransaction baseUrl manager xactId
+    exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl manager mSessionId xactId
+    exit xactId (ExitCaseException _err) = rollbackTransaction baseUrl manager mSessionId xactId
+    exit xactId ExitCaseAbort = rollbackTransaction baseUrl manager mSessionId xactId
 
 createAll ::
   -- | Base URL
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Transaction ID
   Maybe ByteString ->
   FilePath ->
   String ->
   IO ()
-createAll baseUrl manager mXactId srcDir resTy = do
+createAll baseUrl manager mSessionId mXactId srcDir resTy = do
   entries <- listDirectory srcDir
   when (null entries) $ do
     putStrLn $ "error: " ++ srcDir ++ " is empty"
     exitFailure
 
-  withTransaction' baseUrl manager mXactId $ \xactId ->
+  withTransaction' baseUrl manager mSessionId mXactId $ \xactId ->
     for_ entries $ \entry -> do
       let path = srcDir </> entry
       isFile <- doesFileExist path
       if isFile
         then do
           let resourceId = ResourceId resTy entry
-          create baseUrl manager (Just xactId) (Just path) [] resourceId
+          create baseUrl manager mSessionId (Just xactId) (Just path) [] resourceId
         else do
           putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
 
@@ -870,6 +944,8 @@ update ::
   -- | Base URL
   String ->
   Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
   -- | Transaction ID
   Maybe ByteString ->
   -- | Source file
@@ -878,20 +954,28 @@ update ::
   [Property] ->
   ResourceId ->
   IO ()
-update baseUrl manager mXactId mSrcFile properties resourceId = do
+update baseUrl manager mSessionId mXactId mSrcFile properties resourceId = do
   let
     doBody mXactId' srcFile = do
-      (_responseHeaders, response) <- do
+      response <- do
         body <- LazyByteString.readFile srcFile
-        let headers = foldMap transactionIdHeaders mXactId' ++ resourceIdHeaders resourceId
+        let
+          headers =
+            sessionCookieHeaders mSessionId
+              ++ foldMap transactionIdHeaders mXactId'
+              ++ resourceIdHeaders resourceId
         httpPut manager (baseUrl ++ "/.resource") headers body
 
       ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
     doProperties mXactId' ps = do
-      (_responseHeaders, response) <- do
+      response <- do
         let body = renderProperties ps
-        let headers = foldMap transactionIdHeaders mXactId' ++ resourceIdHeaders resourceId
+        let
+          headers =
+            sessionCookieHeaders mSessionId
+              ++ foldMap transactionIdHeaders mXactId'
+              ++ resourceIdHeaders resourceId
         httpPatch
           manager
           (baseUrl ++ "/.resource/" ++ resourceIdPath resourceId ++ "/property")
@@ -908,12 +992,18 @@ update baseUrl manager mXactId mSrcFile properties resourceId = do
     (Just srcFile, []) -> do
       doBody mXactId srcFile
     (Just srcFile, _ : _) ->
-      withTransaction' baseUrl manager mXactId $ \xactId -> do
+      withTransaction' baseUrl manager mSessionId mXactId $ \xactId -> do
         doBody (Just xactId) srcFile
         doProperties (Just xactId) properties
 
-edit :: String -> Http.Manager -> ResourceId -> IO ()
-edit baseUrl manager resourceId = do
+edit ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  ResourceId ->
+  IO ()
+edit baseUrl manager mSessionId resourceId = do
   dataHome <- getDataHome
   editor <- getEditor
 
@@ -928,44 +1018,48 @@ edit baseUrl manager resourceId = do
         if isDoesNotExistError err
           then pure Nothing
           else throwIO err
-  (_responseHeaders, rBody) <- do
-    let
-      headers =
-        resourceIdHeaders resourceId
-          ++ [ ( hIfUnmodifiedSince
-               , fromString $ formatTime defaultTimeLocale rfc822DateFormat localModificationTime
-               )
-             | Just localModificationTime <- pure $ mLocalModificationTime
-             ]
-    httpGet
-      manager
-      (baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId)
-      headers
 
-  updated <-
-    case rBody of
-      PreconditionFailed -> do
+  updated <- do
+    response <- do
+      let
+        headers =
+          sessionCookieHeaders mSessionId
+            ++ resourceIdHeaders resourceId
+            ++ [ ( hIfUnmodifiedSince
+                 , fromString $ formatTime defaultTimeLocale rfc822DateFormat localModificationTime
+                 )
+               | Just localModificationTime <- pure $ mLocalModificationTime
+               ]
+      httpGet
+        manager
+        (baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId)
+        headers
+
+    case statusCode $ Http.responseStatus response of
+      412 -> do
         putStrLn "error: the local copy of this resource is out of date"
         exitFailure
-      NotFound{} -> do
+      404 -> do
         when (isNothing mLocalModificationTime) $ writeFile resourcePathLocal ""
         pure False
-      Ok body -> do
-        when (isNothing mLocalModificationTime) $ LazyByteString.writeFile resourcePathLocal body
+      200 -> do
+        when (isNothing mLocalModificationTime) $
+          LazyByteString.writeFile resourcePathLocal (Http.responseBody response)
         pure True
       _ ->
-        unexpected rBody
+        unexpected response
 
   callProcess editor [resourcePathLocal]
 
-  (_responseHeaders, response) <- do
+  response <- do
     let url = baseUrl ++ "/.resource"
     if updated
       then do
         localModificationTime <- getModificationTime resourcePathLocal
         let
           headers =
-            resourceIdHeaders resourceId
+            sessionCookieHeaders mSessionId
+              ++ resourceIdHeaders resourceId
               ++ [
                    ( hIfUnmodifiedSince
                    , fromString $ formatTime defaultTimeLocale rfc822DateFormat localModificationTime
@@ -978,31 +1072,42 @@ edit baseUrl manager resourceId = do
         body <- LazyByteString.readFile resourcePathLocal
         httpPost manager url headers body
 
-  case response of
-    PreconditionFailed -> do
+  case statusCode $ Http.responseStatus response of
+    412 -> do
       putStrLn "error: the server has a newer copy of the resource (update aborted)"
       exitFailure
-    Created body -> do
-      ByteString.Lazy.Char8.putStrLn body
+    201 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
       removeFile resourcePathLocal
-    Ok body -> do
-      ByteString.Lazy.Char8.putStrLn body
+    200 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
       removeFile resourcePathLocal
     _ ->
       unexpected response
 
-refreshAll :: String -> Http.Manager -> String -> IO ()
-refreshAll baseUrl manager resTy = do
-  let headers = []
-  (_responseHeaders, response) <- do
-    httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
+refreshAll ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  String ->
+  IO ()
+refreshAll baseUrl manager mSessionId resTy = do
+  let headers = sessionCookieHeaders mSessionId
+  response <- httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
 
   ByteString.Lazy.Char8.putStrLn =<< expectOk response
 
-import_ :: String -> Http.Manager -> FilePath -> IO ()
-import_ baseUrl manager path = do
-  let headers = []
-  (_responseHeaders, response) <- do
+import_ ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  FilePath ->
+  IO ()
+import_ baseUrl manager mSessionId path = do
+  let headers = sessionCookieHeaders mSessionId
+  response <- do
     content <- LazyByteString.readFile path
     httpPut manager (baseUrl ++ "/.import") headers content
 

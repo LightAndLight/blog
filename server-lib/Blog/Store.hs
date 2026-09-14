@@ -64,12 +64,17 @@ module Blog.Store
 
 import Blog
   ( MetadataValue (..)
+  , Name (..)
   , ResourceConfig (..)
   , ResourceId (..)
+  , nameToPath
+  , pathToName
   , propertiesPart
   , readResourceId
+  , renderName
   , renderResourceId
   , resourceConfigDecoder
+  , resourceIdToPath
   )
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
@@ -134,7 +139,7 @@ import qualified Toml
 
 data Store m
   = Store
-  { lookupResourceTypeImpl :: !(TransactionId -> String -> m (Maybe (ResourceType m)))
+  { lookupResourceTypeImpl :: !(TransactionId -> Name -> m (Maybe (ResourceType m)))
   , beginTransactionImpl :: Bool -> m TransactionId
   , commitTransactionImpl :: TransactionId -> m ()
   , rollbackTransactionImpl :: TransactionId -> m ()
@@ -229,14 +234,14 @@ fromDirectory storeDir = do
         , overlayBase = storeDir
         }
 
-    lookupResourceTypeImpl :: TransactionId -> String -> m (Maybe (ResourceType m))
+    lookupResourceTypeImpl :: TransactionId -> Name -> m (Maybe (ResourceType m))
     lookupResourceTypeImpl xactId resTyName
-      | resTyName == "resource" = do
+      | resTyName == Name "resource" = do
           let config = ResourceConfig (fromString "text/toml") mempty
-          liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId "resource" config
+          liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId (Name "resource") config
       | otherwise = do
           let overlay = getOverlay xactId
-          let resourceConfigPath = "resource" </> resTyName
+          let resourceConfigPath = "resource" </> nameToPath resTyName
           exists <- liftIO $ overlayDoesFileExist overlay resourceConfigPath
           if exists
             then do
@@ -307,6 +312,7 @@ fromDirectory storeDir = do
               getResourceIds change = do
                 resTyNames <- IO.listDirectory $ xactDir </> changePart change
                 fmap (foldMap Set.toList) . for resTyNames $ \resTyName -> do
+                  let resTyName' = pathToName resTyName
                   let resTyDir = xactDir </> changePart change </> resTyName
                   entries <- IO.listDirectory resTyDir
                   fmap Set.fromList . for entries $ \entry -> do
@@ -317,8 +323,8 @@ fromDirectory storeDir = do
                         let (prefix, suffix) = break (== ':') entry
                         when (suffix /= ":properties") . error $
                           "unexpected resource directory: " ++ show (resTyDir </> entry)
-                        pure $ ResourceId resTyName prefix
-                      else pure $ ResourceId resTyName entry
+                        pure $ ResourceId resTyName' (pathToName prefix)
+                      else pure $ ResourceId resTyName' (pathToName entry)
 
             creates <- getResourceIds Create
             updates <- getResourceIds Update
@@ -364,11 +370,11 @@ fromDirectory storeDir = do
 parseResourceConfig ::
   MonadError DiagnosticReports m =>
   -- | Resource type name
-  String ->
+  Name ->
   ByteString ->
   m ResourceConfig
 parseResourceConfig resTyName body = do
-  let resourceFile = fromString $ "(resource:" ++ resTyName ++ ")"
+  let resourceFile = fromString $ "(resource:" ++ renderName resTyName ++ ")"
   toml <- tomlResult resourceFile body $ Toml.parse body
   tomlResult resourceFile body $ Toml.decode toml resourceConfigDecoder
 
@@ -376,7 +382,7 @@ lookupResourceType ::
   Store m ->
   TransactionId ->
   -- | Resource type
-  String ->
+  Name ->
   m (Maybe (ResourceType m))
 lookupResourceType = lookupResourceTypeImpl
 
@@ -386,7 +392,7 @@ getResourceType ::
   Store m ->
   TransactionId ->
   -- | Resource type
-  String ->
+  Name ->
   m (ResourceType m)
 getResourceType store xactId resTyName = do
   mResTy <- lookupResourceType store xactId resTyName
@@ -400,7 +406,7 @@ getResourceType store xactId resTyName = do
             (\(_fn, loc) -> "(" ++ prettySrcLoc loc ++ ")")
             (listToMaybe $ getCallStack callStack)
       throwError . DiagnosticSimple $
-        "resource type '" ++ resTyName ++ "' does not exist"
+        "resource type '" ++ renderName resTyName ++ "' does not exist"
 
 bracketTransaction ::
   MonadMask m =>
@@ -473,14 +479,14 @@ restoreDeferred = restoreDeferredImpl
 export ::
   (MonadError DiagnosticReports m, MonadIO m) => Store m -> TransactionId -> m LazyByteString
 export store xactId = do
-  resourceTy <- getResourceType store xactId "resource"
+  resourceTy <- getResourceType store xactId (Name "resource")
   tyIds <- listResource resourceTy
 
   resourceEntries <- for tyIds $ \tyId@(ResourceId resTy resName) -> do
     content <-
       fromMaybe (error $ renderResourceId tyId ++ " does not exist")
         <$> readResource resourceTy resName
-    pure $ Tar.fileEntry (resTy </> resName) (LazyByteString.fromStrict content)
+    pure $ Tar.fileEntry (nameToPath resTy </> nameToPath resName) (LazyByteString.fromStrict content)
 
   entries <- for tyIds $ \(ResourceId _resTyName tyName) -> do
     resTy <- getResourceType store xactId tyName
@@ -490,28 +496,32 @@ export store xactId = do
         fromMaybe (error $ renderResourceId resId ++ " does not exist")
           <$> readResource resTy resName
 
-      let contentEntry = Tar.fileEntry (resTyName </> resName) (LazyByteString.fromStrict content)
+      let contentEntry = Tar.fileEntry (nameToPath resTyName </> nameToPath resName) (LazyByteString.fromStrict content)
 
       properties <- listProperties resTy resName
       propertyEntries <- fmap catMaybes . for properties $ \propName -> do
-        if propName == "metadata"
+        if propName == Name "metadata"
           then
             -- metadata is set on resource creation
             pure Nothing
           else do
             propValue <-
-              fromMaybe (error $ renderResourceId resId ++ ":" ++ propName ++ " does not exist")
+              fromMaybe (error $ renderResourceId resId ++ ":" ++ renderName propName ++ " does not exist")
                 <$> readProperty resTy resName propName
             pure . Just $
               Tar.fileEntry
-                (resTyName </> propertiesPart resName </> propName)
+                (nameToPath resTyName </> propertiesPart (nameToPath resName) </> nameToPath propName)
                 (LazyByteString.fromStrict propValue)
 
       dependencies <- listDependencies resTy resName
       dependencyEntries <- for dependencies $ \dependency -> do
         pure $
           Tar.fileEntry
-            (resTyName </> propertiesPart resName </> "dependencies" </> renderResourceId dependency)
+            ( nameToPath resTyName
+                </> propertiesPart (nameToPath resName)
+                </> "dependencies"
+                </> resourceIdToPath dependency
+            )
             mempty
 
       pure $ contentEntry : propertyEntries ++ dependencyEntries
@@ -551,11 +561,16 @@ import_ store xactId archive = do
           case splitDirectories path of
             [] -> undefined
             [resTyName, resName] -> do
-              resTy <- getResourceType store xactId resTyName
-              _changed <- writeResource resTy resName content
-              pure . Just $ ResourceId resTyName resName
+              let resTyName' = pathToName resTyName
+              let resName' = pathToName resName
+              resTy <- getResourceType store xactId resTyName'
+              _changed <- writeResource resTy resName' content
+              pure . Just $ ResourceId resTyName' resName'
             [resTyName, part, propName] | (resName, ":properties") <- break (== ':') part -> do
-              resTy <- getResourceType store xactId resTyName
+              let resTyName' = pathToName resTyName
+              let resName' = pathToName resName
+              let propName' = pathToName propName
+              resTy <- getResourceType store xactId resTyName'
 
               -- metadata is set on resource creation
               unless (propName == "metadata") $
@@ -564,18 +579,20 @@ import_ store xactId archive = do
                     throwError $
                       DiagnosticReports
                         ( fromString $
-                            "(" ++ renderResourceId (ResourceId (resourceTypeName resTy) resName) ++ ":" ++ propName ++ ")"
+                            "(" ++ renderResourceId (ResourceId (resourceTypeName resTy) resName') ++ ":" ++ propName ++ ")"
                         )
                         content
                         (sageErrorReport err)
                   Right value -> do
-                    setProperty resTy resName propName $ metadataValueFromToml value
+                    setProperty resTy resName' propName' $ metadataValueFromToml value
 
               pure Nothing
             [resTyName, part, "dependencies", subKey] | (resName, ":properties") <- break (== ':') part -> do
-              resTy <- getResourceType store xactId resTyName
+              let resTyName' = pathToName resTyName
+              let resName' = pathToName resName
+              resTy <- getResourceType store xactId resTyName'
               let resId = readResourceId subKey
-              createDependency resTy resName resId
+              createDependency resTy resName' resId
               pure Nothing
             _ ->
               throwError . DiagnosticSimple $ "unrecognised archive path: " ++ path
@@ -597,21 +614,21 @@ import_ store xactId archive = do
 
 data ResourceType m
   = ResourceType
-  { resourceTypeName :: !String
+  { resourceTypeName :: !Name
   , resourceTypeConfig :: !ResourceConfig
-  , doesResourceExistImpl :: !(String -> m Bool)
-  , readResourceImpl :: !(String -> m (Maybe ByteString))
-  , writeResourceImpl :: !(String -> LazyByteString -> m Bool)
-  , removeResourceImpl :: !(String -> m ())
-  , readPropertyImpl :: !(String -> String -> m (Maybe ByteString))
-  , setPropertyImpl :: !(String -> String -> MetadataValue -> m ())
-  , listPropertiesImpl :: !(String -> m [String])
+  , doesResourceExistImpl :: !(Name -> m Bool)
+  , readResourceImpl :: !(Name -> m (Maybe ByteString))
+  , writeResourceImpl :: !(Name -> LazyByteString -> m Bool)
+  , removeResourceImpl :: !(Name -> m ())
+  , readPropertyImpl :: !(Name -> Name -> m (Maybe ByteString))
+  , setPropertyImpl :: !(Name -> Name -> MetadataValue -> m ())
+  , listPropertiesImpl :: !(Name -> m [Name])
   , listResourceImpl :: !(m [ResourceId])
-  , readResourceModificationTimeImpl :: !(String -> m (Maybe UTCTime))
-  , listDependenciesImpl :: !(String -> m [ResourceId])
-  , listDependentsImpl :: !(String -> m [ResourceId])
-  , createDependencyImpl :: !(String -> ResourceId -> m ())
-  , removeDependencyImpl :: !(String -> ResourceId -> m ())
+  , readResourceModificationTimeImpl :: !(Name -> m (Maybe UTCTime))
+  , listDependenciesImpl :: !(Name -> m [ResourceId])
+  , listDependentsImpl :: !(Name -> m [ResourceId])
+  , createDependencyImpl :: !(Name -> ResourceId -> m ())
+  , removeDependencyImpl :: !(Name -> ResourceId -> m ())
   }
 
 hoistResourceType :: (forall a. m a -> n a) -> ResourceType m -> ResourceType n
@@ -641,7 +658,7 @@ resourceTypeFromDirectory ::
   FilePath ->
   TransactionId ->
   -- | Resource type name
-  String ->
+  Name ->
   ResourceConfig ->
   IO (ResourceType m)
 resourceTypeFromDirectory storeDir xactId resTyName config =
@@ -663,21 +680,21 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
         , overlayBase = storeDir </> resTyName'
         }
 
-    overlay = getOverlay resTyName
+    overlay = getOverlay $ nameToPath resTyName
 
-    doesResourceExistImpl :: String -> m Bool
-    doesResourceExistImpl resName = liftIO $ overlayDoesFileExist overlay resName
+    doesResourceExistImpl :: Name -> m Bool
+    doesResourceExistImpl resName = liftIO $ overlayDoesFileExist overlay (nameToPath resName)
 
-    readResourceImpl :: String -> m (Maybe ByteString)
-    readResourceImpl resName = liftIO $ overlayReadFile overlay resName
+    readResourceImpl :: Name -> m (Maybe ByteString)
+    readResourceImpl resName = liftIO $ overlayReadFile overlay (nameToPath resName)
 
-    writeResourceImpl :: ResourceType m -> String -> LazyByteString -> m Bool
+    writeResourceImpl :: ResourceType m -> Name -> LazyByteString -> m Bool
     writeResourceImpl self resName body = do
       exists <- doesResourceExist self resName
       mOldHash <-
         if exists
           then do
-            mValue <- lookupProperty self resName "sha256"
+            mValue <- lookupProperty self resName (Name "sha256")
             case mValue of
               Nothing ->
                 pure Nothing
@@ -690,13 +707,13 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
                     ++ show value
                     ++ ")"
           else do
-            liftIO $ overlayCreateDir overlay (propertiesPart resName)
+            liftIO $ overlayCreateDir overlay (propertiesPart $ nameToPath resName)
             pure Nothing
 
       let changed = mOldHash /= Just newHash
       when changed $ do
-        liftIO $ overlayWriteFile overlay resName body
-        setProperty self resName "sha256" $ VString (Text.Encoding.decodeUtf8 newHash)
+        liftIO $ overlayWriteFile overlay (nameToPath resName) body
+        setProperty self resName (Name "sha256") $ VString (Text.Encoding.decodeUtf8 newHash)
         mMetadata <- extractMetadata resTyName config resName body
         for_ mMetadata $ updateMetadata resName
 
@@ -704,15 +721,15 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
       where
         newHash = Base16.encode $ Sha256.hashlazy body
 
-    updateMetadata :: String -> ByteString -> m ()
+    updateMetadata :: Name -> ByteString -> m ()
     updateMetadata resName metadata = do
       liftIO $
         overlayWriteFile
           overlay
-          (propertiesPart resName </> "metadata")
+          (propertiesPart (nameToPath resName) </> "metadata")
           (LazyByteString.fromStrict metadata)
 
-    removeResourceImpl :: ResourceType m -> String -> m ()
+    removeResourceImpl :: ResourceType m -> Name -> m ()
     removeResourceImpl self resName = do
       exists <- doesResourceExist self resName
       if exists
@@ -725,26 +742,32 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
                 ++ " still has dependents: "
                 ++ intercalate ", " (fmap renderResourceId dependents)
           liftIO $ do
-            overlayRemoveFile overlay resName
-            overlayRemoveDir overlay (propertiesPart resName)
+            overlayRemoveFile overlay (nameToPath resName)
+            overlayRemoveDir overlay (propertiesPart $ nameToPath resName)
         else
           throwError . DiagnosticSimple $
             "resource " ++ renderResourceId (ResourceId resTyName resName) ++ " does not exist"
 
-    readPropertyImpl :: String -> String -> m (Maybe ByteString)
+    readPropertyImpl :: Name -> Name -> m (Maybe ByteString)
     readPropertyImpl resName propName =
-      liftIO $ overlayReadFile overlay (propertiesPart resName </> propName)
+      liftIO $ overlayReadFile overlay (propertiesPart (nameToPath resName) </> nameToPath propName)
 
-    setPropertyImpl :: String -> String -> MetadataValue -> m ()
+    setPropertyImpl :: Name -> Name -> MetadataValue -> m ()
     setPropertyImpl resName key value =
-      liftIO $ overlayWriteFile overlay (propertiesPart resName </> key) (renderMetadataValueToml value)
+      liftIO $
+        overlayWriteFile
+          overlay
+          (propertiesPart (nameToPath resName) </> nameToPath key)
+          (renderMetadataValueToml value)
 
-    listPropertiesImpl :: String -> m [String]
-    listPropertiesImpl resName = liftIO $ overlayListDir overlay (Just $ propertiesPart resName)
+    listPropertiesImpl :: Name -> m [Name]
+    listPropertiesImpl resName = liftIO $ do
+      entries <- overlayListDir overlay (Just . propertiesPart $ nameToPath resName)
+      pure $ fmap pathToName entries
 
-    readResourceModificationTimeImpl :: String -> m (Maybe UTCTime)
+    readResourceModificationTimeImpl :: Name -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
-      liftIO $ overlayGetModificationTime overlay resName
+      liftIO $ overlayGetModificationTime overlay (nameToPath resName)
 
     listResourceImpl :: m [ResourceId]
     listResourceImpl =
@@ -755,45 +778,45 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
             ( \entry -> do
                 let (_prefix, suffix) = break (== ':') entry
                 guard $ suffix /= ":properties"
-                pure $ ResourceId resTyName entry
+                pure $ ResourceId resTyName (pathToName entry)
             )
             entries
 
-    listDependenciesImpl :: String -> m [ResourceId]
+    listDependenciesImpl :: Name -> m [ResourceId]
     listDependenciesImpl resName = do
       liftIO $ do
-        entries <- overlayListDir overlay . Just $ propertiesPart resName </> "dependencies"
+        entries <- overlayListDir overlay . Just $ propertiesPart (nameToPath resName) </> "dependencies"
         pure $ fmap readResourceId entries
 
-    listDependentsImpl :: String -> m [ResourceId]
+    listDependentsImpl :: Name -> m [ResourceId]
     listDependentsImpl resName = do
       liftIO $ do
-        entries <- overlayListDir overlay . Just $ propertiesPart resName </> "dependents"
+        entries <- overlayListDir overlay . Just $ propertiesPart (nameToPath resName) </> "dependents"
         pure $ fmap readResourceId entries
 
-    createDependencyImpl :: String -> ResourceId -> m ()
+    createDependencyImpl :: Name -> ResourceId -> m ()
     createDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
 
-      srcExists <- liftIO $ overlayDoesFileExist overlay resNameSrc
+      srcExists <- liftIO $ overlayDoesFileExist overlay (nameToPath resNameSrc)
       if srcExists
         then liftIO $ do
-          let dir = propertiesPart resNameSrc </> "dependencies"
+          let dir = propertiesPart (nameToPath resNameSrc) </> "dependencies"
           dirExists <- overlayDoesDirectoryExist overlay dir
           unless dirExists $ overlayCreateDir overlay dir
           overlayWriteFile
             overlay
-            (dir </> renderResourceId dependencyTarget)
+            (dir </> resourceIdToPath dependencyTarget)
             mempty
         else
           throwError . DiagnosticSimple $
             "dependency source " ++ renderResourceId dependencySource ++ " does not exist"
 
-      let tgtOverlay = getOverlay resTyNameTgt
-      tgtExists <- liftIO $ overlayDoesFileExist tgtOverlay resNameTgt
+      let tgtOverlay = getOverlay $ nameToPath resTyNameTgt
+      tgtExists <- liftIO $ overlayDoesFileExist tgtOverlay (nameToPath resNameTgt)
       if tgtExists
         then liftIO $ do
-          let dir = propertiesPart resNameTgt </> "dependents"
+          let dir = propertiesPart (nameToPath resNameTgt) </> "dependents"
           dirExists <- overlayDoesDirectoryExist tgtOverlay dir
           unless dirExists $ overlayCreateDir tgtOverlay dir
           overlayWriteFile
@@ -804,72 +827,69 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           throwError . DiagnosticSimple $
             "dependency target " ++ renderResourceId dependencyTarget ++ " does not exist"
 
-    removeDependencyImpl :: String -> ResourceId -> m ()
+    removeDependencyImpl :: Name -> ResourceId -> m ()
     removeDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
 
       liftIO $
         overlayRemoveFile
           overlay
-          (propertiesPart resNameSrc </> "dependencies" </> renderResourceId dependencyTarget)
+          (propertiesPart (nameToPath resNameSrc) </> "dependencies" </> renderResourceId dependencyTarget)
 
-      let tgtOverlay = getOverlay resTyNameTgt
+      let tgtOverlay = getOverlay (nameToPath resTyNameTgt)
       liftIO $
         overlayRemoveFile
           tgtOverlay
-          (propertiesPart resNameTgt </> "dependents" </> renderResourceId dependencySource)
+          (propertiesPart (nameToPath resNameTgt) </> "dependents" </> renderResourceId dependencySource)
 
-doesResourceExist :: ResourceType m -> String -> m Bool
+doesResourceExist :: ResourceType m -> Name -> m Bool
 doesResourceExist = doesResourceExistImpl
 
-readResource :: ResourceType m -> String -> m (Maybe ByteString)
+readResource :: ResourceType m -> Name -> m (Maybe ByteString)
 readResource = readResourceImpl
 
 writeResource ::
   ResourceType m ->
-  String ->
+  Name ->
   LazyByteString ->
   -- | The resource's contents changed
   m Bool
 writeResource = writeResourceImpl
 
-removeResource ::
-  ResourceType m ->
-  String ->
-  m ()
+removeResource :: ResourceType m -> Name -> m ()
 removeResource = removeResourceImpl
 
-readProperty :: ResourceType m -> String -> String -> m (Maybe ByteString)
+readProperty :: ResourceType m -> Name -> Name -> m (Maybe ByteString)
 readProperty = readPropertyImpl
 
-setProperty :: ResourceType m -> String -> String -> MetadataValue -> m ()
+setProperty :: ResourceType m -> Name -> Name -> MetadataValue -> m ()
 setProperty = setPropertyImpl
 
-listProperties :: ResourceType m -> String -> m [String]
+listProperties :: ResourceType m -> Name -> m [Name]
 listProperties = listPropertiesImpl
 
 listResource :: ResourceType m -> m [ResourceId]
 listResource = listResourceImpl
 
-readResourceModificationTime :: ResourceType m -> String -> m (Maybe UTCTime)
+readResourceModificationTime :: ResourceType m -> Name -> m (Maybe UTCTime)
 readResourceModificationTime = readResourceModificationTimeImpl
 
-listDependencies :: ResourceType m -> String -> m [ResourceId]
+listDependencies :: ResourceType m -> Name -> m [ResourceId]
 listDependencies = listDependenciesImpl
 
-listDependents :: ResourceType m -> String -> m [ResourceId]
+listDependents :: ResourceType m -> Name -> m [ResourceId]
 listDependents = listDependentsImpl
 
 createDependency ::
   ResourceType m ->
   -- | Source name
-  String ->
+  Name ->
   -- | Target ID
   ResourceId ->
   m ()
 createDependency = createDependencyImpl
 
-removeDependency :: ResourceType m -> String -> ResourceId -> m ()
+removeDependency :: ResourceType m -> Name -> ResourceId -> m ()
 removeDependency = removeDependencyImpl
 
 parsePropertyValue :: ByteString -> Either Toml.ParseError Toml.TomlValue
@@ -878,7 +898,7 @@ parsePropertyValue =
     (Toml.valueParser Toml.TopLevel <* Sage.skipMany (Sage.satisfy Char.isSpace) <* Sage.eof)
 
 lookupProperty ::
-  MonadError DiagnosticReports m => ResourceType m -> String -> String -> m (Maybe MetadataValue)
+  MonadError DiagnosticReports m => ResourceType m -> Name -> Name -> m (Maybe MetadataValue)
 lookupProperty resTy resName propName = do
   mContent <- readProperty resTy resName propName
   case mContent of
@@ -896,10 +916,10 @@ lookupProperty resTy resName propName = do
 extractMetadata ::
   MonadError DiagnosticReports m =>
   -- | Resource type
-  String ->
+  Name ->
   ResourceConfig ->
   -- | Resource name
-  String ->
+  Name ->
   LazyByteString.ByteString ->
   m (Maybe ByteString)
 extractMetadata resTyName config resName body =
@@ -910,10 +930,10 @@ extractMetadata resTyName config resName body =
 extractMetadataMarkdown ::
   MonadError DiagnosticReports m =>
   -- | Resourced type
-  String ->
+  Name ->
   ResourceConfig ->
   -- | Resource name
-  String ->
+  Name ->
   LazyByteString.ByteString ->
   m (Maybe ByteString)
 extractMetadataMarkdown resTyName config resName body = do

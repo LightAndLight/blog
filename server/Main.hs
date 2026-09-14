@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeApplications #-}
 
@@ -10,6 +11,7 @@ import Blog (MetadataValue (..), ResourceId (..), cfgContentType, renderResource
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..), renderDiagnosticReports)
 import Blog.Error (sageErrorReport, tomlErrorReport)
+import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml)
 import qualified Blog.Route
@@ -22,10 +24,11 @@ import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
 import Control.Exception (evaluate)
 import Control.Monad (unless, when)
-import Control.Monad.Catch (MonadCatch, MonadMask, onException)
+import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow, onException)
 import Control.Monad.Error.Class (MonadError (..))
 import Control.Monad.Except (ExceptT (..), runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.Morph (hoist)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Crypto.Argon2 (Argon2Status (..))
@@ -47,9 +50,9 @@ import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Text.Short as ShortText
-import Data.Time.Clock (UTCTime, getCurrentTime)
+import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
-import Data.Time.Format.ISO8601 (iso8601ParseM)
+import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Traversable (for)
 import GHC.Stack (HasCallStack)
 import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified, hSetCookie)
@@ -62,6 +65,7 @@ import Network.HTTP.Types.Status
   , notImplemented501
   , ok200
   , preconditionFailed412
+  , unauthorized401
   , unsupportedMediaType415
   )
 import qualified Network.Wai as Wai
@@ -76,6 +80,7 @@ import System.FilePath ((</>))
 import System.IO (BufferMode (..), hSetBuffering, stdout)
 import qualified Text.Sage as Sage
 import qualified Toml
+import Web.Cookie (parseCookies)
 import Web.FormUrlEncoded (Form (..), urlDecodeAsForm)
 
 data Cli
@@ -194,16 +199,27 @@ main = do
   WarpTLS.runTLS tlsSettings settings $ app store routes
 
 newtype HandlerT m a = HandlerT (ExceptT Wai.Response m a)
-  deriving (Functor, Applicative, Monad, MonadIO, MonadTrans, MonadError Wai.Response)
+  deriving
+    ( Functor
+    , Applicative
+    , Monad
+    , MonadIO
+    , MonadTrans
+    , MonadThrow
+    , MonadCatch
+    , MonadMask
+    , MonadError Wai.Response
+    )
 
 handleT ::
   MonadIO m =>
   (Wai.Response -> IO Wai.ResponseReceived) -> HandlerT m Wai.Response -> m Wai.ResponseReceived
 handleT respond (HandlerT ma) = liftIO . either respond respond =<< runExceptT ma
 
-handleExceptT :: Monad m => ExceptT DiagnosticReports m a -> HandlerT m a
-handleExceptT ma = do
-  result <- lift $ runExceptT ma
+handleExceptT ::
+  Monad n => (forall x. m x -> HandlerT n x) -> ExceptT DiagnosticReports m a -> HandlerT n a
+handleExceptT f ma = do
+  result <- f $ runExceptT ma
   case result of
     Left err ->
       throwError $ Wai.responseLBS badRequest400 [] (renderDiagnosticReports err)
@@ -305,6 +321,94 @@ evalRules store routesVar xactId resIds = do
           _ -> pure ()
   pure changes
 
+lookupSessionCookie :: Wai.Request -> Maybe ByteString
+lookupSessionCookie request = do
+  cookies <- lookup (fromString "Cookie") $ Wai.requestHeaders request
+  lookup (fromString sessionIdCookieName) $ parseCookies cookies
+
+newtype AuthenticatedUser = AuthenticatedUser String
+
+authenticate ::
+  (MonadIO m, MonadMask m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  HandlerT m AuthenticatedUser
+authenticate store routesVar request = do
+  let store' = Store.hoistStore (hoist lift) store
+  handleExceptT id . withTransaction store' routesVar Nothing $ \xactId _defer -> do
+    sessionTy <- do
+      let resTyName = "session"
+      mSessionTy <- Store.lookupResourceType store' xactId resTyName
+      case mSessionTy of
+        Nothing -> do
+          liftIO . putStrLn $ "warning: no '" ++ resTyName ++ "' resource type (refusing authentication)"
+          lift . throwError $
+            Wai.responseLBS
+              notImplemented501
+              []
+              (fromString $ "error: server has no '" ++ resTyName ++ "' resource type")
+        Just x -> pure x
+
+    value <- maybe authenticationRequired pure $ lookupSessionCookie request
+
+    let sessionId = ByteString.Char8.unpack value
+    exists <- Store.doesResourceExist sessionTy sessionId
+    if exists
+      then do
+        let
+          getStringProperty key = do
+            mValue <- Store.lookupProperty sessionTy sessionId key
+            case mValue of
+              Just (VString x) -> pure x
+              Just x -> do
+                liftIO . putStrLn $
+                  "error: "
+                    ++ renderResourceId (ResourceId (Store.resourceTypeName sessionTy) sessionId)
+                    ++ ":"
+                    ++ key
+                    ++ " is not a string (got "
+                    ++ show x
+                    ++ ")"
+                invalidSession
+              Nothing -> do
+                liftIO . putStrLn $
+                  "error: "
+                    ++ renderResourceId (ResourceId (Store.resourceTypeName sessionTy) sessionId)
+                    ++ " is missing '"
+                    ++ key
+                    ++ "' property"
+                invalidSession
+
+        expires <- do
+          expires <- getStringProperty "expires"
+          case iso8601ParseM $ Text.unpack expires of
+            Nothing -> do
+              liftIO . putStrLn $
+                "error: failed to parse "
+                  ++ renderResourceId (ResourceId (Store.resourceTypeName sessionTy) sessionId)
+                  ++ ":expires as a datetime (got "
+                  ++ show expires
+                  ++ ")"
+              invalidSession
+            Just x -> pure (x :: UTCTime)
+
+        now <- liftIO getCurrentTime
+        if now >= expires
+          then invalidSession
+          else do
+            user <- getStringProperty "user"
+            pure . AuthenticatedUser $ Text.unpack user
+      else invalidSession
+  where
+    authenticationRequired =
+      lift . throwError $
+        Wai.responseLBS unauthorized401 [] (fromString "authentication required")
+
+    invalidSession =
+      lift . throwError $
+        Wai.responseLBS unauthorized401 [] (fromString "invalid session ID")
+
 app ::
   Store (ExceptT DiagnosticReports IO) ->
   Routes ->
@@ -312,12 +416,16 @@ app ::
 app store routesVar request respond = do
   handleT respond $
     case Wai.pathInfo request of
-      [part]
-        | part == fromString ".login" ->
-            case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "POST" -> httpLogin store routesVar request
-              _ -> methodNotAllowed
-      part : parts | part == fromString ".resource" ->
+      [part] | part == fromString ".login" ->
+        case ByteString.Char8.unpack $ Wai.requestMethod request of
+          "POST" -> httpLogin store routesVar request
+          _ -> methodNotAllowed
+      [part] | part == fromString ".logout" ->
+        case ByteString.Char8.unpack $ Wai.requestMethod request of
+          "POST" -> httpLogout store routesVar request
+          _ -> methodNotAllowed
+      part : parts | part == fromString ".resource" -> do
+        _user <- authenticate store routesVar request
         case parts of
           [] ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
@@ -350,13 +458,14 @@ app store routesVar request respond = do
                   _ -> methodNotAllowed
           _ ->
             throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
-      [part]
-        | part == fromString ".transaction" ->
+      part : parts | part == fromString ".transaction" -> do
+        _user <- authenticate store routesVar request
+        case parts of
+          [] ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "GET" -> httpTransactionList store
               _ -> methodNotAllowed
-      [part, action]
-        | part == fromString ".transaction" ->
+          [action] ->
             case Text.unpack action of
               "begin" ->
                 case ByteString.Char8.unpack $ Wai.requestMethod request of
@@ -371,13 +480,17 @@ app store routesVar request respond = do
                   "POST" -> httpTransactionRollback store routesVar request
                   _ -> methodNotAllowed
               _ -> throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+          _ ->
+            throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part]
-        | part == fromString ".export" ->
+        | part == fromString ".export" -> do
+            _user <- authenticate store routesVar request
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "GET" -> httpExport store routesVar request
               _ -> methodNotAllowed
       [part]
-        | part == fromString ".import" ->
+        | part == fromString ".import" -> do
+            _user <- authenticate store routesVar request
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "PUT" -> httpImport store routesVar request
               _ -> methodNotAllowed
@@ -403,7 +516,7 @@ httpResourceGet store routesVar request = do
   resName <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-ResourceName"
   mXactId <- optionalTransactionIdHeader headers
 
-  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+  mBody <- handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
     resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
     Store.readResource resTy resName
   case mBody of
@@ -421,6 +534,25 @@ renderChangeList changes =
   fmap
     (\(changedId, change) -> fromString "* " <> fromString (Build.renderChange changedId change))
     (Map.toList changes)
+
+createSession ::
+  Monad m =>
+  Store.ResourceType m ->
+  -- | Session ID
+  ID ->
+  -- | Username
+  Text ->
+  -- | Expires
+  UTCTime ->
+  m ()
+createSession sessionTy sessionId username expires = do
+  _updated <- Store.writeResource sessionTy (ID.toString sessionId) mempty
+
+  Store.setProperty sessionTy (ID.toString sessionId) "user" $
+    VString username
+
+  Store.setProperty sessionTy (ID.toString sessionId) "expires" $
+    VString (fromString $ iso8601Show expires)
 
 httpLogin ::
   (MonadMask m, MonadIO m) =>
@@ -475,7 +607,7 @@ httpLogin store routesVar request = do
       username <- getFormField "username"
       password <- getFormField "password"
 
-      handleExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
+      handleExceptT lift . withTransaction store routesVar Nothing $ \xactId _defer -> do
         let
           missingResource resTyName = do
             liftIO . putStrLn $ "warning: no '" ++ resTyName ++ "' resource type (skipping login)"
@@ -515,10 +647,11 @@ httpLogin store routesVar request = do
                       Just hashInfo' -> do
                         case Argon2.verifyEncoded hashInfo' (Text.Encoding.encodeUtf8 password) of
                           Argon2Ok -> do
+                            now <- liftIO getCurrentTime
+
                             do
                               -- Clean up expired sessions on login, rather than
                               -- setting up a recurring task.
-                              now <- liftIO getCurrentTime
 
                               sessions <- Store.listResource sessionTy
                               for_ sessions $ \session -> do
@@ -534,12 +667,9 @@ httpLogin store routesVar request = do
 
                             sessionId <- liftIO ID.generate
 
-                            _updated <-
-                              Store.writeResource sessionTy (ID.toString sessionId)
-                                . Text.Lazy.Encoding.encodeUtf8
-                                $ LazyText.fromStrict username
-
                             let days = 3600 * 24 :: Int
+                            let expires = addUTCTime (fromIntegral days) now
+                            createSession sessionTy sessionId username expires
 
                             pure $
                               Wai.responseLBS
@@ -560,6 +690,31 @@ httpLogin store routesVar request = do
                               liftIO . putStrLn $ "error: Argon2.verifyEncoded failed: " ++ show err
                             pure authenticationFailure
 
+httpLogout ::
+  (MonadMask m, MonadIO m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  HandlerT m Wai.Response
+httpLogout store routesVar request = do
+  case lookupSessionCookie request of
+    Nothing ->
+      loggedOut
+    Just value ->
+      case ID.fromString $ ByteString.Char8.unpack value of
+        Nothing ->
+          invalidSessionId
+        Just sessionId -> do
+          handleExceptT lift . withTransaction store routesVar Nothing $ \xactId _defer -> do
+            mSessionTy <- Store.lookupResourceType store xactId "session"
+            for_ mSessionTy $ \sessionTy ->
+              Store.removeResource sessionTy (ID.toString sessionId)
+
+          loggedOut
+  where
+    loggedOut = pure $ Wai.responseLBS ok200 [] (fromString "logged out")
+    invalidSessionId = pure $ Wai.responseLBS badRequest400 [] (fromString "invalid session ID")
+
 httpResourceCreate ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
@@ -575,7 +730,7 @@ httpResourceCreate store routesVar request = do
   let resId = ResourceId resTyName resName
   mXactId <- optionalTransactionIdHeader headers
 
-  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
     resTy <- Store.getResourceType store xactId (fromString resTyName)
     exists <- Store.doesResourceExist resTy resName
     if exists
@@ -633,7 +788,7 @@ httpResourceUpdate store routesVar request = do
                 (fromString "If-Unmodified-Since: invalid date format")
           Just x -> pure $ Just (x :: UTCTime)
 
-  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
     resTy <- Store.getResourceType store xactId resTyName
     mServerModificationTime <- Store.readResourceModificationTime resTy resName
     case mServerModificationTime of
@@ -690,7 +845,7 @@ httpResourceTypeList store routesVar request resTyName = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
   let store' = Store.hoistStore lift store
-  mItems <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
+  mItems <- handleExceptT lift . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
     resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
     lift $ Store.listResource resTy
 
@@ -714,7 +869,7 @@ httpResourceTypeRefresh ::
 httpResourceTypeRefresh store routesVar request resTyName = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
     mResTy <- Store.lookupResourceType store xactId (Text.unpack resTyName)
     case mResTy of
       Nothing ->
@@ -735,7 +890,7 @@ httpResourceTypeRefresh store routesVar request resTyName = do
 
 httpTransactionList :: Monad m => Store (ExceptT DiagnosticReports m) -> HandlerT m Wai.Response
 httpTransactionList store = do
-  xactIds <- handleExceptT $ Store.listTransactions store
+  xactIds <- handleExceptT lift $ Store.listTransactions store
   pure . Wai.responseLBS ok200 [] . fromString $
     foldMap ((++ "\n") . Store.renderTransactionId) xactIds
 
@@ -754,7 +909,7 @@ httpTransactionBegin store routesVar request = do
               . Wai.responseLBS badRequest400 []
               $ fromString "invalid X-Blog-Transaction-Defer value: " <> LazyByteString.fromStrict value
 
-  xactId <- handleExceptT $ Store.beginTransaction store defer
+  xactId <- handleExceptT lift $ Store.beginTransaction store defer
   liftIO $ beginRoutes routesVar xactId
   pure $ Wai.responseLBS ok200 [] (fromString $ Store.renderTransactionId xactId)
 
@@ -766,7 +921,7 @@ httpTransactionCommit store routesVar request = do
   xactId <- do
     value <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-TransactionId"
     parseTransactionId value
-  handleExceptT $ do
+  handleExceptT lift $ do
     transaction <-
       maybe (throwError $ DiagnosticSimple "transaction not found") pure
         =<< Store.lookupTransaction store xactId
@@ -799,7 +954,7 @@ httpTransactionRollback store routesVar request = do
       fmap ByteString.Char8.unpack . requireHeader headers $
         fromString "X-Blog-TransactionId"
     parseTransactionId value
-  handleExceptT $ Store.rollbackTransaction store xactId
+  handleExceptT lift $ Store.rollbackTransaction store xactId
   liftIO $ rollbackRoutes routesVar xactId
   pure $ Wai.responseLBS ok200 [] (fromString $ "rolled back " ++ Store.renderTransactionId xactId)
 
@@ -812,7 +967,7 @@ httpExport ::
 httpExport store routesVar request = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
   content <-
-    handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+    handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
       content <- Store.export store xactId
 
       -- If I don't force `content` here then I get a "thread
@@ -845,7 +1000,7 @@ httpImport ::
   HandlerT m Wai.Response
 httpImport store routesVar request = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
-  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
     imported <- Store.import_ store xactId =<< liftIO (Wai.consumeRequestBodyLazy request)
     if defer
       then do
@@ -887,7 +1042,7 @@ httpResourceLookup store routesVar request resTyName resName = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
   let store' = Store.hoistStore lift store
-  mBody <- handleExceptT . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
+  mBody <- handleExceptT lift . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
     resTy <- MaybeT $ Store.lookupResourceType store xactId (Text.unpack resTyName)
     MaybeT $ Store.readResource resTy (Text.unpack resName)
 
@@ -908,7 +1063,7 @@ httpResourceMetadataLookup ::
 httpResourceMetadataLookup store routesVar request resTyName resName = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+  mBody <- handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
     resTy <- Store.getResourceType store xactId (Text.unpack resTyName)
     Store.readProperty resTy (Text.unpack resName) "metadata"
 
@@ -929,7 +1084,7 @@ httpResourcePropertiesUpdate ::
 httpResourcePropertiesUpdate store routesVar request resTyName resName = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-  handleExceptT . withTransaction store routesVar mXactId $ \xactId defer -> do
+  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
     body <- liftIO $ Wai.consumeRequestBodyLazy request
     Toml.Toml (Toml.Located _offset properties) nonKeys <-
       case Toml.parse $ LazyByteString.toStrict body of
@@ -992,7 +1147,7 @@ httpResourcePropertyLookup ::
 httpResourcePropertyLookup store routesVar request resTyName resName propName = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-  mBody <- handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+  mBody <- handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
     resTy <- Store.getResourceType store xactId $ Text.unpack resTyName
     Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
 
@@ -1013,7 +1168,7 @@ httpRouteGet ::
 httpRouteGet store routesVar request path = do
   mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
 
-  handleExceptT . withTransaction store routesVar mXactId $ \xactId _defer -> do
+  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
     routes <- liftIO $ readActiveRoutes routesVar
     case Blog.Route.lookup path routes of
       Nothing ->

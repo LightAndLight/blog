@@ -9,11 +9,16 @@ module Main (main) where
 
 import Barbies
 import Blog (ResourceId (..), renderResourceId)
+import Blog.Diagnostic (renderDiagnosticReports)
 import qualified Blog.ID as ID
+import Blog.Password (hashPassword)
+import Blog.Session (sessionIdCookieName)
+import qualified Blog.Store as Store
 import Control.Concurrent.Async (async, wait)
 import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)
 import Control.Exception (finally)
-import Control.Monad (guard)
+import Control.Monad (guard, unless, (<=<))
+import Control.Monad.Except (runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Morph (hoist)
 import Control.Monad.Reader (runReaderT)
@@ -26,12 +31,14 @@ import qualified Data.Char as Char
 import Data.Foldable (for_)
 import Data.Functor.Classes (Eq1)
 import Data.Kind (Type)
-import Data.List (sort, stripPrefix)
+import Data.List (find, sort, stripPrefix)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isJust, isNothing, listToMaybe)
 import Data.Set (Set)
 import Data.String (fromString)
+import qualified Data.Text.Lazy as LazyText
+import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.X509.CertificateStore (CertificateStore, readCertificateStore)
 import GHC.Generics (Generic)
 import Hedgehog
@@ -55,10 +62,10 @@ import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Http
 import qualified Network.HTTP.Client.TLS as Http.Tls
 import Network.HTTP.Types.Header (RequestHeaders)
-import Network.HTTP.Types.Status (badRequest400, created201, notFound404, ok200)
+import Network.HTTP.Types.Status (badRequest400, created201, notFound404, ok200, unauthorized401)
 import qualified Network.TLS as Tls
 import Network.TLS.Extra.Cipher (ciphersuite_default)
-import System.Directory (createDirectory, removeDirectoryRecursive)
+import System.Directory (removeDirectoryRecursive)
 import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hClose, hGetContents)
@@ -89,6 +96,28 @@ httpManager caStore =
     serverName = mempty
     serverId = mempty
 
+httpWithCookies ::
+  Http.Manager ->
+  [Http.Cookie] ->
+  -- | URL
+  String ->
+  -- | Method
+  ByteString ->
+  RequestHeaders ->
+  LazyByteString ->
+  IO (Http.Response LazyByteString)
+httpWithCookies manager cookies url method headers body = do
+  request <- do
+    request <- Http.parseRequest url
+    pure
+      request
+        { Http.method = method
+        , Http.requestHeaders = headers
+        , Http.requestBody = Http.RequestBodyLBS body
+        , Http.cookieJar = Just $ Http.createCookieJar cookies
+        }
+  Http.httpLbs request manager
+
 http ::
   Http.Manager ->
   -- | URL
@@ -98,16 +127,7 @@ http ::
   RequestHeaders ->
   LazyByteString ->
   IO (Http.Response LazyByteString)
-http manager url method headers body = do
-  request <- do
-    request <- Http.parseRequest url
-    pure
-      request
-        { Http.method = method
-        , Http.requestHeaders = headers
-        , Http.requestBody = Http.RequestBodyLBS body
-        }
-  Http.httpLbs request manager
+http manager = httpWithCookies manager []
 
 httpGet ::
   Http.Manager ->
@@ -116,6 +136,16 @@ httpGet ::
   RequestHeaders ->
   IO (Http.Response LazyByteString)
 httpGet manager url headers = http manager url (fromString "GET") headers mempty
+
+httpPostWithCookies ::
+  Http.Manager ->
+  [Http.Cookie] ->
+  -- | URL
+  String ->
+  RequestHeaders ->
+  LazyByteString ->
+  IO (Http.Response LazyByteString)
+httpPostWithCookies manager cookies url = httpWithCookies manager cookies url (fromString "POST")
 
 httpPost ::
   Http.Manager ->
@@ -166,13 +196,66 @@ spec = do
         hedgehog $ do
           manager <- liftIO $ httpManager caStore
 
-          cs <- forAll $ Gen.sequential (Range.constant 0 200) initialState commands
+          let username = "test-user"
+          let salt = "test-salt"
+          let password = "test-password"
+          let
+            passwordHash =
+              Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict $
+                hashPassword (fromString salt) (fromString password)
+
+          let
+            state =
+              initialState
+                { stateResourceTypes =
+                    Map.insert "session" StateResourceType{stateResourceTypeContentType = fromString "text/plain"} $
+                      Map.insert "user" StateResourceType{stateResourceTypeContentType = fromString "text/x.phcs"} $
+                        stateResourceTypes initialState
+                , stateResources =
+                    Map.insertWith
+                      (<>)
+                      "user"
+                      (Map.singleton username StateResource{stateResourceContent = passwordHash})
+                      $ stateResources initialState
+                }
+          cs <- forAll $ Gen.sequential (Range.constant 0 100) state (commands username password)
+
           tmpDir <-
             liftIO $ getCanonicalTemporaryDirectory >>= \tmp -> createTempDirectory tmp "blog-server-tests"
           footnote $ "test data: " ++ tmpDir
 
           let dataDir = tmpDir </> "data"
-          liftIO $ createDirectory dataDir
+
+          let
+            -- A hack to seed the database with a user.
+            setupStore :: IO ()
+            setupStore = do
+              store <- Store.fromDirectory dataDir
+
+              let handleExceptT = either (error . ByteString.Lazy.Char8.unpack . renderDiagnosticReports) pure <=< runExceptT
+              handleExceptT . Store.withTransaction store False $ \xactId -> do
+                resourceTy <- Store.getResourceType store xactId "resource"
+                _updated <-
+                  Store.writeResource resourceTy "user" . fromString $
+                    unlines
+                      [ "content-type = \"text/x.phcs\""
+                      , ""
+                      , "[metadata]"
+                      ]
+                _updated <-
+                  Store.writeResource resourceTy "session" . fromString $
+                    unlines
+                      [ "content-type = \"text/plain\""
+                      , ""
+                      , "[metadata]"
+                      ]
+
+                userTy <- Store.getResourceType store xactId "user"
+                _updated <- Store.writeResource userTy username passwordHash
+
+                pure ()
+
+          liftIO setupStore
 
           let
             proc =
@@ -231,16 +314,21 @@ spec = do
           either error pure result
 
           hoist (`finally` cleanup) $ do
-            runReaderT (executeSequential initialState cs) manager
+            runReaderT (executeSequential state cs) manager
 
           liftIO $ removeDirectoryRecursive tmpDir
 
 data State (v :: Type -> Type)
   = State
-  { stateTransaction :: Maybe (StateTransaction v)
+  { stateSessionIds :: [Var ByteString v]
+  , stateTransaction :: Maybe (StateTransaction v)
   , stateResourceTypes :: Map String StateResourceType
   , stateResources :: Map String (Map String StateResource)
   }
+  deriving (Show)
+
+stateSessionId :: State v -> Maybe (Var ByteString v)
+stateSessionId = listToMaybe . stateSessionIds
 
 data StateResourceType
   = StateResourceType
@@ -260,6 +348,7 @@ data StateResource
   = StateResource
   { stateResourceContent :: LazyByteString
   }
+  deriving (Show)
 
 data StateTransaction (v :: Type -> Type)
   = StateTransaction
@@ -268,6 +357,7 @@ data StateTransaction (v :: Type -> Type)
   , stateTransactionResources ::
       StateTransactionResources (Map String StateResource) (Map String StateResource) (Set String)
   }
+  deriving (Show)
 
 data StateTransactionResources create update delete
   = StateTransactionResources
@@ -275,6 +365,7 @@ data StateTransactionResources create update delete
   , stateTransactionResourcesUpdate :: Map String update
   , stateTransactionResourcesDelete :: Map String delete
   }
+  deriving (Show)
 
 stateLookupResourceType ::
   Eq1 v =>
@@ -380,37 +471,64 @@ stateResourcesTransactionView state =
 initialState :: State v
 initialState =
   State
-    { stateTransaction = Nothing
+    { stateSessionIds = []
+    , stateTransaction = Nothing
     , stateResourceTypes = mempty
     , stateResources = mempty
     }
 
+notSession :: String -> Bool
+notSession resTy =
+  -- `session` resource names are generated by the server, so Hedgehog wraps
+  -- them in `Var`. That doesn't fit with the current resource model, so
+  -- I'm just excluding them for now.
+  resTy /= "session"
+
 commands ::
   (MonadGen gen, MonadReader Http.Manager m, MonadIO m) =>
+  -- | Test username
+  String ->
+  -- | Test password
+  String ->
   [Command gen m State]
-commands =
-  [ cBegin
+commands username password =
+  [ cLogin username password
+  , cLogout
+  , cBegin
+  , cBeginNoauth
   , cCommit
+  , cCommitNoauth
   , cResourceTypeCreate
+  , cResourceTypeCreateNoauth
   , cResourceTypeCreateDuplicate
   , cResourceTypeUpdate
+  , cResourceTypeUpdateNoauth
   , cResourceTypeUpdateMissing
   , cResourceTypeList
+  , cResourceTypeListNoauth
   , cResourceTypeGet GetHeaders
   , cResourceTypeGet GetUrl
+  , cResourceTypeGetNoauth GetHeaders
+  , cResourceTypeGetNoauth GetUrl
   , cResourceCreate
+  , cResourceCreateNoauth
   , cResourceCreateMissing
   , cResourceCreateDuplicate
   , cResourceList
+  , cResourceListNoauth
   , cResourceListMissing
   , cResourceGet GetHeaders
   , cResourceGet GetUrl
+  , cResourceGetNoauth GetHeaders
+  , cResourceGetNoauth GetUrl
   , cResourceGetMissing GetHeaders
   , cResourceGetMissing GetUrl
   ]
 
 data ResourceTypeList (v :: Type -> Type)
   = ResourceTypeList
+      -- | Session ID
+      (Var ByteString v)
       -- | Transaction ID
       (Maybe (Var ByteString v))
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -419,23 +537,28 @@ cResourceTypeList :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Co
 cResourceTypeList =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
         pure $
-          ResourceTypeList
+          ResourceTypeList sessionId
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
     )
-    ( \(ResourceTypeList mXactId) -> do
+    ( \(ResourceTypeList sessionId mXactId) -> do
         manager <- ask
         let resTy = "resource"
-        let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
     )
-    [ Require $ \state (ResourceTypeList mXactId) ->
-        ( case mXactId of
-            Nothing -> True
-            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
-    , Ensure $ \old _new (ResourceTypeList mXactId) output -> do
+    [ Require $ \state (ResourceTypeList sessionId mXactId) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
+    , Ensure $ \old _new (ResourceTypeList _sessionId mXactId) output -> do
         classify (fromString "resource type list (inside transaction)") $ isJust mXactId
         classify (fromString "resource type list (outside transaction)") $ isNothing mXactId
 
@@ -456,7 +579,40 @@ cResourceTypeList =
 
         let actual = sort (fmap ByteString.Lazy.Char8.unpack . ByteString.Lazy.Char8.lines $ Http.responseBody output)
         let expected = fmap renderResourceId resourceIds
+        annotateShow old
         actual === expected
+    ]
+
+data ResourceTypeListNoauth (v :: Type -> Type)
+  = ResourceTypeListNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceTypeListNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourceTypeListNoauth =
+  Command
+    ( \state -> do
+        pure $
+          ResourceTypeListNoauth
+            <$> Gen.element
+              ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+    )
+    ( \(ResourceTypeListNoauth mXactId) -> do
+        manager <- ask
+        let resTy = "resource"
+        let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
+    )
+    [ Require $ \state (ResourceTypeListNoauth mXactId) ->
+        ( case mXactId of
+            Nothing -> True
+            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+        )
+    , Ensure $ \_old _new (ResourceTypeListNoauth mXactId) output -> do
+        classify (fromString "resource type list (unauthenticated)") $ isJust mXactId
+        Http.responseStatus output === unauthorized401
     ]
 
 genResourceName :: MonadGen m => m String
@@ -470,6 +626,8 @@ genStateResourceType = StateResourceType <$> fmap fromString (Gen.string (Range.
 
 data ResourceTypeCreate (v :: Type -> Type)
   = ResourceTypeCreate
+      -- | Session ID
+      (Var ByteString v)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
@@ -481,31 +639,34 @@ cResourceTypeCreate :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => 
 cResourceTypeCreate =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
         pure $
-          ResourceTypeCreate
+          ResourceTypeCreate sessionId
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> genResourceName
             <*> genStateResourceType
     )
-    ( \(ResourceTypeCreate mXactId resName value) -> do
+    ( \(ResourceTypeCreate sessionId mXactId resName value) -> do
         manager <- ask
         let
           headers =
-            [ (fromString "X-Blog-ResourceType", fromString "resource")
-            , (fromString "X-Blog-ResourceName", fromString resName)
-            ]
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $
           httpPost manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
     )
-    [ Require $ \state (ResourceTypeCreate mXactId resName _value) ->
-        ( case mXactId of
-            Nothing -> True
-            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceTypeCreate sessionId mXactId resName _value) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && (not $ resName `Map.member` stateResourceTypesTransactionView state)
-    , Update $ \state (ResourceTypeCreate mXactId resName value) _output ->
+    , Update $ \state (ResourceTypeCreate _sessionId mXactId resName value) _output ->
         case mXactId of
           Nothing ->
             state
@@ -527,7 +688,7 @@ cResourceTypeCreate =
                     in
                       state{stateTransaction = Just transaction'}
               _ -> state
-    , Ensure $ \_old _new (ResourceTypeCreate mXactId _resName value) output -> do
+    , Ensure $ \_old _new (ResourceTypeCreate _sessionId mXactId _resName value) output -> do
         label (fromString "resource type create")
         classify (fromString "resource type create (inside transaction)") $ isJust mXactId
         classify (fromString "resource type create (outside transaction)") $ isNothing mXactId
@@ -537,21 +698,28 @@ cResourceTypeCreate =
         Http.responseStatus output === created201
     ]
 
-cResourceTypeCreateDuplicate ::
+data ResourceTypeCreateNoauth (v :: Type -> Type)
+  = ResourceTypeCreateNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource name
+      String
+      StateResourceType
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceTypeCreateNoauth ::
   (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
-cResourceTypeCreateDuplicate =
+cResourceTypeCreateNoauth =
   Command
     ( \state -> do
-        let resourceTypes = stateResourceTypesTransactionView state
-        guard . not $ null resourceTypes
         pure $
-          ResourceTypeCreate
+          ResourceTypeCreateNoauth
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
-            <*> Gen.element (Map.keys resourceTypes)
+            <*> genResourceName
             <*> genStateResourceType
     )
-    ( \(ResourceTypeCreate mXactId resName value) -> do
+    ( \(ResourceTypeCreateNoauth mXactId resName value) -> do
         manager <- ask
         let
           headers =
@@ -562,13 +730,54 @@ cResourceTypeCreateDuplicate =
         liftIO $
           httpPost manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
     )
-    [ Require $ \state (ResourceTypeCreate mXactId resName _value) ->
+    [ Require $ \state (ResourceTypeCreateNoauth mXactId resName _value) ->
         ( case mXactId of
             Nothing -> True
             Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
         )
+          && (not $ resName `Map.member` stateResourceTypesTransactionView state)
+    , Ensure $ \_old _new (ResourceTypeCreateNoauth _mXactId _resName _value) output -> do
+        label (fromString "resource type create (unauthenticated)")
+
+        Http.responseStatus output === unauthorized401
+    ]
+
+cResourceTypeCreateDuplicate ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourceTypeCreateDuplicate =
+  Command
+    ( \state -> do
+        sessionId <- stateSessionId state
+        let resourceTypes = stateResourceTypesTransactionView state
+        guard . not $ null resourceTypes
+        pure $
+          ResourceTypeCreate
+            sessionId
+            <$> Gen.element
+              ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+            <*> Gen.element (Map.keys resourceTypes)
+            <*> genStateResourceType
+    )
+    ( \(ResourceTypeCreate sessionId mXactId resName value) -> do
+        manager <- ask
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $
+          httpPost manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
+    )
+    [ Require $ \state (ResourceTypeCreate sessionId mXactId resName _value) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && (isJust $ stateLookupResourceType state mXactId resName)
-    , Ensure $ \_old _new (ResourceTypeCreate mXactId _resName _value) output -> do
+    , Ensure $ \_old _new (ResourceTypeCreate _sessionId mXactId _resName _value) output -> do
         label (fromString "resource type create (duplicate)")
         classify (fromString "resource type create (duplicate) (inside transaction)") $ isJust mXactId
         classify (fromString "resource type create (duplicate) (outside transaction)") $ isNothing mXactId
@@ -577,8 +786,14 @@ cResourceTypeCreateDuplicate =
         Http.responseStatus output === badRequest400
     ]
 
+genResourceContent :: MonadGen m => StateResourceType -> m LazyByteString
+genResourceContent (StateResourceType _content) =
+  ByteString.Lazy.Char8.pack <$> Gen.string (Range.constant 0 1000) Gen.alphaNum
+
 data ResourceCreate (v :: Type -> Type)
   = ResourceCreate
+      -- | Session ID
+      (Var ByteString v)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
@@ -589,19 +804,17 @@ data ResourceCreate (v :: Type -> Type)
       LazyByteString
   deriving (Show, Generic, FunctorB, TraversableB)
 
-genResourceContent :: MonadGen m => StateResourceType -> m LazyByteString
-genResourceContent (StateResourceType _content) =
-  ByteString.Lazy.Char8.pack <$> Gen.string (Range.constant 0 1000) Gen.alphaNum
-
 cResourceCreate :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
 cResourceCreate =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let resourceTypes = stateResourceTypesTransactionView state
         guard . not $ null resourceTypes
 
         pure $
-          (\mXactId (resTy, resContent) resName -> ResourceCreate mXactId resTy resName resContent)
+          (\mXactId (resTy, resContent) resName -> ResourceCreate sessionId mXactId resTy resName resContent)
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> ( do
@@ -610,26 +823,29 @@ cResourceCreate =
                 )
             <*> genResourceName
     )
-    ( \(ResourceCreate mXactId resTy resName content) -> do
+    ( \(ResourceCreate sessionId mXactId resTy resName content) -> do
         manager <- ask
         let
           headers =
-            [ (fromString "X-Blog-ResourceType", fromString resTy)
-            , (fromString "X-Blog-ResourceName", fromString resName)
-            ]
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
     )
-    [ Require $ \state (ResourceCreate mXactId resTy resName _content) ->
-        ( case mXactId of
-            Nothing ->
-              True
-            Just xactId ->
-              fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceCreate sessionId mXactId resTy resName _content) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing ->
+                   True
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && isJust (stateLookupResourceType state mXactId resTy)
           && isNothing (stateLookupResource state mXactId resTy resName)
-    , Update $ \state (ResourceCreate mXactId resTy resName content) _output ->
+          && notSession resTy
+    , Update $ \state (ResourceCreate _sessionId mXactId resTy resName content) _output ->
         case mXactId of
           Nothing ->
             state
@@ -652,7 +868,7 @@ cResourceCreate =
                     in
                       state{stateTransaction = Just transaction'}
               _ -> state
-    , Ensure $ \_old _new (ResourceCreate mXactId _resTy _resName content) output -> do
+    , Ensure $ \_old _new (ResourceCreate _sessionId mXactId _resTy _resName content) output -> do
         label (fromString "resource create")
         classify (fromString "resource create (inside transaction)") $ isJust mXactId
         classify (fromString "resource create (outside transaction)") $ isNothing mXactId
@@ -667,33 +883,36 @@ cResourceCreateMissing ::
 cResourceCreateMissing =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
         pure $
-          ResourceCreate
+          ResourceCreate sessionId
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> genResourceName
             <*> genResourceName
             <*> pure mempty
     )
-    ( \(ResourceCreate mXactId resTy resName content) -> do
+    ( \(ResourceCreate sessionId mXactId resTy resName content) -> do
         manager <- ask
         let
           headers =
-            [ (fromString "X-Blog-ResourceType", fromString resTy)
-            , (fromString "X-Blog-ResourceName", fromString resName)
-            ]
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
     )
-    [ Require $ \state (ResourceCreate mXactId resTy _resName _content) ->
-        ( case mXactId of
-            Nothing ->
-              True
-            Just xactId ->
-              fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceCreate sessionId mXactId resTy _resName _content) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing ->
+                   True
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && isNothing (stateLookupResourceType state mXactId resTy)
-    , Ensure $ \_old _new (ResourceCreate mXactId _resTy _resName _content) output -> do
+    , Ensure $ \_old _new (ResourceCreate _sessionId mXactId _resTy _resName _content) output -> do
         label (fromString "resource create (missing)")
         classify (fromString "resource create (missing) (inside transaction)") $ isJust mXactId
         classify (fromString "resource create (missing) (outside transaction)") $ isNothing mXactId
@@ -707,10 +926,12 @@ cResourceCreateDuplicate ::
 cResourceCreateDuplicate =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let nonemptyResources = Map.filter (not . null) $ stateResourcesTransactionView state
         guard . not $ null nonemptyResources
         pure $
-          (\mXactId (resTy, resName) -> ResourceCreate mXactId resTy resName mempty)
+          (\mXactId (resTy, resName) -> ResourceCreate sessionId mXactId resTy resName mempty)
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> ( do
@@ -719,7 +940,66 @@ cResourceCreateDuplicate =
                     pure (resTy, resName)
                 )
     )
-    ( \(ResourceCreate mXactId resTy resName content) -> do
+    ( \(ResourceCreate sessionId mXactId resTy resName content) -> do
+        manager <- ask
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
+    )
+    [ Require $ \state (ResourceCreate sessionId mXactId resTy resName _content) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing ->
+                   True
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
+          && isJust (stateLookupResource state mXactId resTy resName)
+    , Ensure $ \_old _new (ResourceCreate _sessionId mXactId _resTy _resName _content) output -> do
+        label (fromString "resource create (duplicate)")
+        classify (fromString "resource create (duplicate) (inside transaction)") $ isJust mXactId
+        classify (fromString "resource create (duplicate) (outside transaction)") $ isNothing mXactId
+
+        annotateShow output
+        Http.responseStatus output === badRequest400
+    ]
+
+data ResourceCreateNoauth (v :: Type -> Type)
+  = ResourceCreateNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource type
+      String
+      -- | Resource name
+      String
+      -- | Content
+      LazyByteString
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceCreateNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourceCreateNoauth =
+  Command
+    ( \state -> do
+        let resourceTypes = stateResourceTypesTransactionView state
+        guard . not $ null resourceTypes
+
+        pure $
+          (\mXactId (resTy, resContent) resName -> ResourceCreateNoauth mXactId resTy resName resContent)
+            <$> Gen.element
+              ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+            <*> ( do
+                    (resTyName, resTy) <- Gen.element . Map.toList $ stateResourceTypesTransactionView state
+                    (,) resTyName <$> genResourceContent resTy
+                )
+            <*> genResourceName
+    )
+    ( \(ResourceCreateNoauth mXactId resTy resName content) -> do
         manager <- ask
         let
           headers =
@@ -729,25 +1009,24 @@ cResourceCreateDuplicate =
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
     )
-    [ Require $ \state (ResourceCreate mXactId resTy resName _content) ->
+    [ Require $ \state (ResourceCreateNoauth mXactId resTy resName _content) ->
         ( case mXactId of
             Nothing ->
               True
             Just xactId ->
               fmap stateTransactionId (stateTransaction state) == Just xactId
         )
-          && isJust (stateLookupResource state mXactId resTy resName)
-    , Ensure $ \_old _new (ResourceCreate mXactId _resTy _resName _content) output -> do
-        label (fromString "resource create (duplicate)")
-        classify (fromString "resource create (duplicate) (inside transaction)") $ isJust mXactId
-        classify (fromString "resource create (duplicate) (outside transaction)") $ isNothing mXactId
-
-        annotateShow output
-        Http.responseStatus output === badRequest400
+          && isJust (stateLookupResourceType state mXactId resTy)
+          && isNothing (stateLookupResource state mXactId resTy resName)
+    , Ensure $ \_old _new (ResourceCreateNoauth _mXactId _resTy _resName _content) output -> do
+        label (fromString "resource create (unauthenticated)")
+        Http.responseStatus output === unauthorized401
     ]
 
 data ResourceList (v :: Type -> Type)
   = ResourceList
+      -- | Session ID
+      (Var ByteString v)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
@@ -758,28 +1037,35 @@ cResourceList :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Comman
 cResourceList =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let resourceTypes = stateResourceTypesTransactionView state
         guard . not $ null resourceTypes
         pure $
-          ResourceList
+          ResourceList sessionId
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> Gen.element (Map.keys resourceTypes)
     )
-    ( \(ResourceList mXactId resTy) -> do
+    ( \(ResourceList sessionId mXactId resTy) -> do
         manager <- ask
-        let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
     )
-    [ Require $ \state (ResourceList mXactId resTy) ->
-        ( case mXactId of
-            Nothing ->
-              Map.member resTy (stateResourceTypes state)
-            Just xactId ->
-              fmap stateTransactionId (stateTransaction state) == Just xactId
-                && Map.member resTy (stateResourceTypesTransactionView state)
-        )
-    , Ensure $ \old _new (ResourceList mXactId resTy) output -> do
+    [ Require $ \state (ResourceList sessionId mXactId resTy) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing ->
+                   Map.member resTy (stateResourceTypes state)
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+                     && Map.member resTy (stateResourceTypesTransactionView state)
+             )
+          && notSession resTy
+    , Ensure $ \old _new (ResourceList _sessionId mXactId resTy) output -> do
         classify (fromString "resource list (inside transaction)") $ isJust mXactId
         classify (fromString "resource list (outside transaction)") $ isNothing mXactId
 
@@ -807,26 +1093,31 @@ cResourceListMissing :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) =>
 cResourceListMissing =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
         pure $
-          ResourceList
+          ResourceList sessionId
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> genResourceName
     )
-    ( \(ResourceList mXactId resTy) -> do
+    ( \(ResourceList sessionId mXactId resTy) -> do
         manager <- ask
-        let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
     )
-    [ Require $ \state (ResourceList mXactId resTy) ->
-        ( case mXactId of
-            Nothing ->
-              True
-            Just xactId ->
-              fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceList sessionId mXactId resTy) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing ->
+                   True
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && isNothing (stateLookupResourceType state mXactId resTy)
-    , Ensure $ \_old _new (ResourceList mXactId _resTy) output -> do
+    , Ensure $ \_old _new (ResourceList _sessionId mXactId _resTy) output -> do
         classify (fromString "resource list (missing) (inside transaction)") $ isJust mXactId
         classify (fromString "resource list (missing) (outside transaction)") $ isNothing mXactId
 
@@ -834,8 +1125,48 @@ cResourceListMissing =
         Http.responseStatus output === notFound404
     ]
 
+data ResourceListNoauth (v :: Type -> Type)
+  = ResourceListNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource type
+      String
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceListNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourceListNoauth =
+  Command
+    ( \state -> do
+        let resourceTypes = stateResourceTypesTransactionView state
+        guard . not $ null resourceTypes
+        pure $
+          ResourceListNoauth
+            <$> Gen.element
+              ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+            <*> Gen.element (Map.keys resourceTypes)
+    )
+    ( \(ResourceListNoauth mXactId resTy) -> do
+        manager <- ask
+        let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
+    )
+    [ Require $ \state (ResourceListNoauth mXactId resTy) ->
+        ( case mXactId of
+            Nothing ->
+              Map.member resTy (stateResourceTypes state)
+            Just xactId ->
+              fmap stateTransactionId (stateTransaction state) == Just xactId
+                && Map.member resTy (stateResourceTypesTransactionView state)
+        )
+    , Ensure $ \_old _new (ResourceListNoauth _mXactId _resTy) output -> do
+        label $ fromString "resource list (unauthenticated)"
+        Http.responseStatus output === unauthorized401
+    ]
+
 data ResourceGet (v :: Type -> Type)
   = ResourceGet
+      -- | Session ID
+      (Var ByteString v)
       -- | Use the transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
@@ -849,10 +1180,12 @@ cResourceGet ::
 cResourceGet getStyle =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let nonemptyResources = Map.filter (not . null) $ stateResourcesTransactionView state
         guard . not $ null nonemptyResources
         pure $
-          (\mXactId (resTy, resName) -> ResourceGet mXactId resTy resName)
+          (\mXactId (resTy, resName) -> ResourceGet sessionId mXactId resTy resName)
             <$> Gen.element ([Nothing] ++ [Just $ stateTransactionId xact | Just xact <- [stateTransaction state]])
             <*> ( do
                     (resTy, res) <- Gen.element $ Map.toList nonemptyResources
@@ -860,28 +1193,33 @@ cResourceGet getStyle =
                     pure (resTy, resName)
                 )
     )
-    ( \(ResourceGet mXactId resTy resName) -> do
+    ( \(ResourceGet sessionId mXactId resTy resName) -> do
         manager <- ask
         case getStyle of
           GetHeaders -> do
             let
               headers =
-                [ (fromString "X-Blog-ResourceType", fromString resTy)
-                , (fromString "X-Blog-ResourceName", fromString resName)
-                ]
+                sessionCookieHeaders (concrete sessionId)
+                  ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
+                     , (fromString "X-Blog-ResourceName", fromString resName)
+                     ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
           GetUrl -> do
-            let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            let
+              headers =
+                sessionCookieHeaders (concrete sessionId)
+                  ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
     )
-    [ Require $ \state (ResourceGet mXactId resTy resName) ->
-        ( case mXactId of
-            Nothing -> True
-            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceGet sessionId mXactId resTy resName) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && isJust (stateLookupResource state mXactId resTy resName)
-    , Ensure $ \old _new (ResourceGet mXactId resTyName resName) output -> do
+    , Ensure $ \old _new (ResourceGet _sessionId mXactId resTyName resName) output -> do
         let
           getStyleDesc =
             case getStyle of
@@ -905,38 +1243,45 @@ cResourceGetMissing ::
 cResourceGetMissing getStyle =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let currentResources = stateResourcesTransactionView state
         let genXactId =
               Gen.element ([Nothing] ++ [Just $ stateTransactionId xact | Just xact <- [stateTransaction state]])
         pure $
           Gen.choice $
-            [ResourceGet <$> genXactId <*> genResourceName <*> genResourceName]
-              ++ [ ResourceGet <$> genXactId <*> Gen.element (Map.keys currentResources) <*> genResourceName
+            [ResourceGet sessionId <$> genXactId <*> genResourceName <*> genResourceName]
+              ++ [ ResourceGet sessionId <$> genXactId <*> Gen.element (Map.keys currentResources) <*> genResourceName
                  | not $ null currentResources
                  ]
     )
-    ( \(ResourceGet mXactId resTy resName) -> do
+    ( \(ResourceGet sessionId mXactId resTy resName) -> do
         manager <- ask
         case getStyle of
           GetHeaders -> do
             let
               headers =
-                [ (fromString "X-Blog-ResourceType", fromString resTy)
-                , (fromString "X-Blog-ResourceName", fromString resName)
-                ]
+                sessionCookieHeaders (concrete sessionId)
+                  ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
+                     , (fromString "X-Blog-ResourceName", fromString resName)
+                     ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
           GetUrl -> do
-            let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            let
+              headers =
+                sessionCookieHeaders (concrete sessionId)
+                  ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
     )
-    [ Require $ \state (ResourceGet mXactId resTy resName) ->
-        ( case mXactId of
-            Nothing -> True
-            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceGet sessionId mXactId resTy resName) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && isNothing (stateLookupResource state mXactId resTy resName)
-    , Ensure $ \_old _new (ResourceGet mXactId _resTyName _resName) output -> do
+    , Ensure $ \_old _new (ResourceGet _sessionId mXactId _resTyName _resName) output -> do
         let
           getStyleDesc =
             case getStyle of
@@ -956,8 +1301,68 @@ cResourceGetMissing getStyle =
           GetUrl -> Http.responseStatus output === notFound404
     ]
 
+data ResourceGetNoauth (v :: Type -> Type)
+  = ResourceGetNoauth
+      -- | Use the transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource type
+      String
+      -- | Resource name
+      String
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceGetNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => GetStyle -> Command gen m State
+cResourceGetNoauth getStyle =
+  Command
+    ( \state -> do
+        let nonemptyResources = Map.filter (not . null) $ stateResourcesTransactionView state
+        guard . not $ null nonemptyResources
+        pure $
+          (\mXactId (resTy, resName) -> ResourceGetNoauth mXactId resTy resName)
+            <$> Gen.element ([Nothing] ++ [Just $ stateTransactionId xact | Just xact <- [stateTransaction state]])
+            <*> ( do
+                    (resTy, res) <- Gen.element $ Map.toList nonemptyResources
+                    (resName, _resValue) <- Gen.element $ Map.toList res
+                    pure (resTy, resName)
+                )
+    )
+    ( \(ResourceGetNoauth mXactId resTy resName) -> do
+        manager <- ask
+        case getStyle of
+          GetHeaders -> do
+            let
+              headers =
+                [ (fromString "X-Blog-ResourceType", fromString resTy)
+                , (fromString "X-Blog-ResourceName", fromString resName)
+                ]
+                  ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            liftIO $ httpGet manager "https://localhost:8080/.resource" headers
+          GetUrl -> do
+            let
+              headers =
+                [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+    )
+    [ Require $ \state (ResourceGetNoauth mXactId resTy resName) ->
+        ( case mXactId of
+            Nothing -> True
+            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+        )
+          && isJust (stateLookupResource state mXactId resTy resName)
+    , Ensure $ \_old _new (ResourceGetNoauth _mXactId _resTyName _resName) output -> do
+        let
+          getStyleDesc =
+            case getStyle of
+              GetHeaders -> "(via headers)"
+              GetUrl -> "(via url)"
+        label (fromString $ "resource get (unauthenticated) " ++ getStyleDesc)
+        Http.responseStatus output === unauthorized401
+    ]
+
 data ResourceTypeUpdate (v :: Type -> Type)
   = ResourceTypeUpdate
+      (Var ByteString v)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
@@ -970,18 +1375,20 @@ cResourceTypeUpdate :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => 
 cResourceTypeUpdate =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let resourceTypes = stateResourceTypesTransactionView state
         guard . not $ null resourceTypes
 
         pure $
           Gen.choice $
-            [ (\mXactId resName -> ResourceTypeUpdate mXactId resName)
+            [ (\mXactId resName -> ResourceTypeUpdate sessionId mXactId resName)
                 <$> Gen.element
                   ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
                 <*> Gen.element (Map.keys resourceTypes)
                 <*> genStateResourceType
             ]
-              ++ [ (\resName -> ResourceTypeUpdate (Just $ stateTransactionId transaction) resName)
+              ++ [ (\resName -> ResourceTypeUpdate sessionId (Just $ stateTransactionId transaction) resName)
                      <$> Gen.element (Map.keys newResourceTypes)
                      <*> genStateResourceType
                  | Just transaction <- [stateTransaction state]
@@ -989,24 +1396,26 @@ cResourceTypeUpdate =
                  , not $ null newResourceTypes
                  ]
     )
-    ( \(ResourceTypeUpdate mXactId resName value) -> do
+    ( \(ResourceTypeUpdate sessionId mXactId resName value) -> do
         manager <- ask
         let
           headers =
-            [ (fromString "X-Blog-ResourceType", fromString "resource")
-            , (fromString "X-Blog-ResourceName", fromString resName)
-            ]
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPut manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
     )
-    [ Require $ \state (ResourceTypeUpdate mXactId resName _value) ->
-        ( case mXactId of
-            Nothing -> True
-            Just xactId ->
-              fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceTypeUpdate sessionId mXactId resName _value) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && isJust (stateLookupResourceType state mXactId resName)
-    , Update $ \state (ResourceTypeUpdate mXactId resName value) _output ->
+    , Update $ \state (ResourceTypeUpdate _sessionId mXactId resName value) _output ->
         case mXactId of
           Nothing ->
             state
@@ -1036,7 +1445,7 @@ cResourceTypeUpdate =
                     in
                       state{stateTransaction = Just transaction'}
               _ -> state
-    , Ensure $ \old _new (ResourceTypeUpdate mXactId resName value) output -> do
+    , Ensure $ \old _new (ResourceTypeUpdate _sessionId mXactId resName value) output -> do
         label (fromString "resource type update")
         classify (fromString "resource type update (inside transaction)") $ isJust mXactId
         classify (fromString "resource type update (outside transaction)") $ isNothing mXactId
@@ -1056,14 +1465,77 @@ cResourceTypeUpdateMissing ::
 cResourceTypeUpdateMissing =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
         pure $
-          ResourceTypeUpdate
+          ResourceTypeUpdate sessionId
             <$> Gen.element
               ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
             <*> genResourceName
             <*> genStateResourceType
     )
-    ( \(ResourceTypeUpdate mXactId resName value) -> do
+    ( \(ResourceTypeUpdate sessionId mXactId resName value) -> do
+        manager <- ask
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
+                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 ]
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $ httpPut manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
+    )
+    [ Require $ \state (ResourceTypeUpdate sessionId mXactId resName _value) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId ->
+                   fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
+          && isNothing (stateLookupResourceType state mXactId resName)
+    , Ensure $ \_old _new (ResourceTypeUpdate _sessionId mXactId _resName _value) output -> do
+        label (fromString "resource type update (missing)")
+        classify (fromString "resource type update (missing) (inside transaction)") $ isJust mXactId
+        classify (fromString "resource type update (missing) (outside transaction)") $ isNothing mXactId
+
+        annotateShow output
+        Http.responseStatus output === badRequest400
+    ]
+
+data ResourceTypeUpdateNoauth (v :: Type -> Type)
+  = ResourceTypeUpdateNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource name
+      String
+      -- | New value
+      StateResourceType
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceTypeUpdateNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourceTypeUpdateNoauth =
+  Command
+    ( \state -> do
+        let resourceTypes = stateResourceTypesTransactionView state
+        guard . not $ null resourceTypes
+
+        pure $
+          Gen.choice $
+            [ (\mXactId resName -> ResourceTypeUpdateNoauth mXactId resName)
+                <$> Gen.element
+                  ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+                <*> Gen.element (Map.keys resourceTypes)
+                <*> genStateResourceType
+            ]
+              ++ [ (\resName -> ResourceTypeUpdateNoauth (Just $ stateTransactionId transaction) resName)
+                     <$> Gen.element (Map.keys newResourceTypes)
+                     <*> genStateResourceType
+                 | Just transaction <- [stateTransaction state]
+                 , let newResourceTypes = stateTransactionResourcesCreate (stateTransactionResourceTypes transaction)
+                 , not $ null newResourceTypes
+                 ]
+    )
+    ( \(ResourceTypeUpdateNoauth mXactId resName value) -> do
         manager <- ask
         let
           headers =
@@ -1073,67 +1545,72 @@ cResourceTypeUpdateMissing =
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPut manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
     )
-    [ Require $ \state (ResourceTypeUpdate mXactId resName _value) ->
+    [ Require $ \state (ResourceTypeUpdateNoauth mXactId resName _value) ->
         ( case mXactId of
             Nothing -> True
             Just xactId ->
               fmap stateTransactionId (stateTransaction state) == Just xactId
         )
-          && isNothing (stateLookupResourceType state mXactId resName)
-    , Ensure $ \_old _new (ResourceTypeUpdate mXactId _resName _value) output -> do
-        label (fromString "resource type update (missing)")
-        classify (fromString "resource type update (missing) (inside transaction)") $ isJust mXactId
-        classify (fromString "resource type update (missing) (outside transaction)") $ isNothing mXactId
-
-        annotateShow output
-        Http.responseStatus output === badRequest400
+          && isJust (stateLookupResourceType state mXactId resName)
+    , Ensure $ \_old _new (ResourceTypeUpdateNoauth _mXactId _resName _value) output -> do
+        label (fromString "resource type update (unauthenticated)")
+        Http.responseStatus output === unauthorized401
     ]
+
+data GetStyle = GetHeaders | GetUrl
 
 data ResourceTypeGet (v :: Type -> Type)
   = ResourceTypeGet
+      -- | Session ID
+      (Var ByteString v)
       -- | Use the transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
       String
   deriving (Show, Generic, FunctorB, TraversableB)
 
-data GetStyle = GetHeaders | GetUrl
-
 cResourceTypeGet ::
   (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => GetStyle -> Command gen m State
 cResourceTypeGet getStyle =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
+
         let resourceTypes = stateResourceTypesTransactionView state
         guard . not $ null resourceTypes
         pure $
-          ResourceTypeGet
+          ResourceTypeGet sessionId
             <$> Gen.element ([Nothing] ++ [Just $ stateTransactionId xact | Just xact <- [stateTransaction state]])
             <*> Gen.element (Map.keys resourceTypes)
     )
-    ( \(ResourceTypeGet mXactId resName) -> do
+    ( \(ResourceTypeGet sessionId mXactId resName) -> do
         manager <- ask
         let resTy = "resource"
         case getStyle of
           GetHeaders -> do
             let
               headers =
-                [ (fromString "X-Blog-ResourceType", fromString resTy)
-                , (fromString "X-Blog-ResourceName", fromString resName)
-                ]
+                sessionCookieHeaders (concrete sessionId)
+                  ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
+                     , (fromString "X-Blog-ResourceName", fromString resName)
+                     ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
           GetUrl -> do
-            let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            let
+              headers =
+                sessionCookieHeaders (concrete sessionId)
+                  ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
     )
-    [ Require $ \state (ResourceTypeGet mXactId resName) ->
-        ( case mXactId of
-            Nothing -> True
-            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
-        )
+    [ Require $ \state (ResourceTypeGet sessionId mXactId resName) ->
+        Just sessionId == stateSessionId state
+          && ( case mXactId of
+                 Nothing -> True
+                 Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+             )
           && (isJust $ stateLookupResourceType state mXactId resName)
-    , Ensure $ \old _new (ResourceTypeGet mXactId resName) output -> do
+    , Ensure $ \old _new (ResourceTypeGet _sessionId mXactId resName) output -> do
         let
           getStyleDesc =
             case getStyle of
@@ -1154,21 +1631,160 @@ cResourceTypeGet getStyle =
         Http.responseBody output === stateResourceTypeContent resTy
     ]
 
+data ResourceTypeGetNoauth (v :: Type -> Type)
+  = ResourceTypeGetNoauth
+      -- | Use the transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource name
+      String
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceTypeGetNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => GetStyle -> Command gen m State
+cResourceTypeGetNoauth getStyle =
+  Command
+    ( \state -> do
+        let resourceTypes = stateResourceTypesTransactionView state
+        guard . not $ null resourceTypes
+        pure $
+          ResourceTypeGetNoauth
+            <$> Gen.element ([Nothing] ++ [Just $ stateTransactionId xact | Just xact <- [stateTransaction state]])
+            <*> Gen.element (Map.keys resourceTypes)
+    )
+    ( \(ResourceTypeGetNoauth mXactId resName) -> do
+        manager <- ask
+        let resTy = "resource"
+        case getStyle of
+          GetHeaders -> do
+            let
+              headers =
+                [ (fromString "X-Blog-ResourceType", fromString resTy)
+                , (fromString "X-Blog-ResourceName", fromString resName)
+                ]
+                  ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            liftIO $ httpGet manager "https://localhost:8080/.resource" headers
+          GetUrl -> do
+            let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+    )
+    [ Require $ \state (ResourceTypeGetNoauth mXactId resName) ->
+        ( case mXactId of
+            Nothing -> True
+            Just xactId -> fmap stateTransactionId (stateTransaction state) == Just xactId
+        )
+          && (isJust $ stateLookupResourceType state mXactId resName)
+    , Ensure $ \_old _new (ResourceTypeGetNoauth _mXactId _resName) output -> do
+        let
+          getStyleDesc =
+            case getStyle of
+              GetHeaders -> "(via headers)"
+              GetUrl -> "(via url)"
+        label (fromString $ "resource type get (unauthorised) " ++ getStyleDesc)
+        Http.responseStatus output === unauthorized401
+    ]
+
+data Login (v :: Type -> Type)
+  = Login
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cLogin ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) =>
+  -- | Test username
+  String ->
+  -- | Test password
+  String ->
+  Command gen m State
+cLogin username password =
+  Command
+    (\_state -> Just $ pure Login)
+    ( \Login -> do
+        manager <- ask
+        let headers = [(fromString "Content-Type", fromString "application/xxx-form-urlencoded")]
+        response <-
+          liftIO $
+            httpPostWithCookies manager [] "https://localhost:8080/.login" headers $
+              LazyByteString.intercalate
+                (fromString "&")
+                [fromString $ "username=" ++ username, fromString $ "password=" ++ password]
+
+        let status = Http.responseStatus response
+        unless (status == ok200) . error $ "unexpected response status: " ++ show status
+
+        cookie <-
+          maybe
+            (error $ "response missing session ID cookie: " ++ show (Http.responseCookieJar response))
+            pure
+            . find ((fromString sessionIdCookieName ==) . Http.cookie_name)
+            . Http.destroyCookieJar
+            $ Http.responseCookieJar response
+
+        pure $ Http.cookie_value cookie
+    )
+    [ Update $ \state Login output ->
+        state{stateSessionIds = output : stateSessionIds state}
+    , Ensure $ \_old _new _cmd _output -> do
+        label $ fromString "login"
+    ]
+
+data Logout (v :: Type -> Type)
+  = Logout
+      -- | Session ID
+      (Var ByteString v)
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cLogout ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) =>
+  Command gen m State
+cLogout =
+  Command
+    ( \state -> do
+        guard . not . null $ stateSessionIds state
+        pure $
+          Logout <$> Gen.element (stateSessionIds state)
+    )
+    ( \(Logout sessionId) -> do
+        manager <- ask
+        let headers = sessionCookieHeaders (concrete sessionId)
+        liftIO $ httpPost manager "https://localhost:8080/.logout" headers mempty
+    )
+    [ Require $ \state (Logout sessionId) ->
+        sessionId `elem` stateSessionIds state
+    , Update $ \state (Logout sessionId) _output ->
+        state{stateSessionIds = filter (/= sessionId) (stateSessionIds state)}
+    , Ensure $ \_old _new _cmd output -> do
+        label $ fromString "logout"
+
+        Http.responseStatus output === ok200
+    ]
+
+sessionCookieHeaders :: ByteString -> RequestHeaders
+sessionCookieHeaders sessionId = [(fromString "Cookie", fromString (sessionIdCookieName ++ "=") <> sessionId)]
+
 data Begin (v :: Type -> Type)
   = Begin
+      -- | Session ID
+      (Var ByteString v)
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cBegin :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
 cBegin =
   Command
-    (\_state -> Just $ pure Begin)
-    ( \Begin -> do
+    ( \state -> do
+        sessionId <- stateSessionId state
+        pure $
+          pure $
+            Begin sessionId
+    )
+    ( \(Begin sessionId) -> do
         manager <- ask
-        response <- liftIO $ httpPost manager "https://localhost:8080/.transaction/begin" [] mempty
+        let headers = sessionCookieHeaders $ concrete sessionId
+        response <- liftIO $ httpPost manager "https://localhost:8080/.transaction/begin" headers mempty
         pure . LazyByteString.toStrict $ Http.responseBody response
     )
-    [ Require $ \state Begin -> isNothing $ stateTransaction state
-    , Update $ \state Begin output ->
+    [ Require $ \state (Begin sessionId) ->
+        Just sessionId == stateSessionId state
+          && isNothing (stateTransaction state)
+    , Update $ \state (Begin _sessionId) output ->
         let
           transaction =
             StateTransaction
@@ -1182,8 +1798,32 @@ cBegin =
         label $ fromString "begin"
     ]
 
+data BeginNoauth (v :: Type -> Type)
+  = BeginNoauth
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cBeginNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cBeginNoauth =
+  Command
+    (\_state -> Just $ pure BeginNoauth)
+    ( \BeginNoauth -> do
+        manager <- ask
+        let headers = []
+        response <- liftIO $ httpPost manager "https://localhost:8080/.transaction/begin" headers mempty
+        pure response
+    )
+    [ Require $ \state BeginNoauth ->
+        isNothing (stateTransaction state)
+    , Ensure $ \_old _new _cmd output -> do
+        label $ fromString "begin (unauthenticated)"
+
+        Http.responseStatus output === unauthorized401
+    ]
+
 data Commit (v :: Type -> Type)
   = Commit
+      -- | Session ID
+      (Var ByteString v)
       -- | Transaction ID
       (Var ByteString v)
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -1192,18 +1832,49 @@ cCommit :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen 
 cCommit =
   Command
     ( \state -> do
+        sessionId <- stateSessionId state
         xactId <- stateTransactionId <$> stateTransaction state
-        pure $ pure (Commit xactId)
+        pure $ pure (Commit sessionId xactId)
     )
-    ( \(Commit xactId) -> do
+    ( \(Commit sessionId xactId) -> do
+        manager <- ask
+        let
+          headers =
+            sessionCookieHeaders (concrete sessionId)
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId)]
+        liftIO $ httpPost manager "https://localhost:8080/.transaction/commit" headers mempty
+    )
+    [ Require $ \state (Commit sessionId _) ->
+        Just sessionId == stateSessionId state
+          && isJust (stateTransaction state)
+    , Update $ \state (Commit _sessionId _xactId) _output -> stateCommit state
+    , Ensure $ \_old _new (Commit _sessionId _xactId) output -> do
+        label $ fromString "commit"
+        annotateShow output
+        Http.responseStatus output === ok200
+    ]
+
+data CommitNoauth (v :: Type -> Type)
+  = CommitNoauth
+      -- | Transaction ID
+      (Var ByteString v)
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cCommitNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cCommitNoauth =
+  Command
+    ( \state -> do
+        xactId <- stateTransactionId <$> stateTransaction state
+        pure $ pure (CommitNoauth xactId)
+    )
+    ( \(CommitNoauth xactId) -> do
         manager <- ask
         let headers = [(fromString "X-Blog-TransactionId", concrete xactId)]
         liftIO $ httpPost manager "https://localhost:8080/.transaction/commit" headers mempty
     )
-    [ Require $ \state (Commit _) -> isJust $ stateTransaction state
-    , Update $ \state (Commit _xactId) _output -> stateCommit state
-    , Ensure $ \_old _new (Commit _xactId) output -> do
-        label $ fromString "commit"
-        annotateShow output
-        Http.responseStatus output === ok200
+    [ Require $ \state (CommitNoauth _) ->
+        isJust (stateTransaction state)
+    , Ensure $ \_old _new (CommitNoauth _xactId) output -> do
+        label $ fromString "commit (unauthorised)"
+        Http.responseStatus output === unauthorized401
     ]

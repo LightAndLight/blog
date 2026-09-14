@@ -11,6 +11,7 @@ where
 
 import Blog
   ( MetadataValue (..)
+  , Name
   , ResourceConfig
   , ResourceId (..)
   , cfgMetadata
@@ -63,9 +64,9 @@ parseResourceMetadata ::
   MonadError DiagnosticReports m =>
   ResourceConfig ->
   -- | Resource type
-  String ->
+  Name ->
   -- | Resource name
-  String ->
+  Name ->
   ByteString ->
   m (Map Text MetadataValue)
 parseResourceMetadata config resTyName resName content = do

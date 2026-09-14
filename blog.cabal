@@ -58,6 +58,7 @@ executable blog
         time,
         tomlin,
         tls,
+        transformers,
         unix
 
     hs-source-dirs:   cli
@@ -68,6 +69,11 @@ library blog-server-lib
     import:           warnings
     hs-source-dirs:   server-lib
     exposed-modules:
+        Blog.Diagnostic
+        Blog.Error
+        Blog.Metadata
+        Blog.Pandoc
+        Blog.Store
         Blog.Store.Overlay
         IO
     build-depends:
@@ -107,13 +113,8 @@ executable blog-server
     main-is:          Main.hs
     other-modules:
         Blog.Build
-        Blog.Diagnostic
-        Blog.Error
-        Blog.Metadata
-        Blog.Pandoc
         Blog.Route
         Blog.Rules
-        Blog.Store
     build-depends:
         argon2,
         base ^>=4.20.2.0,
@@ -122,6 +123,7 @@ executable blog-server
         blog-server-lib,
         bytestring,
         containers,
+        cookie,
         cryptohash-sha256,
         deepseq,
         diagnostica,
@@ -131,6 +133,7 @@ executable blog-server
         filepath,
         http-api-data,
         http-types,
+        mmorph,
         mtl >=2.3.2,
         optparse-applicative,
         pandoc,
@@ -183,6 +186,7 @@ test-suite blog-server-tests
         mtl,
         process,
         temporary,
+        text,
         tls
 
     default-language: Haskell2010
