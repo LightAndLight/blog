@@ -12,6 +12,7 @@ module Blog.Rules (rules) where
 import Blog
   ( MetadataType (..)
   , MetadataValue (..)
+  , Name
   , ResourceId (..)
   , cfgMetadata
   , metaCfgDefault
@@ -19,10 +20,12 @@ import Blog
   , metaCfgType
   , metadataValueString
   , propertyParser
+  , renderName
   , renderResourceId
   , resourceIdParser
   , resourceNameParser
   , resourceTypeParser
+  , unsafeName
   )
 import Blog.Build ((*<))
 import qualified Blog.Build as Build
@@ -215,7 +218,7 @@ loadTemplate ::
     m
     (Map.Map Temple.TemplateRef Temple.Core, [Temple.Binding], Temple.Core)
 loadTemplate readTemplateRef renderTemplateRef iTemplate = do
-  let inputTemplateRef = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+  let inputTemplateRef = Temple.TemplateRef . renderName . resourceName $ Build.resourceInputId iTemplate
   let templateResourceType = resourceType $ Build.resourceInputId iTemplate
 
   let templateContent = Build.resourceInputContent iTemplate
@@ -223,10 +226,11 @@ loadTemplate readTemplateRef renderTemplateRef iTemplate = do
 
   let
     getTemplateRef (Temple.TemplateRef name) =
-      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-        <$> Store.readResource (Build.resourceInputType iTemplate) name
+      fromMaybe
+        (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType $ unsafeName name))
+        <$> Store.readResource (Build.resourceInputType iTemplate) (unsafeName name)
 
-  let ref = Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate
+  let ref = Temple.TemplateRef . renderName . resourceName $ Build.resourceInputId iTemplate
   inferBindings
     readTemplateRef
     renderTemplateRef
@@ -282,15 +286,16 @@ templateDependency iTemplate () = do
 
   let
     renderTemplateRef (Temple.TemplateRef name) =
-      renderResourceId (ResourceId templateResourceType name)
+      renderResourceId (ResourceId templateResourceType (unsafeName name))
 
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
-      Store.readResource (Build.resourceInputType iTemplate) name
+      Store.readResource (Build.resourceInputType iTemplate) (unsafeName name)
 
     getTemplateRef (Temple.TemplateRef name) =
-      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-        <$> Store.readResource (Build.resourceInputType iTemplate) name
+      fromMaybe
+        (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType (unsafeName name)))
+        <$> Store.readResource (Build.resourceInputType iTemplate) (unsafeName name)
 
   (deps, bindings, _template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
 
@@ -323,7 +328,9 @@ templateDependency iTemplate () = do
 
   let
     templateDependencies =
-      Set.map (\(Temple.TemplateRef r) -> ResourceId "template" r) (Map.keysSet deps)
+      Set.map
+        (\(Temple.TemplateRef r) -> ResourceId (unsafeName "template") (unsafeName r))
+        (Map.keysSet deps)
         <> fold mResources
   Build.setDependencies (Build.resourceInputId iTemplate) templateDependencies
 
@@ -349,7 +356,7 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
       tomlString = (fromString "\"" <>) . (<> fromString "\"")
     Build.writeResource
       oAdjacency
-      (currentResTyName ++ "-" ++ currentResName)
+      (renderName currentResTyName ++ "-" ++ renderName currentResName)
       ( foldMap (<> fromString "\n") $
           [ fromString "previous = " <> tomlString (fromString $ renderResourceId resId) | Just resId <- [prev]
           ]
@@ -370,7 +377,7 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
       inputs' <- Store.listResource resTy
       for inputs' $ \input -> do
         metadata <- do
-          mMetadata <- Store.readProperty resTy (resourceName input) "metadata"
+          mMetadata <- Store.readProperty resTy (resourceName input) (unsafeName "metadata")
           case mMetadata of
             Nothing ->
               throwError . DiagnosticSimple $ renderResourceId input ++ " has no metadata"
@@ -606,6 +613,12 @@ unifyPropertyType path a b = do
     Left err -> lift . throwError $ TypeError path err
     Right x -> pure x
 
+textToName :: Text -> Name
+textToName = unsafeName . Text.unpack
+
+nameToText :: Name -> Text
+nameToText = fromString . renderName
+
 resourceTypeProvider ::
   MonadError DiagnosticReports m =>
   Store m ->
@@ -613,14 +626,14 @@ resourceTypeProvider ::
   TypeProvider (WriterT (Set ResourceId) m)
 resourceTypeProvider store xactId path resourceTypesTy = do
   forRecord path resourceTypesTy $ \path' resTyName resourcesTy -> do
-    mResTy <- lift . lift . lift . Store.lookupResourceType store xactId $ Text.unpack resTyName
+    mResTy <- lift . lift . lift . Store.lookupResourceType store xactId $ textToName resTyName
     resTy <- maybe (lift . throwError $ ResourceTypeNotFound path resTyName) pure mResTy
 
     forRecord path' resourcesTy $ \path'' resName propertiesTy -> do
-      exists <- lift . lift . lift . Store.doesResourceExist resTy $ Text.unpack resName
+      exists <- lift . lift . lift . Store.doesResourceExist resTy $ textToName resName
       unless exists . lift . throwError $ ResourceNotFound path' resName
 
-      lift . lift . tell . Set.singleton $ ResourceId (Text.unpack resTyName) (Text.unpack resName)
+      lift . lift . tell . Set.singleton $ ResourceId (textToName resTyName) (textToName resName)
 
       propertiesTypeProvider
         (Store.hoistResourceType lift resTy)
@@ -699,7 +712,7 @@ metadataPropertyTypeProvider =
   PropertyTypeProvider $ \resTy resName propName -> do
     -- TODO: this will parse out metadata for every property. It should be parsed only once.
     metadata <- do
-      mMetadata <- Store.readProperty resTy (Text.unpack resName) "metadata"
+      mMetadata <- Store.readProperty resTy (textToName resName) (unsafeName "metadata")
       case mMetadata of
         Nothing ->
           pure mempty
@@ -707,7 +720,7 @@ metadataPropertyTypeProvider =
           parseResourceMetadata
             (Store.resourceTypeConfig resTy)
             (Store.resourceTypeName resTy)
-            (Text.unpack resName)
+            (textToName resName)
             content
 
     case Map.lookup propName . cfgMetadata $ Store.resourceTypeConfig resTy of
@@ -743,8 +756,8 @@ contentPropertyTypeProvider =
               (mFormat, mContent) <-
                 lift . lift $
                   (,)
-                    <$> Store.lookupProperty resTy (Text.unpack resName) "content-format"
-                    <*> Store.readResource resTy (Text.unpack resName)
+                    <$> Store.lookupProperty resTy (textToName resName) (unsafeName "content-format")
+                    <*> Store.readResource resTy (textToName resName)
 
               let
                 format :: ByteString -> ByteString
@@ -769,7 +782,7 @@ lookupPropertyTypeProvider ::
 lookupPropertyTypeProvider =
   PropertyTypeProvider $
     \resTy resName propName -> do
-      mValue <- Store.lookupProperty resTy (Text.unpack resName) (Text.unpack propName)
+      mValue <- Store.lookupProperty resTy (textToName resName) (textToName propName)
       case mValue of
         Nothing -> pure Nothing
         Just value -> do
@@ -799,8 +812,8 @@ lookupPropertyTypeProvider =
             case result of
               Right (_state, ty) -> pure ty
               Left err -> do
-                let resId = ResourceId (Store.resourceTypeName resTy) (Text.unpack resName)
-                content <- fromJust <$> Store.readProperty resTy (Text.unpack resName) (Text.unpack propName)
+                let resId = ResourceId (Store.resourceTypeName resTy) (textToName resName)
+                content <- fromJust <$> Store.readProperty resTy (textToName resName) (textToName propName)
                 throwError
                   . DiagnosticReports
                     (fromString $ "(" ++ renderResourceId resId ++ ")")
@@ -1107,10 +1120,10 @@ loadMarkdown input = do
       )
         <$ Sage.string (fromString "resource")
         <* Sage.char ':'
-        <*> fmap fromString resourceTypeParser
+        <*> fmap nameToText resourceTypeParser
         <* Sage.char ':'
-        <*> fmap fromString resourceNameParser
-        <*> many (Sage.char '/' *> fmap fromString propertyParser)
+        <*> fmap nameToText resourceNameParser
+        <*> many (Sage.char '/' *> fmap nameToText propertyParser)
 
     resolveResourceReferences :: Pandoc -> WriterT (Set ResourceId) (Build.ActionT m) Pandoc
     resolveResourceReferences =
@@ -1239,7 +1252,7 @@ loadMetadata input = do
   let resId = Build.resourceInputId input
   let resTy = Build.resourceInputType input
   let resName = resourceName resId
-  mContent <- Store.readProperty resTy resName "metadata"
+  mContent <- Store.readProperty resTy resName (unsafeName "metadata")
   content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
   parseResourceMetadata
     (Store.resourceTypeConfig resTy)
@@ -1283,7 +1296,7 @@ getAdjacency iAdjacency = do
       xactId <- Build.askTransactionId
 
       resTy <- Store.getResourceType store xactId resTyName
-      mContent <- Store.readProperty resTy resName "metadata"
+      mContent <- Store.readProperty resTy resName (unsafeName "metadata")
       content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
       metadata <-
         parseResourceMetadata
@@ -1367,16 +1380,17 @@ renderTemplate iTemplate typeProviders = do
   let
     readTemplateRef :: Temple.TemplateRef -> Build.ActionT m (Maybe ByteString)
     readTemplateRef (Temple.TemplateRef name) =
-      Store.readResource (Build.resourceInputType iTemplate) name
+      Store.readResource (Build.resourceInputType iTemplate) (unsafeName name)
 
   let
     renderTemplateRef (Temple.TemplateRef name) =
-      renderResourceId (ResourceId templateResourceType name)
+      renderResourceId (ResourceId templateResourceType (unsafeName name))
 
   let
     getTemplateRef (Temple.TemplateRef name) =
-      fromMaybe (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType name))
-        <$> Store.readResource (Build.resourceInputType iTemplate) name
+      fromMaybe
+        (error $ "missing resource " ++ renderResourceId (ResourceId templateResourceType (unsafeName name)))
+        <$> Store.readResource (Build.resourceInputType iTemplate) (unsafeName name)
 
   (deps, bindings, template'') <- loadTemplate readTemplateRef renderTemplateRef iTemplate
 
@@ -1392,7 +1406,7 @@ renderTemplate iTemplate typeProviders = do
           Just typeProvider -> typeProvider readTemplateRef binding
           Nothing ->
             bindingParameterNotFound
-              (Temple.TemplateRef . resourceName $ Build.resourceInputId iTemplate)
+              (Temple.TemplateRef . renderName . resourceName $ Build.resourceInputId iTemplate)
               binding
 
     pure (name, value)
@@ -1470,7 +1484,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
           , bindingTypeProvider $
               propertiesTypeProvider
                 (Build.resourceInputType iArticle)
-                (fromString . resourceName $ Build.resourceInputId iArticle)
+                (nameToText . resourceName $ Build.resourceInputId iArticle)
                 ( articlePropertyTypeProvider prev next html
                     <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
                     <> contentPropertyTypeProvider
@@ -1483,7 +1497,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   metadata <- loadMetadata iArticle
   let mUrl = Map.lookup (fromString "url") metadata
-  for_ mUrl $ Build.setResourceProperty oHtml () "url"
+  for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
 noteHtml ::
   forall m.
@@ -1510,7 +1524,7 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
           , bindingTypeProvider $
               propertiesTypeProvider
                 (Build.resourceInputType iNote)
-                (fromString . resourceName $ Build.resourceInputId iNote)
+                (nameToText . resourceName $ Build.resourceInputId iNote)
                 ( articlePropertyTypeProvider prev next html
                     <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
                     <> contentPropertyTypeProvider
@@ -1523,7 +1537,7 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
 
   metadata <- loadMetadata iNote
   let mUrl = Map.lookup (fromString "url") metadata
-  for_ mUrl $ Build.setResourceProperty oHtml () "url"
+  for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
 pageDependency ::
   forall m.
@@ -1557,7 +1571,7 @@ pageHtml (iTemplate, iPage) oHtml = do
           , bindingTypeProvider $
               propertiesTypeProvider
                 (Build.resourceInputType iPage)
-                (fromString . resourceName $ Build.resourceInputId iPage)
+                (nameToText . resourceName $ Build.resourceInputId iPage)
                 ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
                     <> constantPropertyTypeProvider
                       (fromString "content")
@@ -1576,7 +1590,7 @@ pageHtml (iTemplate, iPage) oHtml = do
 
   metadata <- loadMetadata iPage
   let mUrl = Map.lookup (fromString "url") metadata
-  for_ mUrl $ Build.setResourceProperty oHtml () "url"
+  for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
 data IndexItem m
   = IndexArticle
@@ -1608,7 +1622,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
           , bindingTypeProvider $
               propertiesTypeProvider
                 (Build.resourceInputType iTemplate)
-                (fromString . resourceName $ Build.resourceInputId iTemplate)
+                (nameToText . resourceName $ Build.resourceInputId iTemplate)
                 ( nestedPropertyTypeProvider
                     (fromString "metadata")
                     ( constantPropertyTypeProvider
@@ -1732,7 +1746,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                         IndexArticle iArticle miExcerpt ->
                           propertiesTypeProvider
                             (Build.resourceInputType iArticle)
-                            (fromString . resourceName $ Build.resourceInputId iArticle)
+                            (nameToText . resourceName $ Build.resourceInputId iArticle)
                             -- TODO: this property should come from metadata.
                             --
                             -- Currently blocked on having a good syntax for sum types in metadata.
@@ -1755,7 +1769,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                         IndexNote iNote html ->
                           propertiesTypeProvider
                             (Build.resourceInputType iNote)
-                            (fromString . resourceName $ Build.resourceInputId iNote)
+                            (nameToText . resourceName $ Build.resourceInputId iNote)
                             -- TODO: this property should come from metadata.
                             --
                             -- Currently blocked on having a good syntax for sum types in metadata.
@@ -1787,7 +1801,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
 
   Build.writeResource oHtml () output
 
-  Build.setResourceProperty oHtml () "url" $ VString (fromString "/")
+  Build.setResourceProperty oHtml () (unsafeName "url") $ VString (fromString "/")
 
 resourceRoute ::
   forall m.
@@ -1799,7 +1813,7 @@ resourceRoute iContent oRoute = do
   let resId = Build.resourceInputId iContent
   let resTy = Build.resourceInputType iContent
   let resName = resourceName resId
-  mUrl <- Store.lookupProperty resTy resName "url"
+  mUrl <- Store.lookupProperty resTy resName (unsafeName "url")
   for_ mUrl $ \url -> do
     -- GRIPE: should we really have to parse out `path`, only to immediately print it via `renderRouteEntry`?
     path <-

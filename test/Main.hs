@@ -8,7 +8,7 @@
 module Main (main) where
 
 import Barbies
-import Blog (ResourceId (..), renderResourceId)
+import Blog (Name, ResourceId (..), renderName, renderResourceId, unsafeName)
 import Blog.Diagnostic (renderDiagnosticReports)
 import qualified Blog.ID as ID
 import Blog.Password (hashPassword)
@@ -24,6 +24,7 @@ import Control.Monad.Morph (hoist)
 import Control.Monad.Reader (runReaderT)
 import Control.Monad.Reader.Class (MonadReader, ask)
 import Data.ByteString (ByteString)
+import qualified Data.ByteString.Builder as Builder
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
@@ -75,6 +76,7 @@ import qualified System.Process as Process
 import qualified Test.Blog.Store.Overlay
 import Test.Hspec (Spec, describe, hspec, it, runIO)
 import Test.Hspec.Hedgehog (hedgehog)
+import Web.HttpApiData (toEncodedUrlPiece)
 
 main :: IO ()
 main = hspec spec
@@ -208,14 +210,18 @@ spec = do
             state =
               initialState
                 { stateResourceTypes =
-                    Map.insert "session" StateResourceType{stateResourceTypeContentType = fromString "text/plain"} $
-                      Map.insert "user" StateResourceType{stateResourceTypeContentType = fromString "text/x.phcs"} $
-                        stateResourceTypes initialState
+                    Map.insert
+                      (unsafeName "session")
+                      StateResourceType{stateResourceTypeContentType = fromString "text/plain"}
+                      $ Map.insert
+                        (unsafeName "user")
+                        StateResourceType{stateResourceTypeContentType = fromString "text/x.phcs"}
+                      $ stateResourceTypes initialState
                 , stateResources =
                     Map.insertWith
                       (<>)
-                      "user"
-                      (Map.singleton username StateResource{stateResourceContent = passwordHash})
+                      (unsafeName "user")
+                      (Map.singleton (unsafeName username) StateResource{stateResourceContent = passwordHash})
                       $ stateResources initialState
                 }
           cs <- forAll $ Gen.sequential (Range.constant 0 100) state (commands username password)
@@ -234,24 +240,24 @@ spec = do
 
               let handleExceptT = either (error . ByteString.Lazy.Char8.unpack . renderDiagnosticReports) pure <=< runExceptT
               handleExceptT . Store.withTransaction store False $ \xactId -> do
-                resourceTy <- Store.getResourceType store xactId "resource"
+                resourceTy <- Store.getResourceType store xactId (unsafeName "resource")
                 _updated <-
-                  Store.writeResource resourceTy "user" . fromString $
+                  Store.writeResource resourceTy (unsafeName "user") . fromString $
                     unlines
                       [ "content-type = \"text/x.phcs\""
                       , ""
                       , "[metadata]"
                       ]
                 _updated <-
-                  Store.writeResource resourceTy "session" . fromString $
+                  Store.writeResource resourceTy (unsafeName "session") . fromString $
                     unlines
                       [ "content-type = \"text/plain\""
                       , ""
                       , "[metadata]"
                       ]
 
-                userTy <- Store.getResourceType store xactId "user"
-                _updated <- Store.writeResource userTy username passwordHash
+                userTy <- Store.getResourceType store xactId (unsafeName "user")
+                _updated <- Store.writeResource userTy (unsafeName username) passwordHash
 
                 pure ()
 
@@ -322,8 +328,8 @@ data State (v :: Type -> Type)
   = State
   { stateSessionIds :: [Var ByteString v]
   , stateTransaction :: Maybe (StateTransaction v)
-  , stateResourceTypes :: Map String StateResourceType
-  , stateResources :: Map String (Map String StateResource)
+  , stateResourceTypes :: Map Name StateResourceType
+  , stateResources :: Map Name (Map Name StateResource)
   }
   deriving (Show)
 
@@ -355,15 +361,15 @@ data StateTransaction (v :: Type -> Type)
   { stateTransactionId :: Var ByteString v
   , stateTransactionResourceTypes :: StateTransactionResources StateResourceType StateResourceType ()
   , stateTransactionResources ::
-      StateTransactionResources (Map String StateResource) (Map String StateResource) (Set String)
+      StateTransactionResources (Map Name StateResource) (Map Name StateResource) (Set Name)
   }
   deriving (Show)
 
 data StateTransactionResources create update delete
   = StateTransactionResources
-  { stateTransactionResourcesCreate :: Map String create
-  , stateTransactionResourcesUpdate :: Map String update
-  , stateTransactionResourcesDelete :: Map String delete
+  { stateTransactionResourcesCreate :: Map Name create
+  , stateTransactionResourcesUpdate :: Map Name update
+  , stateTransactionResourcesDelete :: Map Name delete
   }
   deriving (Show)
 
@@ -373,7 +379,7 @@ stateLookupResourceType ::
   -- | Transaction ID
   Maybe (Var ByteString v) ->
   -- | Resource type
-  String ->
+  Name ->
   Maybe StateResourceType
 stateLookupResourceType state Nothing resTy = Map.lookup resTy $ stateResourceTypes state
 stateLookupResourceType state (Just xactId) resTy = do
@@ -387,9 +393,9 @@ stateLookupResource ::
   -- | Transaction ID
   Maybe (Var ByteString v) ->
   -- | Resource type
-  String ->
+  Name ->
   -- | Resource name
-  String ->
+  Name ->
   Maybe StateResource
 stateLookupResource state Nothing resTy resName = Map.lookup resName =<< Map.lookup resTy (stateResources state)
 stateLookupResource state (Just xactId) resTy resName = do
@@ -405,7 +411,7 @@ stateCommit state =
     , stateResources = stateResourcesTransactionView state
     }
 
-stateResourceTypesTransactionView :: State v -> Map String StateResourceType
+stateResourceTypesTransactionView :: State v -> Map Name StateResourceType
 stateResourceTypesTransactionView state =
   case stateTransaction state of
     Nothing ->
@@ -420,25 +426,25 @@ stateResourceTypesTransactionView state =
         $ stateResourceTypes state
   where
     insertCreatedResourceTypes ::
-      Map String StateResourceType ->
-      Map String StateResourceType ->
-      Map String StateResourceType
+      Map Name StateResourceType ->
+      Map Name StateResourceType ->
+      Map Name StateResourceType
     insertCreatedResourceTypes created resources = Map.unionWith (\new _old -> new) created resources
 
     modifyUpdatedResourceTypes ::
-      Map String StateResourceType ->
-      Map String StateResourceType ->
-      Map String StateResourceType
+      Map Name StateResourceType ->
+      Map Name StateResourceType ->
+      Map Name StateResourceType
     modifyUpdatedResourceTypes updated resources = Map.unionWith (\new _old -> new) updated resources
 
     removeDeletedResourceTypes ::
-      Map String () ->
-      Map String StateResourceType ->
-      Map String StateResourceType
+      Map Name () ->
+      Map Name StateResourceType ->
+      Map Name StateResourceType
     removeDeletedResourceTypes deleted resources =
       resources `Map.difference` deleted
 
-stateResourcesTransactionView :: State v -> Map String (Map String StateResource)
+stateResourcesTransactionView :: State v -> Map Name (Map Name StateResource)
 stateResourcesTransactionView state =
   case stateTransaction state of
     Nothing ->
@@ -450,21 +456,21 @@ stateResourcesTransactionView state =
             stateResources state
   where
     insertCreatedResources ::
-      Map String (Map String StateResource) ->
-      Map String (Map String StateResource) ->
-      Map String (Map String StateResource)
+      Map Name (Map Name StateResource) ->
+      Map Name (Map Name StateResource) ->
+      Map Name (Map Name StateResource)
     insertCreatedResources created resources = Map.unionWith (<>) created resources
 
     modifyUpdatedResources ::
-      Map String (Map String StateResource) ->
-      Map String (Map String StateResource) ->
-      Map String (Map String StateResource)
+      Map Name (Map Name StateResource) ->
+      Map Name (Map Name StateResource) ->
+      Map Name (Map Name StateResource)
     modifyUpdatedResources updated resources = Map.unionWith (<>) updated resources
 
     removeDeletedResources ::
-      Map String (Set String) ->
-      Map String (Map String StateResource) ->
-      Map String (Map String StateResource)
+      Map Name (Set Name) ->
+      Map Name (Map Name StateResource) ->
+      Map Name (Map Name StateResource)
     removeDeletedResources deleted resources =
       Map.differenceWith (\rs ids -> Just $ foldl' (flip Map.delete) rs ids) resources deleted
 
@@ -477,12 +483,12 @@ initialState =
     , stateResources = mempty
     }
 
-notSession :: String -> Bool
+notSession :: Name -> Bool
 notSession resTy =
   -- `session` resource names are generated by the server, so Hedgehog wraps
   -- them in `Var`. That doesn't fit with the current resource model, so
   -- I'm just excluding them for now.
-  resTy /= "session"
+  renderName resTy /= "session"
 
 commands ::
   (MonadGen gen, MonadReader Http.Manager m, MonadIO m) =>
@@ -567,7 +573,7 @@ cResourceTypeList =
 
         let
           resourceIds =
-            fmap (ResourceId "resource") $
+            fmap (ResourceId (unsafeName "resource")) $
               case mXactId of
                 Nothing ->
                   Map.keys $ stateResourceTypes old
@@ -615,11 +621,11 @@ cResourceTypeListNoauth =
         Http.responseStatus output === unauthorized401
     ]
 
-genResourceName :: MonadGen m => m String
+genResourceName :: MonadGen m => m Name
 genResourceName =
-  Gen.list (Range.constant 1 20) genResourceNameChar
+  unsafeName <$> Gen.list (Range.constant 1 20) genResourceNameChar
   where
-    genResourceNameChar = Gen.element (['a' .. 'z'] ++ "-")
+    genResourceNameChar = Gen.element (['a' .. 'z'] ++ "-.")
 
 genStateResourceType :: MonadGen m => m StateResourceType
 genStateResourceType = StateResourceType <$> fmap fromString (Gen.string (Range.constant 1 20) Gen.alphaNum)
@@ -631,7 +637,7 @@ data ResourceTypeCreate (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
-      String
+      Name
       StateResourceType
   deriving (Show, Generic, FunctorB, TraversableB)
 
@@ -653,7 +659,7 @@ cResourceTypeCreate =
           headers =
             sessionCookieHeaders (concrete sessionId)
               ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $
@@ -703,7 +709,7 @@ data ResourceTypeCreateNoauth (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
-      String
+      Name
       StateResourceType
   deriving (Show, Generic, FunctorB, TraversableB)
 
@@ -724,7 +730,7 @@ cResourceTypeCreateNoauth =
         let
           headers =
             [ (fromString "X-Blog-ResourceType", fromString "resource")
-            , (fromString "X-Blog-ResourceName", fromString resName)
+            , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
             ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $
@@ -764,7 +770,7 @@ cResourceTypeCreateDuplicate =
           headers =
             sessionCookieHeaders (concrete sessionId)
               ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $
@@ -797,9 +803,9 @@ data ResourceCreate (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
-      String
+      Name
       -- | Resource name
-      String
+      Name
       -- | Content
       LazyByteString
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -828,8 +834,8 @@ cResourceCreate =
         let
           headers =
             sessionCookieHeaders (concrete sessionId)
-              ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+              ++ [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
@@ -897,8 +903,8 @@ cResourceCreateMissing =
         let
           headers =
             sessionCookieHeaders (concrete sessionId)
-              ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+              ++ [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
@@ -945,8 +951,8 @@ cResourceCreateDuplicate =
         let
           headers =
             sessionCookieHeaders (concrete sessionId)
-              ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+              ++ [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
@@ -974,9 +980,9 @@ data ResourceCreateNoauth (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
-      String
+      Name
       -- | Resource name
-      String
+      Name
       -- | Content
       LazyByteString
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -1003,8 +1009,8 @@ cResourceCreateNoauth =
         manager <- ask
         let
           headers =
-            [ (fromString "X-Blog-ResourceType", fromString resTy)
-            , (fromString "X-Blog-ResourceName", fromString resName)
+            [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+            , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
             ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPost manager "https://localhost:8080/.resource" headers content
@@ -1023,6 +1029,9 @@ cResourceCreateNoauth =
         Http.responseStatus output === unauthorized401
     ]
 
+nameToPart :: Name -> String
+nameToPart = ByteString.Lazy.Char8.unpack . Builder.toLazyByteString . toEncodedUrlPiece . renderName
+
 data ResourceList (v :: Type -> Type)
   = ResourceList
       -- | Session ID
@@ -1030,7 +1039,7 @@ data ResourceList (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
-      String
+      Name
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cResourceList :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
@@ -1053,7 +1062,7 @@ cResourceList =
           headers =
             sessionCookieHeaders (concrete sessionId)
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
+        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ nameToPart resTy) headers
     )
     [ Require $ \state (ResourceList sessionId mXactId resTy) ->
         Just sessionId == stateSessionId state
@@ -1106,7 +1115,7 @@ cResourceListMissing =
           headers =
             sessionCookieHeaders (concrete sessionId)
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
+        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ nameToPart resTy) headers
     )
     [ Require $ \state (ResourceList sessionId mXactId resTy) ->
         Just sessionId == stateSessionId state
@@ -1130,7 +1139,7 @@ data ResourceListNoauth (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
-      String
+      Name
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cResourceListNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
@@ -1148,7 +1157,7 @@ cResourceListNoauth =
     ( \(ResourceListNoauth mXactId resTy) -> do
         manager <- ask
         let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy) headers
+        liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ nameToPart resTy) headers
     )
     [ Require $ \state (ResourceListNoauth mXactId resTy) ->
         ( case mXactId of
@@ -1170,9 +1179,9 @@ data ResourceGet (v :: Type -> Type)
       -- | Use the transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
-      String
+      Name
       -- | Resource name
-      String
+      Name
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cResourceGet ::
@@ -1200,8 +1209,8 @@ cResourceGet getStyle =
             let
               headers =
                 sessionCookieHeaders (concrete sessionId)
-                  ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
-                     , (fromString "X-Blog-ResourceName", fromString resName)
+                  ++ [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+                     , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                      ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
@@ -1210,7 +1219,11 @@ cResourceGet getStyle =
               headers =
                 sessionCookieHeaders (concrete sessionId)
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+            liftIO $
+              httpGet
+                manager
+                ("https://localhost:8080/.resource/" ++ nameToPart resTy ++ "/" ++ nameToPart resName)
+                headers
     )
     [ Require $ \state (ResourceGet sessionId mXactId resTy resName) ->
         Just sessionId == stateSessionId state
@@ -1262,8 +1275,8 @@ cResourceGetMissing getStyle =
             let
               headers =
                 sessionCookieHeaders (concrete sessionId)
-                  ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
-                     , (fromString "X-Blog-ResourceName", fromString resName)
+                  ++ [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+                     , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                      ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
@@ -1272,7 +1285,11 @@ cResourceGetMissing getStyle =
               headers =
                 sessionCookieHeaders (concrete sessionId)
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+            liftIO $
+              httpGet
+                manager
+                ("https://localhost:8080/.resource/" ++ nameToPart resTy ++ "/" ++ nameToPart resName)
+                headers
     )
     [ Require $ \state (ResourceGet sessionId mXactId resTy resName) ->
         Just sessionId == stateSessionId state
@@ -1306,9 +1323,9 @@ data ResourceGetNoauth (v :: Type -> Type)
       -- | Use the transaction ID
       (Maybe (Var ByteString v))
       -- | Resource type
-      String
+      Name
       -- | Resource name
-      String
+      Name
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cResourceGetNoauth ::
@@ -1333,8 +1350,8 @@ cResourceGetNoauth getStyle =
           GetHeaders -> do
             let
               headers =
-                [ (fromString "X-Blog-ResourceType", fromString resTy)
-                , (fromString "X-Blog-ResourceName", fromString resName)
+                [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+                , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                 ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
@@ -1342,7 +1359,11 @@ cResourceGetNoauth getStyle =
             let
               headers =
                 [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+            liftIO $
+              httpGet
+                manager
+                ("https://localhost:8080/.resource/" ++ nameToPart resTy ++ "/" ++ nameToPart resName)
+                headers
     )
     [ Require $ \state (ResourceGetNoauth mXactId resTy resName) ->
         ( case mXactId of
@@ -1366,7 +1387,7 @@ data ResourceTypeUpdate (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
-      String
+      Name
       -- | New value
       StateResourceType
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -1402,7 +1423,7 @@ cResourceTypeUpdate =
           headers =
             sessionCookieHeaders (concrete sessionId)
               ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPut manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
@@ -1479,7 +1500,7 @@ cResourceTypeUpdateMissing =
           headers =
             sessionCookieHeaders (concrete sessionId)
               ++ [ (fromString "X-Blog-ResourceType", fromString "resource")
-                 , (fromString "X-Blog-ResourceName", fromString resName)
+                 , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                  ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPut manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
@@ -1506,7 +1527,7 @@ data ResourceTypeUpdateNoauth (v :: Type -> Type)
       -- | Transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
-      String
+      Name
       -- | New value
       StateResourceType
   deriving (Show, Generic, FunctorB, TraversableB)
@@ -1540,7 +1561,7 @@ cResourceTypeUpdateNoauth =
         let
           headers =
             [ (fromString "X-Blog-ResourceType", fromString "resource")
-            , (fromString "X-Blog-ResourceName", fromString resName)
+            , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
             ]
               ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
         liftIO $ httpPut manager "https://localhost:8080/.resource" headers (stateResourceTypeContent value)
@@ -1566,7 +1587,7 @@ data ResourceTypeGet (v :: Type -> Type)
       -- | Use the transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
-      String
+      Name
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cResourceTypeGet ::
@@ -1592,7 +1613,7 @@ cResourceTypeGet getStyle =
               headers =
                 sessionCookieHeaders (concrete sessionId)
                   ++ [ (fromString "X-Blog-ResourceType", fromString resTy)
-                     , (fromString "X-Blog-ResourceName", fromString resName)
+                     , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                      ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
@@ -1601,7 +1622,8 @@ cResourceTypeGet getStyle =
               headers =
                 sessionCookieHeaders (concrete sessionId)
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+            liftIO $
+              httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ nameToPart resName) headers
     )
     [ Require $ \state (ResourceTypeGet sessionId mXactId resName) ->
         Just sessionId == stateSessionId state
@@ -1636,7 +1658,7 @@ data ResourceTypeGetNoauth (v :: Type -> Type)
       -- | Use the transaction ID
       (Maybe (Var ByteString v))
       -- | Resource name
-      String
+      Name
   deriving (Show, Generic, FunctorB, TraversableB)
 
 cResourceTypeGetNoauth ::
@@ -1659,13 +1681,14 @@ cResourceTypeGetNoauth getStyle =
             let
               headers =
                 [ (fromString "X-Blog-ResourceType", fromString resTy)
-                , (fromString "X-Blog-ResourceName", fromString resName)
+                , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
                 ]
                   ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
             liftIO $ httpGet manager "https://localhost:8080/.resource" headers
           GetUrl -> do
             let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
-            liftIO $ httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ resName) headers
+            liftIO $
+              httpGet manager ("https://localhost:8080/.resource/" ++ resTy ++ "/" ++ nameToPart resName) headers
     )
     [ Require $ \state (ResourceTypeGetNoauth mXactId resName) ->
         ( case mXactId of

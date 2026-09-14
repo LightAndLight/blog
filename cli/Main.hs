@@ -1,6 +1,16 @@
 module Main (main) where
 
-import Blog (ResourceId (..), propertiesPart, renderResourceId, resourceIdParser)
+import Blog
+  ( Name
+  , ResourceId (..)
+  , mkName
+  , nameToPath
+  , pathToName
+  , propertiesPart
+  , renderName
+  , renderResourceId
+  , resourceIdParser
+  )
 import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Password (hashPassword)
@@ -13,6 +23,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
+import qualified Data.ByteString.Builder as Builder
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
@@ -67,6 +78,7 @@ import qualified Text.Diagnostic.Sage
 import qualified Text.Sage as Sage
 import qualified Toml
 import Web.FormUrlEncoded (urlEncodeAsFormStable)
+import Web.HttpApiData (ToHttpApiData (..))
 
 data Cli
   = Cli
@@ -287,6 +299,18 @@ cliParser =
         <$> Options.strArgument
           (Options.metavar "DIR" <> Options.help "Directory in which to create the user")
 
+parseName ::
+  -- | Input
+  String ->
+  IO Name
+parseName input =
+  case mkName input of
+    Nothing -> do
+      putStrLn $ "error: empty resource [type] name"
+      exitFailure
+    Just x ->
+      pure x
+
 parseResourceId ::
   -- | Input
   String ->
@@ -375,7 +399,8 @@ main = do
       create baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
     CreateAll mXactId srcDir resTy -> do
       let mXactId' = fmap fromString mXactId
-      createAll baseUrl manager mSessionId mXactId' srcDir resTy
+      resTy' <- parseName resTy
+      createAll baseUrl manager mSessionId mXactId' srcDir resTy'
     Update mXactId mSrcFile properties resourceId -> do
       let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
@@ -542,12 +567,15 @@ getDataHome = do
 
 resourceIdHeaders :: ResourceId -> RequestHeaders
 resourceIdHeaders resourceId =
-  [ (fromString "X-Blog-ResourceType", fromString $ resourceType resourceId)
-  , (fromString "X-Blog-ResourceName", fromString $ resourceName resourceId)
+  [ (fromString "X-Blog-ResourceType", fromString . renderName $ resourceType resourceId)
+  , (fromString "X-Blog-ResourceName", fromString . renderName $ resourceName resourceId)
   ]
 
+nameToPart :: Name -> String
+nameToPart = ByteString.Lazy.Char8.unpack . Builder.toLazyByteString . toEncodedUrlPiece . renderName
+
 resourceIdPath :: ResourceId -> String
-resourceIdPath resourceId = resourceType resourceId ++ "/" ++ resourceName resourceId
+resourceIdPath resourceId = nameToPart (resourceType resourceId) ++ "/" ++ nameToPart (resourceName resourceId)
 
 transactionIdHeaders :: ByteString -> RequestHeaders
 transactionIdHeaders xactId =
@@ -685,10 +713,14 @@ view baseUrl manager mSessionId viewTarget resourceId = do
     resourceDirLocal =
       case viewTarget of
         ViewMetadata ->
-          dataHome </> resourceType resourceId </> propertiesPart (resourceName resourceId)
+          dataHome
+            </> nameToPath (resourceType resourceId)
+            </> propertiesPart (resourceName resourceId)
         ViewProperty _propName ->
-          dataHome </> resourceType resourceId </> propertiesPart (resourceName resourceId)
-        ViewContent -> dataHome </> resourceType resourceId
+          dataHome
+            </> nameToPath (resourceType resourceId)
+            </> propertiesPart (resourceName resourceId)
+        ViewContent -> dataHome </> nameToPath (resourceType resourceId)
   createDirectoryIfMissing True resourceDirLocal
 
   let
@@ -696,7 +728,7 @@ view baseUrl manager mSessionId viewTarget resourceId = do
       case viewTarget of
         ViewMetadata -> resourceDirLocal </> "metadata"
         ViewProperty propName -> resourceDirLocal </> propName
-        ViewContent -> resourceDirLocal </> resourceName resourceId
+        ViewContent -> resourceDirLocal </> nameToPath (resourceName resourceId)
 
   response <- do
     mLocalModificationTime <-
@@ -718,17 +750,26 @@ view baseUrl manager mSessionId viewTarget resourceId = do
       url =
         case viewTarget of
           ViewMetadata ->
-            baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId ++ "/metadata"
+            baseUrl
+              ++ "/.resource/"
+              ++ nameToPart (resourceType resourceId)
+              ++ "/"
+              ++ nameToPart (resourceName resourceId)
+              ++ "/metadata"
           ViewProperty propName ->
             baseUrl
               ++ "/.resource/"
-              ++ resourceType resourceId
+              ++ nameToPart (resourceType resourceId)
               ++ "/"
-              ++ resourceName resourceId
+              ++ nameToPart (resourceName resourceId)
               ++ "/property/"
               ++ propName
           ViewContent ->
-            baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId
+            baseUrl
+              ++ "/.resource/"
+              ++ nameToPart (resourceType resourceId)
+              ++ "/"
+              ++ nameToPart (resourceName resourceId)
 
     httpGet manager url headers
 
@@ -921,7 +962,7 @@ createAll ::
   -- | Transaction ID
   Maybe ByteString ->
   FilePath ->
-  String ->
+  Name ->
   IO ()
 createAll baseUrl manager mSessionId mXactId srcDir resTy = do
   entries <- listDirectory srcDir
@@ -935,7 +976,7 @@ createAll baseUrl manager mSessionId mXactId srcDir resTy = do
       isFile <- doesFileExist path
       if isFile
         then do
-          let resourceId = ResourceId resTy entry
+          let resourceId = ResourceId resTy (pathToName entry)
           create baseUrl manager mSessionId (Just xactId) (Just path) [] resourceId
         else do
           putStrLn $ "warning: " ++ path ++ " is not a file (ignoring)"
@@ -1007,10 +1048,10 @@ edit baseUrl manager mSessionId resourceId = do
   dataHome <- getDataHome
   editor <- getEditor
 
-  let resourceDirLocal = dataHome </> resourceType resourceId
+  let resourceDirLocal = dataHome </> nameToPath (resourceType resourceId)
   createDirectoryIfMissing True resourceDirLocal
 
-  let resourcePathLocal = resourceDirLocal </> resourceName resourceId
+  let resourcePathLocal = resourceDirLocal </> nameToPath (resourceName resourceId)
 
   mLocalModificationTime <-
     fmap Just (getModificationTime resourcePathLocal)
@@ -1032,7 +1073,12 @@ edit baseUrl manager mSessionId resourceId = do
                ]
       httpGet
         manager
-        (baseUrl ++ "/.resource/" ++ resourceType resourceId ++ "/" ++ resourceName resourceId)
+        ( baseUrl
+            ++ "/.resource/"
+            ++ nameToPart (resourceType resourceId)
+            ++ "/"
+            ++ nameToPart (resourceName resourceId)
+        )
         headers
 
     case statusCode $ Http.responseStatus response of

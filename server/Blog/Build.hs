@@ -54,10 +54,13 @@ where
 
 import Blog
   ( MetadataValue (..)
+  , Name
   , ResourceId (ResourceId)
+  , renderName
   , renderResourceId
   , resourceName
   , resourceType
+  , unsafeName
   )
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Metadata
@@ -87,7 +90,6 @@ import qualified Data.Map as Map
 import Data.Maybe (mapMaybe)
 import Data.Set (Set)
 import qualified Data.Set as Set
-import Data.String (fromString)
 import Data.Text (Text)
 import Data.Traversable (for)
 import Prelude hiding (any)
@@ -213,7 +215,7 @@ putResource resId@(ResourceId resTyName resName) content = do
 
   reasons <- ActionT $ asks aeReasons
 
-  resTy <- Store.getResourceType store transactionId $ fromString resTyName
+  resTy <- Store.getResourceType store transactionId resTyName
   existed <- Store.doesResourceExist resTy resName
   changed <- Store.writeResource resTy resName content
   when changed $ do
@@ -221,14 +223,14 @@ putResource resId@(ResourceId resTyName resName) content = do
     let changes = Map.singleton resId (Change status reasons)
     ActionT $ tell mempty{asChanges = changes, asPending = [resId]}
 
-setProperty :: MonadIO m => ResourceId -> String -> MetadataValue -> ActionT m ()
+setProperty :: MonadIO m => ResourceId -> Name -> MetadataValue -> ActionT m ()
 setProperty resId@(ResourceId resTyName resName) key value = do
   store <- askStore
   transactionId <- askTransactionId
 
   reasons <- ActionT $ asks aeReasons
 
-  resTy <- Store.getResourceType store transactionId $ fromString resTyName
+  resTy <- Store.getResourceType store transactionId resTyName
   exists <- Store.doesResourceExist resTy resName
   if exists
     then do
@@ -237,7 +239,7 @@ setProperty resId@(ResourceId resTyName resName) key value = do
       ActionT $ tell mempty{asChanges = changes}
     else do
       throwError . DiagnosticSimple $
-        "can't set property '" ++ key ++ "' on missing resource " ++ renderResourceId resId
+        "can't set property '" ++ renderName key ++ "' on missing resource " ++ renderResourceId resId
   ActionT $ tell mempty{asPending = [resId]}
 
 rule ::
@@ -254,7 +256,7 @@ data Input m :: Type -> Type where
   IFmap :: (a -> b) -> Input m a -> Input m b
   IPure :: a -> Input m a
   IApply :: Input m (a -> b) -> Input m a -> Input m b
-  IResource :: InputQuantifier m a -> String -> ResourceNamePattern -> Input m a
+  IResource :: InputQuantifier m a -> Name -> ResourceNamePattern -> Input m a
   IMany :: Input m a -> Input m [a]
 
 instance Functor (Input m) where
@@ -274,13 +276,13 @@ data ResourceInput m a
   { resourceInputId :: !ResourceId
   , resourceInputType :: !(Store.ResourceType (ActionT m))
   , resourceInputMetadata :: !(Map Text MetadataValue)
-  , resourceInputProperty :: String -> ActionT m (Maybe MetadataValue)
+  , resourceInputProperty :: Name -> ActionT m (Maybe MetadataValue)
   , resourceInputContent :: a
   }
 
 data ResourceInputs m a
   = ResourceInputs
-  { resourceInputsType :: !String
+  { resourceInputsType :: !Name
   , resourceInputs :: ![ResourceInput m a]
   }
 
@@ -446,13 +448,13 @@ queryInputs i = go i
             IAny ->
               pure $
                 InputTuples
-                  [resTyName ++ ":" ++ renderResourceNamePattern resNamePat]
+                  [renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat]
                   (mapMaybe sequence olds)
                   (mapMaybe sequence news)
             IOptional ->
               pure $
                 InputTuples
-                  ["optional(" ++ resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
+                  ["optional(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
                   olds
                   news
             IAll ->
@@ -460,7 +462,7 @@ queryInputs i = go i
                 then
                   pure $
                     InputTuples
-                      ["all(" ++ resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
+                      ["all(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
                       [ InputTuple
                           { inputTupleAge = Old
                           , inputTupleReasons = []
@@ -473,7 +475,7 @@ queryInputs i = go i
                   let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
                   pure $
                     InputTuples
-                      ["all(" ++ resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
+                      ["all(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
                       []
                       [ InputTuple
                           { inputTupleAge = New
@@ -514,7 +516,7 @@ queryInputs i = go i
 
 makeResource ::
   MonadIO m =>
-  Store.ResourceType (ActionT m) -> String -> ActionT m (Maybe (ResourceInput m ByteString))
+  Store.ResourceType (ActionT m) -> Name -> ActionT m (Maybe (ResourceInput m ByteString))
 makeResource resTy resName = do
   let resTyName = Store.resourceTypeName resTy
   mContent <- Store.readResource resTy resName
@@ -523,7 +525,7 @@ makeResource resTy resName = do
       pure Nothing
     Just content -> do
       metadata <- do
-        mMetadataContent <- Store.readProperty resTy resName "metadata"
+        mMetadataContent <- Store.readProperty resTy resName (unsafeName "metadata")
         maybe
           (pure mempty)
           (parseResourceMetadata (Store.resourceTypeConfig resTy) resTyName resName)
@@ -564,7 +566,7 @@ iMatch = ResourceNamePattern . pure . PExact
 iBind :: String -> ResourceNamePattern
 iBind = ResourceNamePattern . pure . PBind
 
-matchResourceName :: ResourceNamePattern -> String -> Maybe (Map String String)
+matchResourceName :: ResourceNamePattern -> Name -> Maybe (Map String String)
 matchResourceName (ResourceNamePattern ps) resName =
   fst
     <$> foldlM
@@ -586,7 +588,7 @@ matchResourceName (ResourceNamePattern ps) resName =
                   guard $ remaining == binding
                   pure (bindings, "")
       )
-      (mempty, resName)
+      (mempty, renderName resName)
       ps
 
 resourcePatternsOverlap ::
@@ -632,7 +634,7 @@ iResource ::
   -- | Resource name
   ResourceNamePattern ->
   Input m (ResourceInput m ByteString)
-iResource resTyName = IResource IAny resTyName
+iResource resTyName = IResource IAny (unsafeName resTyName)
 
 iResourceOptional ::
   -- | Resource type
@@ -640,7 +642,7 @@ iResourceOptional ::
   -- | Resource name
   ResourceNamePattern ->
   Input m (Maybe (ResourceInput m ByteString))
-iResourceOptional = IResource IOptional
+iResourceOptional = IResource IOptional . unsafeName
 
 {-| Declare a bulk input of a particular resource type, matching the given pattern.
 
@@ -652,7 +654,7 @@ iResourceAll ::
   -- | Resource name
   ResourceNamePattern ->
   Input m (ResourceInputs m ByteString)
-iResourceAll = IResource IAll
+iResourceAll = IResource IAll . unsafeName
 
 iAll :: Input m a -> Input m [a]
 iAll = IMany
@@ -661,8 +663,8 @@ data Output m :: Type -> Type where
   OFmap :: (a -> b) -> Output m a -> Output m b
   OPure :: a -> Output m a
   OApply :: Output m (a -> b) -> Output m a -> Output m b
-  OResourceType :: String -> Output m (ResourceOutput m String)
-  OResource :: String -> OutputResourceNamePattern a -> Output m (ResourceOutput m a)
+  OResourceType :: Name -> Output m (ResourceOutput m String)
+  OResource :: Name -> OutputResourceNamePattern a -> Output m (ResourceOutput m a)
 
 instance Functor (Output m) where
   fmap = OFmap
@@ -675,7 +677,7 @@ data ResourceOutput m a
   = ResourceOutput
   { resourceOutputId :: a -> ResourceId
   , writeResource :: a -> LazyByteString -> ActionT m ()
-  , setResourceProperty :: a -> String -> MetadataValue -> ActionT m ()
+  , setResourceProperty :: a -> Name -> MetadataValue -> ActionT m ()
   }
 
 data OutputResourceNamePattern a where
@@ -733,7 +735,7 @@ renderOutputResourceNamePattern bindings p x = go p x
         Just binding -> binding
 
 oResourceType :: String -> Output m (ResourceOutput m String)
-oResourceType = OResourceType
+oResourceType = OResourceType . unsafeName
 
 oResource ::
   -- | Resource type name
@@ -741,7 +743,7 @@ oResource ::
   -- | Resource name pattern
   OutputResourceNamePattern a ->
   Output m (ResourceOutput m a)
-oResource resTyName = OResource resTyName
+oResource resTyName = OResource (unsafeName resTyName)
 
 makeOutput :: MonadIO m => Map String String -> Output m a -> a
 makeOutput bindings = go
@@ -751,10 +753,10 @@ makeOutput bindings = go
     go (OPure a) = a
     go (OApply a b) = go a (go b)
     go (OResourceType resTyName) =
-      let mkResId = ResourceId resTyName
+      let mkResId = ResourceId resTyName . unsafeName
       in ResourceOutput mkResId (putResource . mkResId) (setProperty . mkResId)
     go (OResource resTyName pat) =
-      let mkResId = ResourceId resTyName . renderOutputResourceNamePattern bindings pat
+      let mkResId = ResourceId resTyName . unsafeName . renderOutputResourceNamePattern bindings pat
       in ResourceOutput mkResId (putResource . mkResId) (setProperty . mkResId)
 
 data Change
@@ -795,7 +797,7 @@ renderReason (Reason status resId) =
 data ResourceIdPattern
   = ResourceIdPattern
       -- | Resource type name
-      !String
+      !Name
       !ResourceNamePattern
   deriving (Show, Eq)
 

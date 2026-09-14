@@ -179,6 +179,7 @@ test-suite blog-server-tests
         hspec,
         hspec-core,
         hspec-hedgehog,
+        http-api-data,
         http-client,
         http-client-tls,
         http-types,

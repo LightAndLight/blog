@@ -1,11 +1,21 @@
+{-# LANGUAGE BangPatterns #-}
+
 module Blog
-  ( nameParser
+  ( Name
+  , mkName
+  , unsafeName
+  , nameParser
+  , renderName
+  , nameToPath
+  , pathToName
   , ResourceId (..)
   , resourceTypeParser
   , resourceNameParser
   , resourceIdParser
   , readResourceId
   , renderResourceId
+  , resourceIdToPath
+  , pathToResourceId
   , propertyParser
   , ResourceType (..)
   , ResourceConfig (..)
@@ -30,25 +40,83 @@ import qualified Temple
 import qualified Text.Sage as Sage
 import qualified Toml
 
+newtype Name = Name String
+  deriving (Show, Eq, Ord)
+
+-- | Precondition: the name is non-empty
+mkName :: String -> Maybe Name
+mkName "" = Nothing
+mkName n = Just $ Name n
+
+-- | Precondition: the name is non-empty
+unsafeName :: HasCallStack => String -> Name
+unsafeName n = fromMaybe (error $ "invalid name: " ++ show n) $ mkName n
+
+renderName :: Name -> String
+renderName (Name n) = n
+
+nameToPath :: Name -> FilePath
+nameToPath (Name n)
+  -- Disallow the name "."
+  | "." <- n = "%2E"
+  -- Disallow anything prefixed with ".." (avoids "..", "...", etc.)
+  | '.' : '.' : cs <- n = "%2E%2E" ++ go cs
+  | otherwise = go n
+  where
+    -- Not allowed in Unix file paths
+    go ('\NUL' : cs) = "%00" ++ go cs
+    -- Prevent directory traversal
+    go ('/' : cs) = "%2F" ++ go cs
+    -- "%" is the escape character
+    go ('%' : cs) = "%25" ++ go cs
+    -- ":" has a special meaning on disk
+    go (':' : cs) = "%3A" ++ go cs
+    go (c : cs) = c : go cs
+    go [] = ""
+
+-- | Precondition: the path is non-empty
+pathToName :: HasCallStack => FilePath -> Name
+pathToName = unsafeName . go
+  where
+    go ('%' : cs) =
+      let
+        (prefix, suffix) = splitAt 2 cs
+        !c =
+          case prefix of
+            "00" -> '\NUL'
+            "2E" -> '.'
+            "2F" -> '/'
+            "25" -> '%'
+            "3A" -> ':'
+            _ -> error $ "invalid percent-encoding: %" ++ prefix
+      in
+        c : go suffix
+    go (c : cs) = c : go cs
+    go [] = ""
+
 data ResourceId
   = ResourceId
-  { resourceType :: !String
-  , resourceName :: !String
+  { resourceType :: !Name
+  , resourceName :: !Name
   }
   deriving (Show, Eq, Ord)
 
-nameParser :: Sage.Parser String
+nameParser :: Sage.Parser Name
 nameParser =
-  some $ Sage.satisfy ((||) <$> Char.isAlphaNum <*> (`elem` "-_."))
+  fmap Name
+    . some
+    $ Sage.satisfy ((||) <$> Char.isAlphaNum <*> (`elem` "-_."))
 
-resourceTypeParser :: Sage.Parser String
-resourceTypeParser = (:) <$> Sage.satisfy Char.isAlpha <*> many (Sage.satisfy Char.isAlphaNum)
+resourceTypeParser :: Sage.Parser Name
+resourceTypeParser =
+  fmap Name $
+    (:) <$> Sage.satisfy Char.isAlpha <*> many (Sage.satisfy Char.isAlphaNum)
 
-resourceNameParser :: Sage.Parser String
+resourceNameParser :: Sage.Parser Name
 resourceNameParser =
   nameParser
 
-propertyParser :: Sage.Parser String
+propertyParser :: Sage.Parser Name
 propertyParser =
   nameParser
 
@@ -56,7 +124,17 @@ resourceIdParser :: Sage.Parser ResourceId
 resourceIdParser = ResourceId <$> resourceTypeParser <* Sage.char ':' <*> resourceNameParser
 
 renderResourceId :: ResourceId -> String
-renderResourceId (ResourceId type_ name) = type_ ++ ":" ++ name
+renderResourceId (ResourceId type_ name) = renderName type_ ++ ":" ++ renderName name
+
+resourceIdToPath :: ResourceId -> FilePath
+resourceIdToPath (ResourceId resTyName resName) = nameToPath resTyName ++ ":" ++ nameToPath resName
+
+pathToResourceId :: HasCallStack => FilePath -> ResourceId
+pathToResourceId input =
+  let (prefix, suffix) = break (== ':') input
+  in case suffix of
+       ':' : rest -> ResourceId (pathToName prefix) (pathToName rest)
+       _ -> error $ "invalid resource ID: " ++ show input
 
 readResourceId :: HasCallStack => String -> ResourceId
 readResourceId input =
@@ -80,9 +158,9 @@ data ResourceConfig
 
 propertiesPart ::
   -- | Resource name
-  String ->
+  Name ->
   FilePath
-propertiesPart resName = resName ++ ":properties"
+propertiesPart resName = nameToPath resName ++ ":properties"
 
 data MetadataConfig
   = MetadataConfig
