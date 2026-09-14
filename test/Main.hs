@@ -1722,7 +1722,7 @@ cLogin username password =
     (\_state -> Just $ pure Login)
     ( \Login -> do
         manager <- ask
-        let headers = [(fromString "Content-Type", fromString "application/xxx-form-urlencoded")]
+        let headers = [(fromString "Content-Type", fromString "application/x-www-form-urlencoded")]
         response <-
           liftIO $
             httpPostWithCookies manager [] "https://localhost:8080/.login" headers $

@@ -630,7 +630,7 @@ login baseUrl manager = do
   username <- requestInput "username: "
   password <- requestInputSensitive "password: "
 
-  let headers = [(hContentType, fromString "application/xxx-form-urlencoded")]
+  let headers = [(hContentType, fromString "application/x-www-form-urlencoded")]
   let body = urlEncodeAsFormStable [("username", username), ("password", password)]
   response <- httpPostWithCookies manager [] (baseUrl ++ "/.login") headers body
   let cookies = getResponseCookies response

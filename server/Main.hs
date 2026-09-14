@@ -606,7 +606,7 @@ httpLogin ::
   Wai.Request ->
   HandlerT m Wai.Response
 httpLogin store routesVar request = do
-  let contentType = "application/xxx-form-urlencoded"
+  let contentType = "application/x-www-form-urlencoded"
   case lookup (fromString "Content-Type") $ Wai.requestHeaders request of
     Just value | value == fromString contentType -> pure ()
     _ ->
