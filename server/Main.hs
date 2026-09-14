@@ -62,7 +62,7 @@ import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime, no
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Traversable (for)
-import Network.HTTP.Types.Header (RequestHeaders, hContentType, hLastModified, hSetCookie)
+import Network.HTTP.Types.Header (Header, RequestHeaders, hContentType, hLastModified, hSetCookie)
 import Network.HTTP.Types.Status
   ( badRequest400
   , created201
@@ -580,6 +580,25 @@ renderChangeList changes =
 sessionDuration :: NominalDiffTime
 sessionDuration = 30 * nominalDay
 
+sessionCookie ::
+  {-| Session ID
+
+  'Nothing' clears the cookie.
+  -}
+  Maybe ID ->
+  -- | @Max-Age@, in seconds
+  Int ->
+  Header
+sessionCookie value maxAge =
+  ( hSetCookie
+  , fromString $
+      sessionIdCookieName
+        ++ "="
+        ++ foldMap ID.toString value
+        ++ "; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age="
+        ++ show maxAge
+  )
+
 createSession ::
   Monad m =>
   Store.ResourceType m ->
@@ -720,16 +739,7 @@ httpLogin store routesVar request = do
                             pure $
                               Wai.responseLBS
                                 ok200
-                                [
-                                  ( hSetCookie
-                                  , fromString $
-                                      sessionIdCookieName
-                                        ++ "="
-                                        ++ ID.toString sessionId
-                                        ++ "; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age="
-                                        ++ show (truncate sessionDuration :: Int)
-                                  )
-                                ]
+                                [sessionCookie (Just sessionId) (truncate sessionDuration)]
                                 (fromString "logged in")
                           err -> do
                             unless (err == Argon2VerifyMismatch) $ do
@@ -743,23 +753,15 @@ httpLogout ::
   Wai.Request ->
   HandlerT m Wai.Response
 httpLogout store routesVar request = do
-  case lookupSessionCookie request of
-    Nothing ->
-      loggedOut
-    Just value ->
-      case ID.fromString $ ByteString.Char8.unpack value of
-        Nothing ->
-          invalidSessionId
-        Just sessionId -> do
-          handleExceptT lift . withTransaction store routesVar Nothing $ \xactId _defer -> do
-            mSessionTy <- Store.lookupResourceType store xactId (unsafeName "session")
-            for_ mSessionTy $ \sessionTy ->
-              Store.removeResource sessionTy (unsafeName $ ID.toString sessionId)
+  for_ (ID.fromString . ByteString.Char8.unpack =<< lookupSessionCookie request) $ \sessionId ->
+    handleExceptT lift . withTransaction store routesVar Nothing $ \xactId _defer -> do
+      mSessionTy <- Store.lookupResourceType store xactId (unsafeName "session")
+      for_ mSessionTy $ \sessionTy -> do
+        let sessionName = unsafeName $ ID.toString sessionId
+        exists <- Store.doesResourceExist sessionTy sessionName
+        when exists $ Store.removeResource sessionTy sessionName
 
-          loggedOut
-  where
-    loggedOut = pure $ Wai.responseLBS ok200 [] (fromString "logged out")
-    invalidSessionId = pure $ Wai.responseLBS badRequest400 [] (fromString "invalid session ID")
+  pure $ Wai.responseLBS ok200 [sessionCookie Nothing 0] (fromString "logged out")
 
 httpResourceCreate ::
   (MonadMask m, MonadIO m) =>
