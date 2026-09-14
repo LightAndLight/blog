@@ -167,6 +167,15 @@ httpPut ::
   IO (Http.Response LazyByteString)
 httpPut manager url headers = http manager url (fromString "PUT") headers
 
+httpPatch ::
+  Http.Manager ->
+  -- | URL
+  String ->
+  RequestHeaders ->
+  LazyByteString ->
+  IO (Http.Response LazyByteString)
+httpPatch manager url headers = http manager url (fromString "PATCH") headers
+
 testUsername :: String
 testUsername = "test-user"
 
@@ -510,6 +519,10 @@ commands username password =
   , cBeginNoauth
   , cCommit
   , cCommitNoauth
+  , cRollbackNoauth
+  , cTransactionListNoauth
+  , cExportNoauth
+  , cImportNoauth
   , cResourceTypeCreate
   , cResourceTypeCreateNoauth
   , cResourceTypeCreateDuplicate
@@ -535,6 +548,8 @@ commands username password =
   , cResourceGetNoauth GetUrl
   , cResourceGetMissing GetHeaders
   , cResourceGetMissing GetUrl
+  , cResourceUpdateNoauth
+  , cResourcePropertiesUpdateNoauth
   ]
 
 data ResourceTypeList (v :: Type -> Type)
@@ -1905,5 +1920,195 @@ cCommitNoauth =
         isJust (stateTransaction state)
     , Ensure $ \_old _new (CommitNoauth _xactId) output -> do
         label $ fromString "commit (unauthorised)"
+        Http.responseStatus output === unauthorized401
+    ]
+
+data RollbackNoauth (v :: Type -> Type)
+  = RollbackNoauth
+      -- | Transaction ID
+      (Var ByteString v)
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cRollbackNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cRollbackNoauth =
+  Command
+    ( \state -> do
+        xactId <- stateTransactionId <$> stateTransaction state
+        pure $ pure (RollbackNoauth xactId)
+    )
+    ( \(RollbackNoauth xactId) -> do
+        manager <- ask
+        let headers = [(fromString "X-Blog-TransactionId", concrete xactId)]
+        liftIO $ httpPost manager "https://localhost:8080/.transaction/rollback" headers mempty
+    )
+    [ Require $ \state (RollbackNoauth _xactId) ->
+        isJust (stateTransaction state)
+    , Ensure $ \_old _new (RollbackNoauth _xactId) output -> do
+        label $ fromString "rollback (unauthenticated)"
+        Http.responseStatus output === unauthorized401
+    ]
+
+data TransactionListNoauth (v :: Type -> Type)
+  = TransactionListNoauth
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cTransactionListNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cTransactionListNoauth =
+  Command
+    (\_state -> Just $ pure TransactionListNoauth)
+    ( \TransactionListNoauth -> do
+        manager <- ask
+        liftIO $ httpGet manager "https://localhost:8080/.transaction" []
+    )
+    [ Ensure $ \_old _new TransactionListNoauth output -> do
+        label $ fromString "transaction list (unauthenticated)"
+        Http.responseStatus output === unauthorized401
+    ]
+
+data ExportNoauth (v :: Type -> Type)
+  = ExportNoauth
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cExportNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cExportNoauth =
+  Command
+    (\_state -> Just $ pure ExportNoauth)
+    ( \ExportNoauth -> do
+        manager <- ask
+        liftIO $ httpGet manager "https://localhost:8080/.export" []
+    )
+    [ Ensure $ \_old _new ExportNoauth output -> do
+        label $ fromString "export (unauthenticated)"
+        Http.responseStatus output === unauthorized401
+    ]
+
+data ImportNoauth (v :: Type -> Type)
+  = ImportNoauth
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cImportNoauth :: (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cImportNoauth =
+  Command
+    (\_state -> Just $ pure ImportNoauth)
+    ( \ImportNoauth -> do
+        manager <- ask
+        -- 1024 zero bytes is an empty tar archive, so the only thing wrong with
+        -- this request is that it is unauthenticated.
+        liftIO $ httpPut manager "https://localhost:8080/.import" [] (LazyByteString.replicate 1024 0)
+    )
+    [ Ensure $ \_old _new ImportNoauth output -> do
+        label $ fromString "import (unauthenticated)"
+        Http.responseStatus output === unauthorized401
+    ]
+
+data ResourceUpdateNoauth (v :: Type -> Type)
+  = ResourceUpdateNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource type
+      Name
+      -- | Resource name
+      Name
+      -- | Content
+      LazyByteString
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourceUpdateNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourceUpdateNoauth =
+  Command
+    ( \state -> do
+        let nonemptyResources = Map.filter (not . null) $ stateResourcesTransactionView state
+        guard . not $ null nonemptyResources
+        pure $
+          (\mXactId (resTy, resName) content -> ResourceUpdateNoauth mXactId resTy resName content)
+            <$> Gen.element
+              ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+            <*> ( do
+                    (resTy, res) <- Gen.element $ Map.toList nonemptyResources
+                    (resName, _resValue) <- Gen.element $ Map.toList res
+                    pure (resTy, resName)
+                )
+            <*> ( do
+                    resTy <- Gen.element . Map.elems $ stateResourceTypesTransactionView state
+                    genResourceContent resTy
+                )
+    )
+    ( \(ResourceUpdateNoauth mXactId resTy resName content) -> do
+        manager <- ask
+        let
+          headers =
+            [ (fromString "X-Blog-ResourceType", fromString $ renderName resTy)
+            , (fromString "X-Blog-ResourceName", fromString $ renderName resName)
+            ]
+              ++ [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $ httpPut manager "https://localhost:8080/.resource" headers content
+    )
+    [ Require $ \state (ResourceUpdateNoauth mXactId resTy resName _content) ->
+        ( case mXactId of
+            Nothing ->
+              True
+            Just xactId ->
+              fmap stateTransactionId (stateTransaction state) == Just xactId
+        )
+          && isJust (stateLookupResource state mXactId resTy resName)
+    , Ensure $ \_old _new (ResourceUpdateNoauth _mXactId _resTy _resName _content) output -> do
+        label $ fromString "resource update (unauthenticated)"
+        Http.responseStatus output === unauthorized401
+    ]
+
+data ResourcePropertiesUpdateNoauth (v :: Type -> Type)
+  = ResourcePropertiesUpdateNoauth
+      -- | Transaction ID
+      (Maybe (Var ByteString v))
+      -- | Resource type
+      Name
+      -- | Resource name
+      Name
+  deriving (Show, Generic, FunctorB, TraversableB)
+
+cResourcePropertiesUpdateNoauth ::
+  (MonadGen gen, MonadReader Http.Manager m, MonadIO m) => Command gen m State
+cResourcePropertiesUpdateNoauth =
+  Command
+    ( \state -> do
+        let nonemptyResources = Map.filter (not . null) $ stateResourcesTransactionView state
+        guard . not $ null nonemptyResources
+        pure $
+          (\mXactId (resTy, resName) -> ResourcePropertiesUpdateNoauth mXactId resTy resName)
+            <$> Gen.element
+              ([Nothing] ++ [Just (stateTransactionId transaction) | Just transaction <- [stateTransaction state]])
+            <*> ( do
+                    (resTy, res) <- Gen.element $ Map.toList nonemptyResources
+                    (resName, _resValue) <- Gen.element $ Map.toList res
+                    pure (resTy, resName)
+                )
+    )
+    ( \(ResourcePropertiesUpdateNoauth mXactId resTy resName) -> do
+        manager <- ask
+        let headers = [(fromString "X-Blog-TransactionId", concrete xactId) | Just xactId <- [mXactId]]
+        liftIO $
+          httpPatch
+            manager
+            ( "https://localhost:8080/.resource/"
+                ++ nameToPart resTy
+                ++ "/"
+                ++ nameToPart resName
+                ++ "/property"
+            )
+            headers
+            (fromString "title = \"unauthenticated\"\n")
+    )
+    [ Require $ \state (ResourcePropertiesUpdateNoauth mXactId resTy resName) ->
+        ( case mXactId of
+            Nothing ->
+              True
+            Just xactId ->
+              fmap stateTransactionId (stateTransaction state) == Just xactId
+        )
+          && isJust (stateLookupResource state mXactId resTy resName)
+    , Ensure $ \_old _new (ResourcePropertiesUpdateNoauth _mXactId _resTy _resName) output -> do
+        label $ fromString "resource properties update (unauthenticated)"
         Http.responseStatus output === unauthorized401
     ]
