@@ -408,7 +408,32 @@ authenticate store routesVar request = do
           then invalidSession
           else do
             user <- getStringProperty (unsafeName "user")
-            pure . AuthenticatedUser $ Text.unpack user
+            userName <-
+              case mkName $ Text.unpack user of
+                Nothing -> do
+                  liftIO . putStrLn $
+                    "error: "
+                      ++ renderResourceId (ResourceId (Store.resourceTypeName sessionTy) sessionId)
+                      ++ ":user is not a valid name (got "
+                      ++ show user
+                      ++ ")"
+                  invalidSession
+                Just x -> pure x
+
+            mUserTy <- Store.lookupResourceType store' xactId (unsafeName "user")
+            case mUserTy of
+              Nothing -> do
+                liftIO . putStrLn $ "warning: no 'user' resource type (refusing authentication)"
+                lift . throwError $
+                  Wai.responseLBS
+                    notImplemented501
+                    []
+                    (fromString $ "error: server has no 'user' resource type")
+              Just userTy -> do
+                userExists <- Store.doesResourceExist userTy userName
+                if userExists
+                  then pure . AuthenticatedUser $ renderName userName
+                  else invalidSession
       else invalidSession
   where
     authenticationRequired =
