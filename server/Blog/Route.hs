@@ -57,7 +57,7 @@ insert [] value (Routes _ rest) = Routes (Just value) rest
 insert (p : ps) value (Routes root rest) = Routes root (Map.alter f p rest)
   where
     f :: Maybe (Routes a) -> Maybe (Routes a)
-    f Nothing = Just $ Routes (Just value) mempty
+    f Nothing = Just $ singleton ps value
     f (Just routes) = Just $ insert ps value routes
 
 delete :: [Text] -> Routes a -> Routes a
