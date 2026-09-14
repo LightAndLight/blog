@@ -33,7 +33,7 @@ import Data.List (find)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.String (fromString)
 import Data.Text (Text)
-import qualified Data.Text.IO as Text
+import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy.Builder as Text.Lazy.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (getCurrentTime)
@@ -64,7 +64,9 @@ import System.Exit (exitFailure)
 import System.FilePath ((</>))
 import System.IO (hFlush, stdout)
 import System.IO.Error (isDoesNotExistError)
-import System.Posix.IO (OpenMode (..), closeFd, defaultFileFlags, openFd)
+import System.Posix.Files (ownerReadMode, ownerWriteMode, unionFileModes)
+import System.Posix.IO (OpenFileFlags (..), OpenMode (..), closeFd, defaultFileFlags, openFd)
+import System.Posix.IO.ByteString (fdWrite)
 import System.Posix.Terminal
   ( TerminalMode (..)
   , TerminalState (..)
@@ -606,6 +608,14 @@ requestInputSensitive prompt =
     (putStr prompt *> hFlush stdout *> getLine)
       `finally` (setTerminalAttributes tty attrs Immediately <* putChar '\n')
 
+writePrivateFile :: FilePath -> ByteString -> IO ()
+writePrivateFile path content = do
+  bracket (openFd path WriteOnly defaultFileFlags{creat = Just ownerReadWrite}) closeFd $ \fd -> do
+    _count <- fdWrite fd content
+    pure ()
+  where
+    ownerReadWrite = ownerReadMode `unionFileModes` ownerWriteMode
+
 getSessionId :: IO (Maybe ID)
 getSessionId = runMaybeT $ do
   dataHome <- liftIO getDataHome
@@ -649,7 +659,7 @@ login baseUrl manager = do
         when exists $ removeDirectoryRecursive dir
       createDirectoryIfMissing True dir
 
-      ByteString.writeFile (dir </> "id") $ Http.cookie_value sessionCookie
+      writePrivateFile (dir </> "id") $ Http.cookie_value sessionCookie
       writeFile (dir </> "expires") $ iso8601Show (Http.cookie_expiry_time sessionCookie)
       ByteString.Lazy.Char8.putStrLn body'
 
@@ -1164,7 +1174,7 @@ seedUser ::
   FilePath ->
   IO ()
 seedUser dir = do
-  username <- requestInput "username: "
+  username <- parseName =<< requestInput "username: "
 
   password <- requestInputSensitive "password: "
   password' <- requestInputSensitive "confirm password: "
@@ -1176,8 +1186,10 @@ seedUser dir = do
   salt <- ID.generate
 
   createDirectoryIfMissing True dir
-  let file = dir </> username
-  Text.writeFile file $
+  createDirectoryIfMissing True $ dir </> propertiesPart username
+
+  let file = dir </> nameToPath username
+  writePrivateFile file . Text.Encoding.encodeUtf8 $
     hashPassword defaultHashOptions (ByteString.pack $ ID.toBytes salt) (fromString password)
 
   putStrLn $ "created " ++ file
