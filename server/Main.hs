@@ -58,7 +58,7 @@ import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Data.Text.Short as ShortText
-import Data.Time.Clock (UTCTime, addUTCTime, getCurrentTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, getCurrentTime, nominalDay)
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Traversable (for)
@@ -577,6 +577,9 @@ renderChangeList changes =
     (\(changedId, change) -> fromString "* " <> fromString (Build.renderChange changedId change))
     (Map.toList changes)
 
+sessionDuration :: NominalDiffTime
+sessionDuration = 30 * nominalDay
+
 createSession ::
   Monad m =>
   Store.ResourceType m ->
@@ -711,8 +714,7 @@ httpLogin store routesVar request = do
 
                             sessionId <- liftIO ID.generate
 
-                            let days = 3600 * 24 :: Int
-                            let expires = addUTCTime (fromIntegral days) now
+                            let expires = addUTCTime sessionDuration now
                             createSession sessionTy sessionId username expires
 
                             pure $
@@ -725,7 +727,7 @@ httpLogin store routesVar request = do
                                         ++ "="
                                         ++ ID.toString sessionId
                                         ++ "; Secure; HttpOnly; SameSite=Strict; Path=/; Max-Age="
-                                        ++ show (30 * days)
+                                        ++ show (truncate sessionDuration :: Int)
                                   )
                                 ]
                                 (fromString "logged in")
