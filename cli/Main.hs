@@ -98,6 +98,7 @@ data ViewTarget
 
 data Command
   = Login
+  | Logout
   | Begin
       -- | Defer rules until commit
       Bool
@@ -165,6 +166,7 @@ cliParser =
       )
     <*> Options.hsubparser
       ( Options.command "login" (Options.info loginParser $ Options.progDesc "Authenticate with the server")
+          <> Options.command "logout" (Options.info logoutParser $ Options.progDesc "End the current session")
           <> Options.command "begin" (Options.info beginParser $ Options.progDesc "Begin a transaction")
           <> Options.command "commit" (Options.info commitParser $ Options.progDesc "Commit a transaction")
           <> Options.command
@@ -196,6 +198,9 @@ cliParser =
   where
     loginParser =
       pure Login
+
+    logoutParser =
+      pure Logout
 
     beginParser =
       Begin
@@ -381,6 +386,8 @@ main = do
   case cliCommand cli of
     Login ->
       login baseUrl manager
+    Logout ->
+      logout baseUrl manager mSessionId
     Begin defer ->
       begin baseUrl manager mSessionId defer
     Commit xactId ->
@@ -616,10 +623,12 @@ writePrivateFile path content = do
   where
     ownerReadWrite = ownerReadMode `unionFileModes` ownerWriteMode
 
+sessionDir :: IO FilePath
+sessionDir = (</> ":session") <$> getDataHome
+
 getSessionId :: IO (Maybe ID)
 getSessionId = runMaybeT $ do
-  dataHome <- liftIO getDataHome
-  let dir = dataHome </> ":session"
+  dir <- liftIO sessionDir
 
   expires <-
     MaybeT $
@@ -651,8 +660,7 @@ login baseUrl manager = do
       putStrLn $ "error: log in failed (no session cookie received)"
       exitFailure
     Just sessionCookie -> do
-      dataHome <- getDataHome
-      let dir = dataHome </> ":session"
+      dir <- sessionDir
 
       do
         exists <- doesDirectoryExist dir
@@ -662,6 +670,21 @@ login baseUrl manager = do
       writePrivateFile (dir </> "id") $ Http.cookie_value sessionCookie
       writeFile (dir </> "expires") $ iso8601Show (Http.cookie_expiry_time sessionCookie)
       ByteString.Lazy.Char8.putStrLn body'
+
+logout ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  IO ()
+logout baseUrl manager mSessionId = do
+  response <- httpPost manager (baseUrl ++ "/.logout") (sessionCookieHeaders mSessionId) mempty
+  body <- expectOk response
+
+  dir <- sessionDir
+  removeDirectoryRecursive dir `catch` \err -> unless (isDoesNotExistError err) $ throwIO err
+
+  ByteString.Lazy.Char8.putStrLn body
 
 begin ::
   String ->
