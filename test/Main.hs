@@ -11,7 +11,7 @@ import Barbies
 import Blog (Name, ResourceId (..), renderName, renderResourceId, unsafeName)
 import Blog.Diagnostic (renderDiagnosticReports)
 import qualified Blog.ID as ID
-import Blog.Password (hashPassword)
+import Blog.Password (HashOptions (..), defaultHashOptions, hashPassword)
 import Blog.Session (sessionIdCookieName)
 import qualified Blog.Store as Store
 import Control.Concurrent.Async (async, wait)
@@ -167,6 +167,20 @@ httpPut ::
   IO (Http.Response LazyByteString)
 httpPut manager url headers = http manager url (fromString "PUT") headers
 
+testUsername :: String
+testUsername = "test-user"
+
+testPassword :: String
+testPassword = "test-password"
+
+testPasswordHash :: LazyByteString
+testPasswordHash =
+  Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict $
+    hashPassword testHashOptions (fromString "test-salt") (fromString testPassword)
+  where
+    -- weak password hashing to speed up tests
+    testHashOptions = defaultHashOptions{hashIterations = 1, hashMemory = 8, hashParallelism = 1}
+
 spec :: Spec
 spec = do
   describe "Blog.ID" $ do
@@ -198,14 +212,6 @@ spec = do
         hedgehog $ do
           manager <- liftIO $ httpManager caStore
 
-          let username = "test-user"
-          let salt = "test-salt"
-          let password = "test-password"
-          let
-            passwordHash =
-              Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict $
-                hashPassword (fromString salt) (fromString password)
-
           let
             state =
               initialState
@@ -221,10 +227,10 @@ spec = do
                     Map.insertWith
                       (<>)
                       (unsafeName "user")
-                      (Map.singleton (unsafeName username) StateResource{stateResourceContent = passwordHash})
+                      (Map.singleton (unsafeName testUsername) StateResource{stateResourceContent = testPasswordHash})
                       $ stateResources initialState
                 }
-          cs <- forAll $ Gen.sequential (Range.constant 0 100) state (commands username password)
+          cs <- forAll $ Gen.sequential (Range.constant 0 100) state (commands testUsername testPassword)
 
           tmpDir <-
             liftIO $ getCanonicalTemporaryDirectory >>= \tmp -> createTempDirectory tmp "blog-server-tests"
@@ -257,7 +263,7 @@ spec = do
                       ]
 
                 userTy <- Store.getResourceType store xactId (unsafeName "user")
-                _updated <- Store.writeResource userTy (unsafeName username) passwordHash
+                _updated <- Store.writeResource userTy (unsafeName testUsername) testPasswordHash
 
                 pure ()
 

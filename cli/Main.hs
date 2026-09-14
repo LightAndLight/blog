@@ -13,7 +13,7 @@ import Blog
   )
 import Blog.ID (ID)
 import qualified Blog.ID as ID
-import Blog.Password (hashPassword)
+import Blog.Password (defaultHashOptions, hashPassword)
 import Blog.Session (sessionIdCookieName)
 import Control.Applicative (empty, many, optional, (<**>), (<|>))
 import Control.Exception (bracket, catch, finally, throwIO)
@@ -1178,6 +1178,6 @@ seedUser dir = do
   createDirectoryIfMissing True dir
   let file = dir </> username
   Text.writeFile file $
-    hashPassword (ByteString.pack $ ID.toBytes salt) (fromString password)
+    hashPassword defaultHashOptions (ByteString.pack $ ID.toBytes salt) (fromString password)
 
   putStrLn $ "created " ++ file
