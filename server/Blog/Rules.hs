@@ -1219,7 +1219,6 @@ loadMarkdown input = do
       template <- parseTemplate ("(" ++ location ++ ")") content'
 
       let inputRef = Temple.TemplateRef "."
-      -- TODO: register these deps
       (deps, bindings, template') <-
         lift $
           inferBindings
@@ -1229,6 +1228,10 @@ loadMarkdown input = do
             ("(" ++ renderResourceId (Build.resourceInputId input) ++ ", inline HTML)", content')
             inputRef
             template
+
+      -- TODO: Template references in inline HTML are currently unsupported
+      unless (null deps) . error $
+        "unexpected template dependencies in " ++ show template
 
       bindings' <- for bindings $ \binding -> do
         let name = Temple.bindingName binding
