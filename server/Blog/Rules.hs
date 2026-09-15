@@ -877,12 +877,34 @@ inferMetadataValueType (VList items) = do
     pure item'
   pure (Temple.CArray items', Temple.TStream itemTy)
 
+data AdjacencyValue
+  = AdjacencyValue
+  { adjacencyValueTitle :: !Text
+  , adjacencyValueUrl :: !Text
+  }
+
+adjacencyValueType :: Temple.Type
+adjacencyValueType = mkRecord [("title", Temple.TString), ("url", Temple.TString)]
+
+adjacencyValueCore :: AdjacencyValue -> Temple.Core
+adjacencyValueCore adjacent =
+  Temple.CRecord
+    [ (fromString "title", metaToTempleCore . VString $ adjacencyValueTitle adjacent)
+    , (fromString "url", metaToTempleCore . VString $ adjacencyValueUrl adjacent)
+    ]
+
+optionalAdjacencyValueCore :: Maybe AdjacencyValue -> Temple.Core
+optionalAdjacencyValueCore Nothing =
+  Temple.CConstructor (fromString "None") []
+optionalAdjacencyValueCore (Just adjacent) =
+  Temple.CConstructor (fromString "Some") [adjacencyValueCore adjacent]
+
 articlePropertyTypeProvider ::
   MonadError DiagnosticReports m =>
   -- | Previous
-  Maybe [(Text, MetadataValue)] ->
+  Maybe AdjacencyValue ->
   -- | Next
-  Maybe [(Text, MetadataValue)] ->
+  Maybe AdjacencyValue ->
   -- | Rendered article content
   Text ->
   PropertyTypeProvider m
@@ -891,34 +913,16 @@ articlePropertyTypeProvider mPrev mNext content =
     if propName == fromString "previous"
       then pure . Just $
         \path propTy -> do
-          unifyPropertyType path propTy $
-            mkOptional (mkRecord [("title", Temple.TString), ("url", Temple.TString)])
-
-          case mPrev of
-            Nothing ->
-              pure $ Temple.CConstructor (fromString "None") []
-            Just prev ->
-              -- TODO: guarantee that these values have the correct type
-              pure $
-                Temple.CConstructor
-                  (fromString "Some")
-                  [Temple.CRecord $ (fmap . fmap) metaToTempleCore prev]
+          -- TODO: is there a better way to ensure the type matches the value?
+          -- Some kind of simultaneous typed-value builder?
+          unifyPropertyType path propTy $ mkOptional adjacencyValueType
+          pure $ optionalAdjacencyValueCore mPrev
       else
         if propName == fromString "next"
           then pure . Just $
             \path propTy -> do
-              unifyPropertyType path propTy $
-                mkOptional (mkRecord [("title", Temple.TString), ("url", Temple.TString)])
-
-              case mNext of
-                Nothing ->
-                  pure $ Temple.CConstructor (fromString "None") []
-                Just next ->
-                  -- TODO: guarantee that these values have the correct type
-                  pure $
-                    Temple.CConstructor
-                      (fromString "Some")
-                      [Temple.CRecord $ (fmap . fmap) metaToTempleCore next]
+              unifyPropertyType path propTy $ mkOptional adjacencyValueType
+              pure $ optionalAdjacencyValueCore mNext
           else
             if propName == fromString "content"
               then pure . Just $
@@ -1287,7 +1291,7 @@ markdownDependency input () = do
 getAdjacency ::
   MonadIO m =>
   Build.ResourceInput m ByteString ->
-  Build.ActionT m (Maybe [(Text, MetadataValue)], Maybe [(Text, MetadataValue)])
+  Build.ActionT m (Maybe AdjacencyValue, Maybe AdjacencyValue)
 getAdjacency iAdjacency = do
   let adjacencyFile = fromString $ "(" ++ renderResourceId (Build.resourceInputId iAdjacency) ++ ")"
   let adjacencyContent = Build.resourceInputContent iAdjacency
@@ -1314,9 +1318,19 @@ getAdjacency iAdjacency = do
           (Store.resourceTypeName resTy)
           resName
           content
-      pure $
-        [(fromString "title", prev') | Just prev' <- [Map.lookup (fromString "title") metadata]]
-          ++ [(fromString "url", next') | Just next' <- [Map.lookup (fromString "url") metadata]]
+      let
+        requireString field =
+          case Map.lookup (fromString field) metadata of
+            Just (VString s) ->
+              pure s
+            Just _ ->
+              throwError . DiagnosticSimple $
+                "(" ++ renderResourceId resId ++ ":metadata:" ++ field ++ "): not a string"
+            Nothing ->
+              throwError . DiagnosticSimple $
+                "(" ++ renderResourceId resId ++ ":metadata): missing '" ++ field ++ "'"
+
+      AdjacencyValue <$> requireString "title" <*> requireString "url"
 
   prev' <- traverse getAdjacencyFields prev
   next' <- traverse getAdjacencyFields next
