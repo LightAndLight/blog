@@ -2,7 +2,9 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 module Blog.Metadata
-  ( resourceMetadataDecoder
+  ( MetadataKeyRequirement (..)
+  , metadataKeyRequirement
+  , resourceMetadataDecoder
   , parseResourceMetadata
   , metadataValueFromToml
   , renderMetadataValueToml
@@ -10,7 +12,8 @@ module Blog.Metadata
 where
 
 import Blog
-  ( MetadataValue (..)
+  ( MetadataConfig
+  , MetadataValue (..)
   , Name
   , ResourceConfig
   , ResourceId (..)
@@ -38,6 +41,21 @@ import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Toml
 
+data MetadataKeyRequirement
+  = -- | The key must be present
+    Required
+  | -- | The key may be omitted, in which case the default value is used instead.
+    Defaulted !MetadataValue
+  | -- | The key may be omitted. When missing, its value is @None@. When present, its value is @Some(value)@.
+    Optional
+
+metadataKeyRequirement :: MetadataConfig -> MetadataKeyRequirement
+metadataKeyRequirement metaCfg =
+  case (metaCfgOptional metaCfg, metaCfgDefault metaCfg) of
+    (False, _) -> Required
+    (True, Nothing) -> Optional
+    (True, Just def) -> Defaulted def
+
 resourceMetadataDecoder ::
   ResourceConfig ->
   Toml.Decoder (Map Text MetadataValue)
@@ -45,18 +63,20 @@ resourceMetadataDecoder config =
   Map.fromList
     <$> traverse
       ( \(key, metaCfg) ->
-          (,) key
-            <$> case (metaCfgOptional metaCfg, metaCfgDefault metaCfg) of
-              (False, _) ->
-                Toml.key key (metadataTypeDecoder $ metaCfgType metaCfg)
-              (True, Nothing) ->
-                maybe
-                  (VConstructor (fromString "None") [])
-                  (VConstructor (fromString "Some") . pure)
-                  <$> Toml.optionalKey key (metadataTypeDecoder $ metaCfgType metaCfg)
-              (True, Just def) ->
-                fromMaybe def
-                  <$> Toml.optionalKey key (metadataTypeDecoder $ metaCfgType metaCfg)
+          let
+            valueDecoder = metadataTypeDecoder $ metaCfgType metaCfg
+          in
+            (,) key
+              <$> case metadataKeyRequirement metaCfg of
+                Required ->
+                  Toml.key key valueDecoder
+                Optional ->
+                  maybe
+                    (VConstructor (fromString "None") [])
+                    (VConstructor (fromString "Some") . pure)
+                    <$> Toml.optionalKey key valueDecoder
+                Defaulted def ->
+                  fromMaybe def <$> Toml.optionalKey key valueDecoder
       )
       (Map.toList $ cfgMetadata config)
 

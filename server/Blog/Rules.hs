@@ -15,8 +15,6 @@ import Blog
   , Name
   , ResourceId (..)
   , cfgMetadata
-  , metaCfgDefault
-  , metaCfgOptional
   , metaCfgType
   , metadataValueString
   , propertyParser
@@ -31,7 +29,7 @@ import Blog.Build ((*<))
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
 import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport, tomlResult)
-import Blog.Metadata (parseResourceMetadata)
+import Blog.Metadata (MetadataKeyRequirement (..), metadataKeyRequirement, parseResourceMetadata)
 import Blog.Pandoc (htmlWriterOptions, markdownReaderOptions, pandoc)
 import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
@@ -55,7 +53,7 @@ import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromJust, fromMaybe, isJust, isNothing)
+import Data.Maybe (fromJust, fromMaybe, isJust)
 import Data.Monoid (All (..), First (..), getAll, getFirst)
 import Data.Ord (Down (..))
 import Data.Set (Set)
@@ -744,12 +742,12 @@ metadataPropertyTypeProvider =
         pure . Just $
           \path propTy -> do
             let
+              ty = metaToTempleTy $ metaCfgType metaCfg
               metadataType =
-                -- TODO: this should be moved out so that it's in sync with
-                -- the result of `parseResourceMetadata`.
-                if metaCfgOptional metaCfg && isNothing (metaCfgDefault metaCfg)
-                  then mkOptional . metaToTempleTy $ metaCfgType metaCfg
-                  else metaToTempleTy $ metaCfgType metaCfg
+                case metadataKeyRequirement metaCfg of
+                  Required -> ty
+                  Defaulted{} -> ty
+                  Optional -> mkOptional ty
               metadataValue = metaToTempleCore . fromJust $ Map.lookup propName metadata
 
             unifyPropertyType path propTy metadataType
