@@ -372,7 +372,7 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
     getResourcesWithPublished store xactId inputs = do
       resTy <- do
         let resTyName = Build.resourceInputsType inputs
-        Store.getResourceType store xactId resTyName
+        Store.getResourceType store (Just xactId) resTyName
 
       inputs' <- Store.listResource resTy
       for inputs' $ \input -> do
@@ -626,7 +626,7 @@ resourceTypeProvider ::
   TypeProvider (WriterT (Set ResourceId) m)
 resourceTypeProvider store xactId path resourceTypesTy = do
   forRecord path resourceTypesTy $ \path' resTyName resourcesTy -> do
-    mResTy <- lift . lift . lift . Store.lookupResourceType store xactId $ textToName resTyName
+    mResTy <- lift . lift . lift . Store.lookupResourceType store (Just xactId) $ textToName resTyName
     resTy <- maybe (lift . throwError $ ResourceTypeNotFound path resTyName) pure mResTy
 
     forRecord path' resourcesTy $ \path'' resName propertiesTy -> do
@@ -1295,7 +1295,7 @@ getAdjacency iAdjacency = do
       store <- Build.askStore
       xactId <- Build.askTransactionId
 
-      resTy <- Store.getResourceType store xactId resTyName
+      resTy <- Store.getResourceType store (Just xactId) resTyName
       mContent <- Store.readProperty resTy resName (unsafeName "metadata")
       content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
       metadata <-

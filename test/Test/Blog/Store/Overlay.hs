@@ -8,6 +8,7 @@ module Test.Blog.Store.Overlay (spec) where
 
 import Blog.Store.Overlay
   ( Overlay (..)
+  , OverlayChanges (..)
   , overlayCommit
   , overlayCreateDir
   , overlayDoesDirectoryExist
@@ -65,9 +66,13 @@ spec =
         overlay =
           Overlay
             { overlayBase = base
-            , overlayCreate = create
-            , overlayUpdate = update
-            , overlayDelete = delete
+            , overlayChanges =
+                Just
+                  OverlayChanges
+                    { overlayCreate = create
+                    , overlayUpdate = update
+                    , overlayDelete = delete
+                    }
             }
       runReaderT (executeSequential initialState cs) overlay
 

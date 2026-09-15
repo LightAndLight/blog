@@ -154,7 +154,7 @@ initRoutes store = do
   routesVar <- atomically $ Routes <$> newTVar Blog.Route.empty <*> newTVar mempty
 
   result <- runExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
-    mResTy <- Store.lookupResourceType store xactId (unsafeName "route")
+    mResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "route")
     case mResTy of
       Nothing -> do
         liftIO $ putStrLn "info: resource type 'route' missing (starting with empty routes)"
@@ -246,21 +246,31 @@ requireHeader headers headerName = do
       pure headerValue
 
 optionalTransactionIdHeader ::
-  MonadError Wai.Response m => RequestHeaders -> m (Maybe Store.TransactionId)
-optionalTransactionIdHeader headers =
-  case lookup (fromString "X-Blog-TransactionId") headers of
-    Nothing ->
-      pure Nothing
-    Just xactId ->
-      Just <$> parseTransactionId (ByteString.Char8.unpack xactId)
+  Monad m =>
+  Store (ExceptT DiagnosticReports m) -> RequestHeaders -> HandlerT m (Maybe Store.TransactionId)
+optionalTransactionIdHeader store headers =
+  traverse (requireTransactionId store) $ lookup (fromString "X-Blog-TransactionId") headers
 
-parseTransactionId :: MonadError Wai.Response m => String -> m Store.TransactionId
-parseTransactionId value =
-  case Store.parseTransactionId value of
+requireTransactionId ::
+  Monad m =>
+  Store (ExceptT DiagnosticReports m) ->
+  ByteString ->
+  HandlerT m Store.TransactionId
+requireTransactionId store value =
+  case Store.parseTransactionId $ ByteString.Char8.unpack value of
     Nothing ->
+      invalidTransactionId
+    Just xactId -> do
+      exists <- handleExceptT id . hoist lift $ Store.doesTransactionExist store xactId
+      unless exists invalidTransactionId
+      pure xactId
+  where
+    invalidTransactionId =
       throwError $
-        Wai.responseLBS badRequest400 [] (fromString $ "invalid transaction ID: " ++ show value)
-    Just x -> pure x
+        Wai.responseLBS
+          badRequest400
+          []
+          (fromString $ "invalid transaction ID: " ++ show value)
 
 withTransaction ::
   (MonadError DiagnosticReports m, MonadMask m, MonadIO m) =>
@@ -309,7 +319,7 @@ evalRules ::
   m (Map ResourceId Build.Change)
 evalRules store routesVar xactId resIds = do
   changes <- Build.evalRules putStrLn store xactId Blog.Rules.rules resIds
-  mRouteResTy <- Store.lookupResourceType store xactId (unsafeName "route")
+  mRouteResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "route")
   -- TODO: not sure if this is a good idea
   case mRouteResTy of
     Nothing ->
@@ -339,14 +349,13 @@ newtype AuthenticatedUser = AuthenticatedUser String
 authenticate ::
   (MonadIO m, MonadMask m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   HandlerT m AuthenticatedUser
-authenticate store routesVar request = do
+authenticate store request = do
   let store' = Store.hoistStore (hoist lift) store
-  handleExceptT id . withTransaction store' routesVar Nothing $ \xactId _defer -> do
+  handleExceptT id $ do
     sessionTy <- do
-      mSessionTy <- Store.lookupResourceType store' xactId (unsafeName "session")
+      mSessionTy <- Store.lookupResourceType store' Nothing (unsafeName "session")
       case mSessionTy of
         Nothing -> do
           liftIO . putStrLn $ "warning: no 'session' resource type (refusing authentication)"
@@ -420,7 +429,7 @@ authenticate store routesVar request = do
                   invalidSession
                 Just x -> pure x
 
-            mUserTy <- Store.lookupResourceType store' xactId (unsafeName "user")
+            mUserTy <- Store.lookupResourceType store' Nothing (unsafeName "user")
             case mUserTy of
               Nothing -> do
                 liftIO . putStrLn $ "warning: no 'user' resource type (refusing authentication)"
@@ -460,11 +469,11 @@ app store routesVar request respond = do
           "POST" -> httpLogout store routesVar request
           _ -> methodNotAllowed
       part : parts | part == fromString ".resource" -> do
-        _user <- authenticate store routesVar request
+        _user <- authenticate store request
         case parts of
           [] ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "GET" -> httpResourceGet store routesVar request
+              "GET" -> httpResourceGet store request
               "POST" -> httpResourceCreate store routesVar request
               "PUT" -> httpResourceUpdate store routesVar request
               _ -> methodNotAllowed
@@ -472,7 +481,7 @@ app store routesVar request respond = do
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "GET" -> do
                 resTyName' <- requireName $ Text.unpack resTyName
-                httpResourceTypeList store routesVar request resTyName'
+                httpResourceTypeList store request resTyName'
               "REFRESH" -> do
                 resTyName' <- requireName $ Text.unpack resTyName
                 httpResourceTypeRefresh store routesVar request resTyName'
@@ -482,7 +491,7 @@ app store routesVar request respond = do
               "GET" -> do
                 resName' <- requireName $ Text.unpack resName
                 resTyName' <- requireName $ Text.unpack resTyName
-                httpResourceLookup store routesVar request resTyName' resName'
+                httpResourceLookup store request resTyName' resName'
               _ -> methodNotAllowed
           [resTyName, resName, part']
             | part' == fromString "metadata" ->
@@ -490,7 +499,7 @@ app store routesVar request respond = do
                   "GET" -> do
                     resName' <- requireName $ Text.unpack resName
                     resTyName' <- requireName $ Text.unpack resTyName
-                    httpResourceMetadataLookup store routesVar request resTyName' resName'
+                    httpResourceMetadataLookup store request resTyName' resName'
                   _ -> methodNotAllowed
             | part' == fromString "property" -> do
                 case ByteString.Char8.unpack $ Wai.requestMethod request of
@@ -506,12 +515,12 @@ app store routesVar request respond = do
                     resName' <- requireName $ Text.unpack resName
                     resTyName' <- requireName $ Text.unpack resTyName
                     propName' <- requireName $ Text.unpack propName
-                    httpResourcePropertyLookup store routesVar request resTyName' resName' propName'
+                    httpResourcePropertyLookup store request resTyName' resName' propName'
                   _ -> methodNotAllowed
           _ ->
             throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       part : parts | part == fromString ".transaction" -> do
-        _user <- authenticate store routesVar request
+        _user <- authenticate store request
         case parts of
           [] ->
             case ByteString.Char8.unpack $ Wai.requestMethod request of
@@ -536,13 +545,13 @@ app store routesVar request respond = do
             throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
       [part]
         | part == fromString ".export" -> do
-            _user <- authenticate store routesVar request
+            _user <- authenticate store request
             case ByteString.Char8.unpack $ Wai.requestMethod request of
-              "GET" -> httpExport store routesVar request
+              "GET" -> httpExport store request
               _ -> methodNotAllowed
       [part]
         | part == fromString ".import" -> do
-            _user <- authenticate store routesVar request
+            _user <- authenticate store request
             case ByteString.Char8.unpack $ Wai.requestMethod request of
               "PUT" -> httpImport store routesVar request
               _ -> methodNotAllowed
@@ -567,10 +576,9 @@ requireName n =
 httpResourceGet ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   HandlerT m Wai.Response
-httpResourceGet store routesVar request = do
+httpResourceGet store request = do
   let headers = Wai.requestHeaders request
 
   resTyName <-
@@ -581,10 +589,10 @@ httpResourceGet store routesVar request = do
     requireName
       <=< fmap ByteString.Char8.unpack . requireHeader headers
       $ fromString "X-Blog-ResourceName"
-  mXactId <- optionalTransactionIdHeader headers
+  mXactId <- optionalTransactionIdHeader store headers
 
-  mBody <- handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
-    resTy <- Store.getResourceType store xactId resTyName
+  mBody <- handleExceptT lift $ do
+    resTy <- Store.getResourceType store mXactId resTyName
     Store.readResource resTy resName
   case mBody of
     Just body ->
@@ -708,11 +716,11 @@ httpLogin store routesVar request = do
                 []
                 (fromString $ "error: server has no '" ++ resTyName ++ "' resource type")
 
-        mUserTy <- Store.lookupResourceType store xactId (unsafeName "user")
+        mUserTy <- Store.lookupResourceType store (Just xactId) (unsafeName "user")
         case mUserTy of
           Nothing -> missingResource "user"
           Just userTy -> do
-            mSessionTy <- Store.lookupResourceType store xactId (unsafeName "session")
+            mSessionTy <- Store.lookupResourceType store (Just xactId) (unsafeName "session")
             case mSessionTy of
               Nothing -> missingResource "session"
               Just sessionTy -> do
@@ -780,7 +788,7 @@ httpLogout ::
 httpLogout store routesVar request = do
   for_ (ID.fromString . ByteString.Char8.unpack =<< lookupSessionCookie request) $ \sessionId ->
     handleExceptT lift . withTransaction store routesVar Nothing $ \xactId _defer -> do
-      mSessionTy <- Store.lookupResourceType store xactId (unsafeName "session")
+      mSessionTy <- Store.lookupResourceType store (Just xactId) (unsafeName "session")
       for_ mSessionTy $ \sessionTy -> do
         let sessionName = unsafeName $ ID.toString sessionId
         exists <- Store.doesResourceExist sessionTy sessionName
@@ -806,10 +814,10 @@ httpResourceCreate store routesVar request = do
       <=< fmap ByteString.Char8.unpack . requireHeader headers
       $ fromString "X-Blog-ResourceName"
   let resId = ResourceId resTyName resName
-  mXactId <- optionalTransactionIdHeader headers
+  mXactId <- optionalTransactionIdHeader store headers
 
   handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
-    resTy <- Store.getResourceType store xactId resTyName
+    resTy <- Store.getResourceType store (Just xactId) resTyName
     exists <- Store.doesResourceExist resTy resName
     if exists
       then
@@ -858,7 +866,7 @@ httpResourceUpdate store routesVar request = do
       <=< fmap ByteString.Char8.unpack
       $ requireHeader headers "X-Blog-ResourceName"
   let resId = ResourceId resTyName resName
-  mXactId <- optionalTransactionIdHeader headers
+  mXactId <- optionalTransactionIdHeader store headers
 
   mLocalModificationTime <- do
     let mValue = ByteString.Char8.unpack <$> lookup (fromString "If-Unmodified-Since") headers
@@ -875,7 +883,7 @@ httpResourceUpdate store routesVar request = do
           Just x -> pure $ Just (x :: UTCTime)
 
   handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
-    resTy <- Store.getResourceType store xactId resTyName
+    resTy <- Store.getResourceType store (Just xactId) resTyName
     mServerModificationTime <- Store.readResourceModificationTime resTy resName
     case mServerModificationTime of
       Just serverModificationTime -> do
@@ -923,16 +931,14 @@ httpResourceUpdate store routesVar request = do
 httpResourceTypeList ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   Name ->
   HandlerT m Wai.Response
-httpResourceTypeList store routesVar request resTyName = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+httpResourceTypeList store request resTyName = do
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
-  let store' = Store.hoistStore lift store
-  mItems <- handleExceptT lift . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
-    resTy <- MaybeT $ Store.lookupResourceType store xactId resTyName
+  mItems <- handleExceptT lift . runMaybeT $ do
+    resTy <- MaybeT $ Store.lookupResourceType store mXactId resTyName
     lift $ Store.listResource resTy
 
   case mItems of
@@ -953,10 +959,10 @@ httpResourceTypeRefresh ::
   Name ->
   HandlerT m Wai.Response
 httpResourceTypeRefresh store routesVar request resTyName = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
   handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
-    mResTy <- Store.lookupResourceType store xactId resTyName
+    mResTy <- Store.lookupResourceType store (Just xactId) resTyName
     case mResTy of
       Nothing ->
         pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
@@ -1004,12 +1010,12 @@ httpTransactionCommit ::
   Store (ExceptT DiagnosticReports m) -> Routes -> Wai.Request -> HandlerT m Wai.Response
 httpTransactionCommit store routesVar request = do
   let headers = Wai.requestHeaders request
-  xactId <- do
-    value <- fmap ByteString.Char8.unpack . requireHeader headers $ fromString "X-Blog-TransactionId"
-    parseTransactionId value
+  xactId <-
+    requireTransactionId store
+      =<< requireHeader headers (fromString "X-Blog-TransactionId")
   handleExceptT lift $ do
     transaction <-
-      maybe (throwError $ DiagnosticSimple "transaction not found") pure
+      maybe (error $ "transaction not found: " ++ show xactId) pure
         =<< Store.lookupTransaction store xactId
     let
       commit = do
@@ -1035,11 +1041,9 @@ httpTransactionRollback ::
   MonadIO m => Store (ExceptT DiagnosticReports m) -> Routes -> Wai.Request -> HandlerT m Wai.Response
 httpTransactionRollback store routesVar request = do
   let headers = Wai.requestHeaders request
-  xactId <- do
-    value <-
-      fmap ByteString.Char8.unpack . requireHeader headers $
-        fromString "X-Blog-TransactionId"
-    parseTransactionId value
+  xactId <-
+    requireTransactionId store
+      =<< requireHeader headers (fromString "X-Blog-TransactionId")
   handleExceptT lift $ Store.rollbackTransaction store xactId
   liftIO $ rollbackRoutes routesVar xactId
   pure $ Wai.responseLBS ok200 [] (fromString $ "rolled back " ++ Store.renderTransactionId xactId)
@@ -1047,14 +1051,13 @@ httpTransactionRollback store routesVar request = do
 httpExport ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   HandlerT m Wai.Response
-httpExport store routesVar request = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+httpExport store request = do
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
   content <-
-    handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
-      content <- Store.export store xactId
+    handleExceptT lift $ do
+      content <- Store.export store mXactId
 
       -- If I don't force `content` here then I get a "thread
       -- blocked indefinitely on MVar" error when
@@ -1085,7 +1088,7 @@ httpImport ::
   Wai.Request ->
   HandlerT m Wai.Response
 httpImport store routesVar request = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
   handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
     imported <- Store.import_ store xactId =<< liftIO (Wai.consumeRequestBodyLazy request)
     if defer
@@ -1117,19 +1120,17 @@ httpImport store routesVar request = do
 httpResourceLookup ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   -- | Resource type name
   Name ->
   -- | Resource name
   Name ->
   HandlerT m Wai.Response
-httpResourceLookup store routesVar request resTyName resName = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+httpResourceLookup store request resTyName resName = do
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
-  let store' = Store.hoistStore lift store
-  mBody <- handleExceptT lift . runMaybeT . withTransaction store' routesVar mXactId $ \xactId _defer -> do
-    resTy <- MaybeT $ Store.lookupResourceType store xactId resTyName
+  mBody <- handleExceptT lift . runMaybeT $ do
+    resTy <- MaybeT $ Store.lookupResourceType store mXactId resTyName
     MaybeT $ Store.readResource resTy resName
 
   case mBody of
@@ -1139,18 +1140,17 @@ httpResourceLookup store routesVar request resTyName resName = do
 httpResourceMetadataLookup ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   -- | Resource type name
   Name ->
   -- | Resource name
   Name ->
   HandlerT m Wai.Response
-httpResourceMetadataLookup store routesVar request resTyName resName = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+httpResourceMetadataLookup store request resTyName resName = do
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
-  mBody <- handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
-    resTy <- Store.getResourceType store xactId resTyName
+  mBody <- handleExceptT lift $ do
+    resTy <- Store.getResourceType store mXactId resTyName
     Store.readProperty resTy resName (unsafeName "metadata")
 
   case mBody of
@@ -1168,7 +1168,7 @@ httpResourcePropertiesUpdate ::
   Name ->
   HandlerT m Wai.Response
 httpResourcePropertiesUpdate store routesVar request resTyName resName = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
   properties <- handleExceptT lift $ do
     body <- liftIO $ Wai.consumeRequestBodyLazy request
@@ -1194,7 +1194,7 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName = do
       pure (name', value)
 
   handleExceptT lift . withTransaction store routesVar mXactId $ \xactId defer -> do
-    resTy <- Store.getResourceType store xactId resTyName
+    resTy <- Store.getResourceType store (Just xactId) resTyName
     let resId = ResourceId resTyName resName
     names <- for properties' $ \(name, value) -> do
       Store.setProperty
@@ -1233,7 +1233,6 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName = do
 httpResourcePropertyLookup ::
   (MonadMask m, MonadIO m) =>
   Store (ExceptT DiagnosticReports m) ->
-  Routes ->
   Wai.Request ->
   -- | Resource type name
   Name ->
@@ -1242,11 +1241,11 @@ httpResourcePropertyLookup ::
   -- | Property name
   Name ->
   HandlerT m Wai.Response
-httpResourcePropertyLookup store routesVar request resTyName resName propName = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+httpResourcePropertyLookup store request resTyName resName propName = do
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
-  mBody <- handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
-    resTy <- Store.getResourceType store xactId resTyName
+  mBody <- handleExceptT lift $ do
+    resTy <- Store.getResourceType store mXactId resTyName
     Store.readProperty resTy resName propName
 
   case mBody of
@@ -1264,15 +1263,15 @@ httpRouteGet ::
   [Text] ->
   HandlerT m Wai.Response
 httpRouteGet store routesVar request path = do
-  mXactId <- optionalTransactionIdHeader $ Wai.requestHeaders request
+  mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
-  handleExceptT lift . withTransaction store routesVar mXactId $ \xactId _defer -> do
+  handleExceptT lift $ do
     routes <- liftIO $ readActiveRoutes routesVar
     case Blog.Route.lookup path routes of
       Nothing ->
         pure $ Wai.responseLBS notFound404 [] (fromString "not found")
       Just resId -> do
-        resTy <- Store.getResourceType store xactId $ resourceType resId
+        resTy <- Store.getResourceType store mXactId $ resourceType resId
         mContent <- Store.readResource resTy $ resourceName resId
         case mContent of
           Nothing ->

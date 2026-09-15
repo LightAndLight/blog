@@ -255,7 +255,7 @@ spec = do
 
               let handleExceptT = either (error . ByteString.Lazy.Char8.unpack . renderDiagnosticReports) pure <=< runExceptT
               handleExceptT . Store.withTransaction store False $ \xactId -> do
-                resourceTy <- Store.getResourceType store xactId (unsafeName "resource")
+                resourceTy <- Store.getResourceType store (Just xactId) (unsafeName "resource")
                 _updated <-
                   Store.writeResource resourceTy (unsafeName "user") . fromString $
                     unlines
@@ -271,7 +271,7 @@ spec = do
                       , "[metadata]"
                       ]
 
-                userTy <- Store.getResourceType store xactId (unsafeName "user")
+                userTy <- Store.getResourceType store (Just xactId) (unsafeName "user")
                 _updated <- Store.writeResource userTy (unsafeName testUsername) testPasswordHash
 
                 pure ()

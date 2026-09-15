@@ -32,6 +32,7 @@ module Blog.Store
   , commitTransaction
   , rollbackTransaction
   , listTransactions
+  , doesTransactionExist
   , lookupTransaction
   , saveDeferred
   , restoreDeferred
@@ -85,6 +86,7 @@ import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMe
 import Blog.Pandoc (markdownReaderOptions)
 import Blog.Store.Overlay
   ( Overlay (..)
+  , OverlayChanges (..)
   , overlayCommit
   , overlayCreateDir
   , overlayDoesDirectoryExist
@@ -140,11 +142,12 @@ import qualified Toml
 
 data Store m
   = Store
-  { lookupResourceTypeImpl :: !(TransactionId -> Name -> m (Maybe (ResourceType m)))
+  { lookupResourceTypeImpl :: !(Maybe TransactionId -> Name -> m (Maybe (ResourceType m)))
   , beginTransactionImpl :: Bool -> m TransactionId
   , commitTransactionImpl :: TransactionId -> m ()
   , rollbackTransactionImpl :: TransactionId -> m ()
   , listTransactionsImpl :: m [TransactionId]
+  , doesTransactionExistImpl :: TransactionId -> m Bool
   , lookupTransactionImpl :: TransactionId -> m (Maybe Transaction)
   , saveDeferredImpl :: TransactionId -> m ()
   , restoreDeferredImpl :: TransactionId -> m ()
@@ -159,13 +162,14 @@ hoistStore f Store{..} =
     , commitTransactionImpl = f . commitTransactionImpl
     , rollbackTransactionImpl = f . rollbackTransactionImpl
     , listTransactionsImpl = f listTransactionsImpl
+    , doesTransactionExistImpl = f . doesTransactionExistImpl
     , lookupTransactionImpl = f . lookupTransactionImpl
     , saveDeferredImpl = f . saveDeferredImpl
     , restoreDeferredImpl = f . restoreDeferredImpl
     }
 
 newtype TransactionId = TransactionId ID
-  deriving (Eq, Ord)
+  deriving (Show, Eq, Ord)
 
 renderTransactionId :: TransactionId -> String
 renderTransactionId (TransactionId xactId) = ID.toString xactId
@@ -227,21 +231,28 @@ fromDirectory storeDir = do
   IO.createDirectoryIfMissing True $ getTransactionDir storeDir
   pure Store{..}
   where
-    getOverlay xactId =
+    getOverlay mXactId =
       Overlay
-        { overlayCreate = getTransactionIdDir storeDir xactId </> changePart Create
-        , overlayUpdate = getTransactionIdDir storeDir xactId </> changePart Update
-        , overlayDelete = getTransactionIdDir storeDir xactId </> changePart Delete
+        { overlayChanges =
+            fmap
+              ( \xactId ->
+                  OverlayChanges
+                    { overlayCreate = getTransactionIdDir storeDir xactId </> changePart Create
+                    , overlayUpdate = getTransactionIdDir storeDir xactId </> changePart Update
+                    , overlayDelete = getTransactionIdDir storeDir xactId </> changePart Delete
+                    }
+              )
+              mXactId
         , overlayBase = storeDir
         }
 
-    lookupResourceTypeImpl :: TransactionId -> Name -> m (Maybe (ResourceType m))
-    lookupResourceTypeImpl xactId resTyName
+    lookupResourceTypeImpl :: Maybe TransactionId -> Name -> m (Maybe (ResourceType m))
+    lookupResourceTypeImpl mXactId resTyName
       | renderName resTyName == "resource" = do
           let config = ResourceConfig (fromString "text/toml") mempty
-          liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
+          liftIO $ Just <$> resourceTypeFromDirectory storeDir mXactId resTyName config
       | otherwise = do
-          let overlay = getOverlay xactId
+          let overlay = getOverlay mXactId
           let resourceConfigPath = "resource" </> nameToPath resTyName
           exists <- liftIO $ overlayDoesFileExist overlay resourceConfigPath
           if exists
@@ -251,7 +262,7 @@ fromDirectory storeDir = do
                   fromMaybe (error $ resourceConfigPath ++ " not found")
                     <$> overlayReadFile overlay resourceConfigPath
               config <- parseResourceConfig resTyName content
-              liftIO $ Just <$> resourceTypeFromDirectory storeDir xactId resTyName config
+              liftIO $ Just <$> resourceTypeFromDirectory storeDir mXactId resTyName config
             else pure Nothing
 
     beginTransactionImpl :: Bool -> m TransactionId
@@ -279,7 +290,7 @@ fromDirectory storeDir = do
       exists <- liftIO $ doesDirectoryExist xactDir
       if exists
         then liftIO $ do
-          overlayCommit $ getOverlay xactId
+          overlayCommit $ getOverlay (Just xactId)
           removeDirectoryRecursive xactDir
         else
           throwError . DiagnosticSimple $ "transaction not found: " ++ renderTransactionId xactId
@@ -300,6 +311,10 @@ fromDirectory storeDir = do
           fmap
             (\entry -> fromMaybe (error $ "invalid transaction ID: " ++ show entry) $ parseTransactionId entry)
             entries
+
+    doesTransactionExistImpl :: TransactionId -> m Bool
+    doesTransactionExistImpl xactId =
+      liftIO . doesDirectoryExist $ getTransactionIdDir storeDir xactId
 
     lookupTransactionImpl :: TransactionId -> m (Maybe Transaction)
     lookupTransactionImpl xactId =
@@ -381,7 +396,11 @@ parseResourceConfig resTyName body = do
 
 lookupResourceType ::
   Store m ->
-  TransactionId ->
+  {-|
+  * @Just xactId@ allows writes to the resources of this type
+  * 'Nothing' treats the resources as read-only
+  -}
+  Maybe TransactionId ->
   -- | Resource type
   Name ->
   m (Maybe (ResourceType m))
@@ -391,7 +410,11 @@ getResourceType ::
   HasCallStack =>
   (MonadError DiagnosticReports m, MonadIO m) =>
   Store m ->
-  TransactionId ->
+  {-|
+  * @Just xactId@ allows writes to the resources of this type
+  * 'Nothing' treats the resources as read-only
+  -}
+  Maybe TransactionId ->
   -- | Resource type
   Name ->
   m (ResourceType m)
@@ -468,6 +491,9 @@ rollbackTransaction = rollbackTransactionImpl
 listTransactions :: Store m -> m [TransactionId]
 listTransactions = listTransactionsImpl
 
+doesTransactionExist :: Store m -> TransactionId -> m Bool
+doesTransactionExist = doesTransactionExistImpl
+
 lookupTransaction :: Store m -> TransactionId -> m (Maybe Transaction)
 lookupTransaction = lookupTransactionImpl
 
@@ -478,9 +504,9 @@ restoreDeferred :: Store m -> TransactionId -> m ()
 restoreDeferred = restoreDeferredImpl
 
 export ::
-  (MonadError DiagnosticReports m, MonadIO m) => Store m -> TransactionId -> m LazyByteString
-export store xactId = do
-  resourceTy <- getResourceType store xactId (unsafeName "resource")
+  (MonadError DiagnosticReports m, MonadIO m) => Store m -> Maybe TransactionId -> m LazyByteString
+export store mXactId = do
+  resourceTy <- getResourceType store mXactId (unsafeName "resource")
   tyIds <- listResource resourceTy
 
   resourceEntries <- for tyIds $ \tyId@(ResourceId resTy resName) -> do
@@ -490,7 +516,7 @@ export store xactId = do
     pure $ Tar.fileEntry (nameToPath resTy </> nameToPath resName) (LazyByteString.fromStrict content)
 
   entries <- for tyIds $ \(ResourceId _resTyName tyName) -> do
-    resTy <- getResourceType store xactId tyName
+    resTy <- getResourceType store mXactId tyName
     resources <- listResource resTy
     fmap concat . for resources $ \resId@(ResourceId resTyName resName) -> do
       content <-
@@ -564,14 +590,14 @@ import_ store xactId archive = do
             [resTyName, resName] -> do
               let resTyName' = pathToName resTyName
               let resName' = pathToName resName
-              resTy <- getResourceType store xactId resTyName'
+              resTy <- getResourceType store (Just xactId) resTyName'
               _changed <- writeResource resTy resName' content
               pure . Just $ ResourceId resTyName' resName'
             [resTyName, part, propName] | (resName, ":properties") <- break (== ':') part -> do
               let resTyName' = pathToName resTyName
               let resName' = pathToName resName
               let propName' = pathToName propName
-              resTy <- getResourceType store xactId resTyName'
+              resTy <- getResourceType store (Just xactId) resTyName'
 
               -- metadata is set on resource creation
               unless (propName == "metadata") $
@@ -591,7 +617,7 @@ import_ store xactId archive = do
             [resTyName, part, "dependencies", subKey] | (resName, ":properties") <- break (== ':') part -> do
               let resTyName' = pathToName resTyName
               let resName' = pathToName resName
-              resTy <- getResourceType store xactId resTyName'
+              resTy <- getResourceType store (Just xactId) resTyName'
               let resId = pathToResourceId subKey
               createDependency resTy resName' resId
               pure Nothing
@@ -657,12 +683,12 @@ resourceTypeFromDirectory ::
   (MonadError DiagnosticReports m, MonadCatch m, MonadIO m) =>
   -- | Store directory
   FilePath ->
-  TransactionId ->
+  Maybe TransactionId ->
   -- | Resource type name
   Name ->
   ResourceConfig ->
   IO (ResourceType m)
-resourceTypeFromDirectory storeDir xactId resTyName config =
+resourceTypeFromDirectory storeDir mXactId resTyName config =
   mfix $ \self ->
     pure
       ResourceType
@@ -675,9 +701,16 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
   where
     getOverlay resTyName' =
       Overlay
-        { overlayCreate = getTransactionIdDir storeDir xactId </> changePart Create </> resTyName'
-        , overlayUpdate = getTransactionIdDir storeDir xactId </> changePart Update </> resTyName'
-        , overlayDelete = getTransactionIdDir storeDir xactId </> changePart Delete </> resTyName'
+        { overlayChanges =
+            fmap
+              ( \xactId ->
+                  OverlayChanges
+                    { overlayCreate = getTransactionIdDir storeDir xactId </> changePart Create </> resTyName'
+                    , overlayUpdate = getTransactionIdDir storeDir xactId </> changePart Update </> resTyName'
+                    , overlayDelete = getTransactionIdDir storeDir xactId </> changePart Delete </> resTyName'
+                    }
+              )
+              mXactId
         , overlayBase = storeDir </> resTyName'
         }
 
@@ -837,7 +870,7 @@ resourceTypeFromDirectory storeDir xactId resTyName config =
           overlay
           (propertiesPart resNameSrc </> "dependencies" </> resourceIdToPath dependencyTarget)
 
-      let tgtOverlay = getOverlay (nameToPath resTyNameTgt)
+      let tgtOverlay = getOverlay $ nameToPath resTyNameTgt
       liftIO $
         overlayRemoveFile
           tgtOverlay
@@ -849,7 +882,9 @@ doesResourceExist = doesResourceExistImpl
 readResource :: ResourceType m -> Name -> m (Maybe ByteString)
 readResource = readResourceImpl
 
+-- | Precondition: the resource is writeable (see 'lookupResourceType')
 writeResource ::
+  HasCallStack =>
   ResourceType m ->
   Name ->
   LazyByteString ->
@@ -857,13 +892,15 @@ writeResource ::
   m Bool
 writeResource = writeResourceImpl
 
-removeResource :: ResourceType m -> Name -> m ()
+-- | Precondition: the resource is writeable (see 'lookupResourceType')
+removeResource :: HasCallStack => ResourceType m -> Name -> m ()
 removeResource = removeResourceImpl
 
 readProperty :: ResourceType m -> Name -> Name -> m (Maybe ByteString)
 readProperty = readPropertyImpl
 
-setProperty :: ResourceType m -> Name -> Name -> MetadataValue -> m ()
+-- | Precondition: the resource is writeable (see 'lookupResourceType')
+setProperty :: HasCallStack => ResourceType m -> Name -> Name -> MetadataValue -> m ()
 setProperty = setPropertyImpl
 
 listProperties :: ResourceType m -> Name -> m [Name]
@@ -881,7 +918,9 @@ listDependencies = listDependenciesImpl
 listDependents :: ResourceType m -> Name -> m [ResourceId]
 listDependents = listDependentsImpl
 
+-- | Precondition: the resource is writeable (see 'lookupResourceType')
 createDependency ::
+  HasCallStack =>
   ResourceType m ->
   -- | Source name
   Name ->
@@ -890,7 +929,9 @@ createDependency ::
   m ()
 createDependency = createDependencyImpl
 
-removeDependency :: ResourceType m -> Name -> ResourceId -> m ()
+-- | Precondition: the resource is writeable (see 'lookupResourceType')
+removeDependency ::
+  HasCallStack => ResourceType m -> Name -> ResourceId -> m ()
 removeDependency = removeDependencyImpl
 
 parsePropertyValue :: ByteString -> Either Toml.ParseError Toml.TomlValue

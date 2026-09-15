@@ -1,5 +1,6 @@
 module Blog.Store.Overlay
   ( Overlay (..)
+  , OverlayChanges (..)
   , overlayReadFile
   , overlayDoesFileExist
   , overlayGetModificationTime
@@ -30,7 +31,17 @@ import System.FilePath (splitDirectories, takeDirectory, (</>))
 data Overlay
   = Overlay
   { overlayBase :: !FilePath
-  , overlayCreate :: !FilePath
+  , overlayChanges :: !(Maybe OverlayChanges)
+  {- ^ 'Nothing' means the overlay is read-only.
+
+  Mutation operations will fail with an error.
+  -}
+  }
+  deriving (Show)
+
+data OverlayChanges
+  = OverlayChanges
+  { overlayCreate :: !FilePath
   , overlayUpdate :: !FilePath
   , overlayDelete :: !FilePath
   }
@@ -51,23 +62,29 @@ orElseM (mma : mmas) = do
     Nothing -> orElseM mmas
 
 overlayDeleted :: Overlay -> FilePath -> IO Bool
-overlayDeleted overlay path = do
-  let prefixes = fmap (foldr1 (</>)) . drop 1 . inits $ splitDirectories path
-  orIO $
-    doesFileExist (overlayDelete overlay </> path)
-      : fmap
-        ( \prefix -> do
-            let prefix' = overlayDelete overlay </> prefix
-            isDir <- doesDirectoryExist prefix'
-            if isDir
-              then null <$> IO.listDirectory prefix'
-              else pure False
-        )
-        prefixes
+overlayDeleted overlay path =
+  case overlayChanges overlay of
+    Nothing -> pure False
+    Just changes -> do
+      let prefixes = fmap (foldr1 (</>)) . drop 1 . inits $ splitDirectories path
+      orIO $
+        doesFileExist (overlayDelete changes </> path)
+          : fmap
+            ( \prefix -> do
+                let prefix' = overlayDelete changes </> prefix
+                isDir <- doesDirectoryExist prefix'
+                if isDir
+                  then null <$> IO.listDirectory prefix'
+                  else pure False
+            )
+            prefixes
+
+ifChanges :: Overlay -> a -> (OverlayChanges -> a) -> a
+ifChanges overlay def f = maybe def f (overlayChanges overlay)
 
 overlayResolve :: Overlay -> FilePath -> IO (Maybe FilePath)
 overlayResolve overlay path = do
-  created <- tryPath $ overlayCreate overlay </> path
+  created <- ifChanges overlay (pure Nothing) $ \changes -> tryPath $ overlayCreate changes </> path
   case created of
     Just resolved -> pure $ Just resolved
     Nothing -> do
@@ -76,7 +93,7 @@ overlayResolve overlay path = do
         then pure Nothing
         else
           orElseM
-            [ tryPath $ overlayUpdate overlay </> path
+            [ ifChanges overlay (pure Nothing) $ \changes -> tryPath $ overlayUpdate changes </> path
             , tryPath $ overlayBase overlay </> path
             ]
   where
@@ -91,11 +108,11 @@ overlayListDir overlay mPath = do
   removed <- maybe (pure False) (overlayDeleted overlay) mPath
   if removed
     then do
-      fmap (fromMaybe []) . list $ appendPath (overlayCreate overlay)
+      ifChanges overlay (pure []) $ \changes -> fmap (fromMaybe []) . list $ appendPath (overlayCreate changes)
     else do
-      created <- fmap (fromMaybe []) . list $ appendPath (overlayCreate overlay)
+      created <- ifChanges overlay (pure []) $ \changes -> fmap (fromMaybe []) . list $ appendPath (overlayCreate changes)
       existing <- fmap (fromMaybe []) . list $ appendPath (overlayBase overlay)
-      deleted <- fmap (fromMaybe []) . listRecursive $ appendPath (overlayDelete overlay)
+      deleted <- ifChanges overlay (pure []) $ \changes -> fmap (fromMaybe []) . listRecursive $ appendPath (overlayDelete changes)
       pure $
         created
           `union` filter
@@ -116,7 +133,7 @@ overlayListDir overlay mPath = do
 
 overlayDoesDirectoryExist :: Overlay -> FilePath -> IO Bool
 overlayDoesDirectoryExist overlay path = do
-  created <- doesDirectoryExist $ overlayCreate overlay </> path
+  created <- ifChanges overlay (pure False) $ \changes -> doesDirectoryExist $ overlayCreate changes </> path
   if created
     then pure True
     else do
@@ -184,126 +201,147 @@ overlayReadFile overlay path = do
     Nothing -> pure Nothing
     Just path' -> Just <$> ByteString.readFile path'
 
+-- | Precondition: overlay is writeable
 overlayWriteFile ::
   HasCallStack =>
   Overlay ->
   FilePath ->
   LazyByteString ->
   IO ()
-overlayWriteFile overlay path content = do
-  removed <- doesFileExist $ overlayDelete overlay </> path
-  path' <-
-    if removed
-      then pure $ overlayCreate overlay </> path
-      else do
-        do
-          dirExists <-
-            orIO
-              [ doesDirectoryExist $ overlayCreate overlay </> takeDirectory path
-              , doesDirectoryExist $ overlayBase overlay </> takeDirectory path
-              ]
-          unless dirExists $
-            error $
-              "directory of " ++ path ++ " does not exist"
-        created <- doesFileExist $ overlayCreate overlay </> path
-        if created
-          then pure $ overlayCreate overlay </> path
+overlayWriteFile overlay path content =
+  case overlayChanges overlay of
+    Nothing ->
+      error "overlay is read-only"
+    Just changes -> do
+      removed <- doesFileExist $ overlayDelete changes </> path
+      path' <-
+        if removed
+          then pure $ overlayCreate changes </> path
           else do
-            updated <- doesFileExist $ overlayUpdate overlay </> path
-            if updated
-              then pure $ overlayUpdate overlay </> path
+            do
+              dirExists <-
+                orIO
+                  [ doesDirectoryExist $ overlayCreate changes </> takeDirectory path
+                  , doesDirectoryExist $ overlayBase overlay </> takeDirectory path
+                  ]
+              unless dirExists $
+                error $
+                  "directory of " ++ path ++ " does not exist"
+            created <- doesFileExist $ overlayCreate changes </> path
+            if created
+              then pure $ overlayCreate changes </> path
               else do
-                exists <- doesFileExist $ overlayBase overlay </> path
-                if exists
-                  then pure $ overlayUpdate overlay </> path
-                  else pure $ overlayCreate overlay </> path
-  IO.createDirectoryIfMissing True $ takeDirectory path'
-  IO.writeFile path' content
+                updated <- doesFileExist $ overlayUpdate changes </> path
+                if updated
+                  then pure $ overlayUpdate changes </> path
+                  else do
+                    exists <- doesFileExist $ overlayBase overlay </> path
+                    if exists
+                      then pure $ overlayUpdate changes </> path
+                      else pure $ overlayCreate changes </> path
+      IO.createDirectoryIfMissing True $ takeDirectory path'
+      IO.writeFile path' content
 
+-- | Precondition: overlay is writeable
 overlayCreateDir :: HasCallStack => Overlay -> FilePath -> IO ()
-overlayCreateDir overlay path = do
-  missing <- isNothing <$> overlayResolve overlay path
-  when missing $ do
-    let path' = overlayCreate overlay </> path
-    IO.createDirectoryIfMissing True $ takeDirectory path'
-    IO.createDirectory path'
+overlayCreateDir overlay path =
+  case overlayChanges overlay of
+    Nothing ->
+      error "overlay is read-only"
+    Just changes -> do
+      missing <- isNothing <$> overlayResolve overlay path
+      when missing $ do
+        let path' = overlayCreate changes </> path
+        IO.createDirectoryIfMissing True $ takeDirectory path'
+        IO.createDirectory path'
 
+-- | Precondition: overlay is writeable
 overlayRemoveDir :: HasCallStack => Overlay -> FilePath -> IO ()
-overlayRemoveDir overlay path = do
-  missing <- isNothing <$> overlayResolve overlay path
-  unless missing $ do
-    doRemove $ overlayCreate overlay
-    doRemove $ overlayUpdate overlay
+overlayRemoveDir overlay path =
+  case overlayChanges overlay of
+    Nothing ->
+      error "overlay is read-only"
+    Just changes -> do
+      missing <- isNothing <$> overlayResolve overlay path
+      unless missing $ do
+        doRemove $ overlayCreate changes
+        doRemove $ overlayUpdate changes
 
-    inBase <- doesDirectoryExist $ overlayBase overlay </> path
-    when inBase $ do
-      let path' = overlayDelete overlay </> path
-      exists <- doesDirectoryExist path'
-      if exists
-        then clearDirectory path'
-        else do
-          IO.createDirectoryIfMissing True $ takeDirectory path'
-          IO.createDirectory path'
+        inBase <- doesDirectoryExist $ overlayBase overlay </> path
+        when inBase $ do
+          let path' = overlayDelete changes </> path
+          exists <- doesDirectoryExist path'
+          if exists
+            then clearDirectory path'
+            else do
+              IO.createDirectoryIfMissing True $ takeDirectory path'
+              IO.createDirectory path'
   where
     doRemove dir = do
       exists <- doesDirectoryExist $ dir </> path
       when exists . IO.removeDirectoryRecursive $ dir </> path
 
+-- | Precondition: overlay is writeable
 overlayRemoveFile ::
   HasCallStack =>
   Overlay ->
   FilePath ->
   IO ()
-overlayRemoveFile overlay path = do
-  missing <- isNothing <$> overlayResolve overlay path
-  unless missing $ do
-    doRemove $ overlayCreate overlay
-    doRemove $ overlayUpdate overlay
+overlayRemoveFile overlay path =
+  case overlayChanges overlay of
+    Nothing ->
+      error "overlay is read-only"
+    Just changes -> do
+      missing <- isNothing <$> overlayResolve overlay path
+      unless missing $ do
+        doRemove $ overlayCreate changes
+        doRemove $ overlayUpdate changes
 
-    inBase <- doesFileExist $ overlayBase overlay </> path
-    when inBase $ do
-      IO.createDirectoryIfMissing True $ overlayDelete overlay </> takeDirectory path
-      IO.writeFile (overlayDelete overlay </> path) mempty
+        inBase <- doesFileExist $ overlayBase overlay </> path
+        when inBase $ do
+          IO.createDirectoryIfMissing True $ overlayDelete changes </> takeDirectory path
+          IO.writeFile (overlayDelete changes </> path) mempty
   where
     doRemove dir = do
       exists <- doesFileExist $ dir </> path
       when exists . IO.removeFile $ dir </> path
 
 overlayCommit :: Overlay -> IO ()
-overlayCommit overlay = do
-  deleted <- fromMaybe [] <$> listRecursive (overlayDelete overlay)
-  for_ deleted $ \path -> do
-    isDir <- doesDirectoryExist $ overlayDelete overlay </> path
-    if isDir
-      then do
-        IO.removeDirectoryRecursive $ overlayBase overlay </> path
-        IO.removeDirectory $ overlayDelete overlay </> path
-      else do
-        IO.removeFile $ overlayBase overlay </> path
-        IO.removeFile $ overlayDelete overlay </> path
+overlayCommit overlay =
+  for_ (overlayChanges overlay) $ \changes -> do
+    deleted <- fromMaybe [] <$> listRecursive (overlayDelete changes)
+    for_ deleted $ \path -> do
+      isDir <- doesDirectoryExist $ overlayDelete changes </> path
+      if isDir
+        then do
+          IO.removeDirectoryRecursive $ overlayBase overlay </> path
+          IO.removeDirectory $ overlayDelete changes </> path
+        else do
+          IO.removeFile $ overlayBase overlay </> path
+          IO.removeFile $ overlayDelete changes </> path
 
-  clearDirectory $ overlayDelete overlay
-  created <- fromMaybe [] <$> listRecursive (overlayCreate overlay)
-  for_ created $ \path -> do
-    let source = overlayCreate overlay </> path
-    let target = overlayBase overlay </> path
-    IO.createDirectoryIfMissing True $ takeDirectory target
-    isDir <- doesDirectoryExist source
-    if isDir
-      then IO.createDirectoryIfMissing False target
-      else IO.renamePath source target
-  clearDirectory $ overlayCreate overlay
+    clearDirectory $ overlayDelete changes
+    created <- fromMaybe [] <$> listRecursive (overlayCreate changes)
+    for_ created $ \path -> do
+      let source = overlayCreate changes </> path
+      let target = overlayBase overlay </> path
+      IO.createDirectoryIfMissing True $ takeDirectory target
+      isDir <- doesDirectoryExist source
+      if isDir
+        then IO.createDirectoryIfMissing False target
+        else IO.renamePath source target
+    clearDirectory $ overlayCreate changes
 
-  updated <- fromMaybe [] <$> listRecursive (overlayUpdate overlay)
-  for_ updated $ \path -> do
-    let source = overlayUpdate overlay </> path
-    let target = overlayBase overlay </> path
-    IO.createDirectoryIfMissing True $ takeDirectory target
-    isDir <- doesDirectoryExist source
-    if isDir
-      then IO.createDirectoryIfMissing False target
-      else IO.renamePath source target
-  clearDirectory $ overlayUpdate overlay
+    updated <- fromMaybe [] <$> listRecursive (overlayUpdate changes)
+    for_ updated $ \path -> do
+      let source = overlayUpdate changes </> path
+      let target = overlayBase overlay </> path
+      IO.createDirectoryIfMissing True $ takeDirectory target
+      isDir <- doesDirectoryExist source
+      if isDir
+        then IO.createDirectoryIfMissing False target
+        else IO.renamePath source target
+    clearDirectory $ overlayUpdate changes
 
 clearDirectory :: FilePath -> IO ()
 clearDirectory path = do

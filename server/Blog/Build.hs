@@ -191,11 +191,11 @@ setDependencies a bs = do
   store <- askStore
   transactionId <- askTransactionId
 
-  resTyA <- Store.getResourceType store transactionId $ resourceType a
+  resTyA <- Store.getResourceType store (Just transactionId) $ resourceType a
 
   for_ bs $ \b -> do
     let ResourceId resTyName resName = b
-    resTyB <- Store.getResourceType store transactionId resTyName
+    resTyB <- Store.getResourceType store (Just transactionId) resTyName
     exists <- Store.doesResourceExist resTyB resName
     unless exists . throwError . DiagnosticSimple $
       "dependency " ++ renderResourceId b ++ " does not exist"
@@ -215,7 +215,7 @@ putResource resId@(ResourceId resTyName resName) content = do
 
   reasons <- ActionT $ asks aeReasons
 
-  resTy <- Store.getResourceType store transactionId resTyName
+  resTy <- Store.getResourceType store (Just transactionId) resTyName
   existed <- Store.doesResourceExist resTy resName
   changed <- Store.writeResource resTy resName content
   when changed $ do
@@ -230,7 +230,7 @@ setProperty resId@(ResourceId resTyName resName) key value = do
 
   reasons <- ActionT $ asks aeReasons
 
-  resTy <- Store.getResourceType store transactionId resTyName
+  resTy <- Store.getResourceType store (Just transactionId) resTyName
   exists <- Store.doesResourceExist resTy resName
   if exists
     then do
@@ -399,7 +399,7 @@ queryInputs i = go i
       store <- askStore
       transactionId <- askTransactionId
 
-      mResTy <- Store.lookupResourceType store transactionId resTyName
+      mResTy <- Store.lookupResourceType store (Just transactionId) resTyName
       case mResTy of
         Nothing ->
           -- TODO: not sure if this is the best way to handle missing resource types,
@@ -834,7 +834,7 @@ evalRules ::
 evalRules fTrace store transactionId (Rules rs) resIds = do
   execWriterT . flip evalStateT (Set.fromList resIds) $ do
     dependents <- lift . lift . for resIds $ \resId -> do
-      resTy <- Store.getResourceType store transactionId $ resourceType resId
+      resTy <- Store.getResourceType store (Just transactionId) $ resourceType resId
       Store.listDependents resTy $ resourceName resId
     modify $ (foldMap Set.fromList dependents <>)
     go
@@ -866,7 +866,7 @@ evalRules fTrace store transactionId (Rules rs) resIds = do
         lift . lift $
           traverse
             ( \changed -> do
-                resTy <- Store.getResourceType store transactionId $ resourceType changed
+                resTy <- Store.getResourceType store (Just transactionId) $ resourceType changed
                 Store.listDependents resTy $ resourceName changed
             )
             changedResources'
