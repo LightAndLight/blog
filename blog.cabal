@@ -133,7 +133,6 @@ executable blog-server
         filepath,
         http-api-data,
         http-types,
-        mmorph,
         mtl >=2.3.2,
         optparse-applicative,
         pandoc,
