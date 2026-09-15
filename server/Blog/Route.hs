@@ -11,7 +11,7 @@ module Blog.Route
   , unionWith
   , RouteEntry (..)
   , routeEntryParser
-  , pathParser
+  , parsePath
   , renderRouteEntry
   )
 where
@@ -19,6 +19,7 @@ where
 import Blog (ResourceId, renderResourceId, resourceIdParser)
 import Control.Applicative (some, (<|>))
 import Control.Monad (guard)
+import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.Char as Char
 import Data.Map (Map)
@@ -104,6 +105,9 @@ routeEntryParser =
   where
     spaces =
       Sage.skipSome (Sage.satisfy Char.isSpace)
+
+parsePath :: ByteString -> Either Sage.ParseError [Text]
+parsePath = Sage.parse (pathParser <* Sage.eof)
 
 pathParser :: Sage.Parser [Text]
 pathParser =

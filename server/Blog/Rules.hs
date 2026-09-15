@@ -1823,12 +1823,17 @@ resourceRoute iContent oRoute = do
   let resName = resourceName resId
   mUrl <- Store.lookupProperty resTy resName (unsafeName "url")
   for_ mUrl $ \url -> do
-    -- GRIPE: should we really have to parse out `path`, only to immediately print it via `renderRouteEntry`?
+    {-
+    At first glance it seemed wasteful to parse the `url` property only to
+    immediately render it again. One advantage, though, is that it validates
+    the `url` property here instead of letting an invalid URL through into
+    the `route` resource.
+    -}
     path <-
       case url of
         VString s -> do
           let input = Text.Encoding.encodeUtf8 s
-          case Sage.parse (Routes.pathParser <* Sage.eof) input of
+          case Routes.parsePath input of
             Right path ->
               pure path
             Left err ->
