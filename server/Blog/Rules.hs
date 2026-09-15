@@ -487,6 +487,13 @@ data TypeProviderError
   | ResourceTypeNotFound ![Part] !Text
   | ResourceNotFound ![Part] !Text
   | PropertyNotFound ![Part] !Text
+  | {- TODO: this would be better if it reported a proper type mismatch, carrying
+    the expected and actual types. That would require inferring the property
+    value's type via `inferMetadataValueType`. There is currently too much ceremony
+    involved with that, so I'm leaving it out. To fix this we'd need a simple way
+    to run `Temple.InferT` in that context.
+    -}
+    PropertyNotAString ![Part] !Text
   | TypeError ![Part] (Temple.TypeError ())
 
 typeProviderErrorDiagnostic ::
@@ -547,6 +554,14 @@ typeProviderErrorDiagnostic renderTemplateRef getTemplateRef location err =
           ++ ": missing property '"
           ++ Text.unpack field
           ++ "'"
+    PropertyNotAString path field ->
+      pure . DiagnosticSimple $
+        location
+          ++ ": "
+          ++ renderTypeProviderPath path
+          ++ ": property '"
+          ++ Text.unpack field
+          ++ "' is not a string"
     TypeError path err' ->
       pure . DiagnosticSimple $
         location ++ ": " ++ renderTypeProviderPath path ++ ": " ++ templeTypeErrorMessage err'
@@ -1660,16 +1675,14 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
           , bindingTypeProvider $ \path ty -> do
               let
                 getPublished ix input = do
+                  let path' = path <> pure (PIndex ix) <> pure (PField $ fromString "metadata")
                   let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata input)
                   case mPublished of
                     Nothing ->
-                      throwError $
-                        PropertyNotFound
-                          (path <> pure (PIndex ix) <> pure (PField $ fromString "metadata"))
-                          (fromString "published")
+                      throwError $ PropertyNotFound path' (fromString "published")
                     Just published
                       | VString s <- published -> pure s
-                      | otherwise -> error "TODO: published not a string"
+                      | otherwise -> throwError $ PropertyNotAString path' (fromString "published")
 
               articlesWithExcerptsWithPublished <-
                 for
