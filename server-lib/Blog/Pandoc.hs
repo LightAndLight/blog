@@ -1,6 +1,11 @@
-module Blog.Pandoc (markdownReaderOptions, htmlWriterOptions) where
+{-# LANGUAGE FlexibleContexts #-}
 
+module Blog.Pandoc (markdownReaderOptions, htmlWriterOptions, pandoc) where
+
+import Blog.Diagnostic (DiagnosticReports (..))
+import Control.Monad.Error.Class (MonadError, throwError)
 import Data.String (fromString)
+import qualified Data.Text as Text
 import Text.Pandoc
 import Text.Pandoc.Highlighting (pygments)
 
@@ -30,3 +35,6 @@ htmlWriterOptions =
     , writerExtensions = enableExtension Ext_tex_math_dollars (writerExtensions def)
     , writerHTMLMathMethod = MathML
     }
+
+pandoc :: MonadError DiagnosticReports m => PandocPure a -> m a
+pandoc = either (throwError . DiagnosticSimple . Text.unpack . renderError) pure . runPure

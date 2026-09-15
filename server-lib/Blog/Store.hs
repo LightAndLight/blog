@@ -83,7 +83,7 @@ import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
-import Blog.Pandoc (markdownReaderOptions)
+import Blog.Pandoc (markdownReaderOptions, pandoc)
 import Blog.Store.Overlay
   ( Overlay (..)
   , OverlayChanges (..)
@@ -981,12 +981,14 @@ extractMetadataMarkdown ::
 extractMetadataMarkdown resTyName config resName body = do
   body' <-
     case Text.Lazy.Encoding.decodeUtf8' body of
-      Left err -> error "TODO: " err
+      Left err ->
+        throwError . DiagnosticSimple $
+          "resource "
+            ++ renderResourceId (ResourceId resTyName resName)
+            ++ " is not valid UTF-8: "
+            ++ show err
       Right x -> pure $! LazyText.toStrict x
-  markdown <-
-    case Pandoc.runPure $ Pandoc.readMarkdown markdownReaderOptions body' of
-      Left err -> error "TODO: " err
-      Right x -> pure x
+  markdown <- pandoc $ Pandoc.readMarkdown markdownReaderOptions body'
 
   let
     metadataBlock (CodeBlock (_ident, classes, _kvs) content)

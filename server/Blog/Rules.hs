@@ -32,7 +32,7 @@ import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
 import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport, tomlResult)
 import Blog.Metadata (parseResourceMetadata)
-import Blog.Pandoc (htmlWriterOptions, markdownReaderOptions)
+import Blog.Pandoc (htmlWriterOptions, markdownReaderOptions, pandoc)
 import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
 import Blog.Store (Store)
@@ -72,7 +72,6 @@ import Data.Traversable (for)
 import qualified Data.Tuple as Tuple
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
-import Text.Pandoc (PandocPure)
 import qualified Text.Pandoc as Pandoc
 import Text.Pandoc.Builder (Block)
 import qualified Text.Pandoc.Builder as Pandoc
@@ -1270,9 +1269,6 @@ markdownDependency ::
 markdownDependency input () = do
   (deps, _markdown) <- loadMarkdown input
   Build.setDependencies (Build.resourceInputId input) deps
-
-pandoc :: MonadError DiagnosticReports m => PandocPure a -> m a
-pandoc = either (throwError . DiagnosticSimple . Text.unpack . Pandoc.renderError) pure . Pandoc.runPure
 
 getAdjacency ::
   MonadIO m =>
