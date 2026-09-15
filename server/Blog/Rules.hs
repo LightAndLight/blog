@@ -645,12 +645,24 @@ resourceTypeProvider store xactId path resourceTypesTy = do
       exists <- lift . lift . lift . Store.doesResourceExist resTy $ textToName resName
       unless exists . lift . throwError $ ResourceNotFound path' resName
 
-      lift . lift . tell . Set.singleton $ ResourceId (textToName resTyName) (textToName resName)
+      let resId = ResourceId (textToName resTyName) (textToName resName)
+      lift . lift . tell $ Set.singleton resId
+
+      metadata <- do
+        mContent <-
+          lift . lift . lift $ Store.readProperty resTy (textToName resName) (unsafeName "metadata")
+        content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
+        lift . lift $
+          parseResourceMetadata
+            (Store.resourceTypeConfig resTy)
+            (Store.resourceTypeName resTy)
+            (textToName resName)
+            content
 
       propertiesTypeProvider
         (Store.hoistResourceType lift resTy)
         resName
-        ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+        ( nestedPropertyTypeProvider (fromString "metadata") (metadataPropertyTypeProvider metadata)
             <> contentPropertyTypeProvider
             <> lookupPropertyTypeProvider
         )
@@ -719,22 +731,9 @@ constantPropertyTypeProvider propName (value, valueTy) =
         then pure . Just $ \path propTy -> value <$ unifyPropertyType path propTy valueTy
         else pure Nothing
 
-metadataPropertyTypeProvider :: MonadError DiagnosticReports m => PropertyTypeProvider m
-metadataPropertyTypeProvider =
-  PropertyTypeProvider $ \resTy resName propName -> do
-    -- TODO: this will parse out metadata for every property. It should be parsed only once.
-    metadata <- do
-      mMetadata <- Store.readProperty resTy (textToName resName) (unsafeName "metadata")
-      case mMetadata of
-        Nothing ->
-          pure mempty
-        Just content ->
-          parseResourceMetadata
-            (Store.resourceTypeConfig resTy)
-            (Store.resourceTypeName resTy)
-            (textToName resName)
-            content
-
+metadataPropertyTypeProvider :: Monad m => Map Text MetadataValue -> PropertyTypeProvider m
+metadataPropertyTypeProvider metadata =
+  PropertyTypeProvider $ \resTy _resName propName ->
     case Map.lookup propName . cfgMetadata $ Store.resourceTypeConfig resTy of
       Nothing ->
         pure Nothing
@@ -1264,19 +1263,6 @@ loadMarkdown input = do
 renderHtml :: MonadError DiagnosticReports m => Pandoc -> m Text
 renderHtml = pandoc . Pandoc.writeHtml5String htmlWriterOptions
 
-loadMetadata :: Monad m => Build.ResourceInput m a -> Build.ActionT m (Map Text MetadataValue)
-loadMetadata input = do
-  let resId = Build.resourceInputId input
-  let resTy = Build.resourceInputType input
-  let resName = resourceName resId
-  mContent <- Store.readProperty resTy resName (unsafeName "metadata")
-  content <- maybe (error $ "resource " ++ renderResourceId resId ++ " has no metadata") pure mContent
-  parseResourceMetadata
-    (Store.resourceTypeConfig resTy)
-    (Store.resourceTypeName resTy)
-    resName
-    content
-
 -- TODO: should this be a separate rule? Is there a way to maintain dependencies inside `articleHtml`?
 markdownDependency ::
   forall m.
@@ -1499,6 +1485,8 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   (prev, next) <- getAdjacency iAdjacency
 
+  let metadata = Build.resourceInputMetadata iArticle
+
   output <-
     renderTemplate iTemplate $
       Map.fromList
@@ -1510,7 +1498,7 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
                 (Build.resourceInputType iArticle)
                 (nameToText . resourceName $ Build.resourceInputId iArticle)
                 ( articlePropertyTypeProvider prev next html
-                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                    <> nestedPropertyTypeProvider (fromString "metadata") (metadataPropertyTypeProvider metadata)
                     <> contentPropertyTypeProvider
                     <> lookupPropertyTypeProvider
                 )
@@ -1519,7 +1507,6 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   Build.writeResource oHtml () output
 
-  metadata <- loadMetadata iArticle
   let mUrl = Map.lookup (fromString "url") metadata
   for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
@@ -1539,6 +1526,8 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
 
   (prev, next) <- getAdjacency iAdjacency
 
+  let metadata = Build.resourceInputMetadata iNote
+
   output <-
     renderTemplate iTemplate $
       Map.fromList
@@ -1550,7 +1539,7 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
                 (Build.resourceInputType iNote)
                 (nameToText . resourceName $ Build.resourceInputId iNote)
                 ( articlePropertyTypeProvider prev next html
-                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                    <> nestedPropertyTypeProvider (fromString "metadata") (metadataPropertyTypeProvider metadata)
                     <> contentPropertyTypeProvider
                     <> lookupPropertyTypeProvider
                 )
@@ -1559,7 +1548,6 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
 
   Build.writeResource oHtml () output
 
-  metadata <- loadMetadata iNote
   let mUrl = Map.lookup (fromString "url") metadata
   for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
@@ -1586,6 +1574,8 @@ pageHtml (iTemplate, iPage) oHtml = do
     (_deps, markdown) <- loadMarkdown iPage
     pandoc $ Pandoc.writeHtml5String htmlWriterOptions markdown
 
+  let metadata = Build.resourceInputMetadata iPage
+
   output <-
     renderTemplate iTemplate $
       Map.fromList
@@ -1596,7 +1586,7 @@ pageHtml (iTemplate, iPage) oHtml = do
               propertiesTypeProvider
                 (Build.resourceInputType iPage)
                 (nameToText . resourceName $ Build.resourceInputId iPage)
-                ( nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
+                ( nestedPropertyTypeProvider (fromString "metadata") (metadataPropertyTypeProvider metadata)
                     <> constantPropertyTypeProvider
                       (fromString "content")
                       ( Temple.CString
@@ -1612,7 +1602,6 @@ pageHtml (iTemplate, iPage) oHtml = do
 
   Build.writeResource oHtml () output
 
-  metadata <- loadMetadata iPage
   let mUrl = Map.lookup (fromString "url") metadata
   for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
@@ -1662,7 +1651,6 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                         <> constantPropertyTypeProvider (fromString "chinese") (Temple.CFalse, Temple.TBool)
                         <> constantPropertyTypeProvider (fromString "asciinema") (Temple.CFalse, Temple.TBool)
                     )
-                    <> nestedPropertyTypeProvider (fromString "metadata") metadataPropertyTypeProvider
                     <> contentPropertyTypeProvider
                     <> lookupPropertyTypeProvider
                 )
@@ -1765,7 +1753,8 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
               listTypeProvider
                 ( fmap
                     ( \case
-                        IndexArticle iArticle miExcerpt ->
+                        IndexArticle iArticle miExcerpt -> do
+                          let metadata = Build.resourceInputMetadata iArticle
                           propertiesTypeProvider
                             (Build.resourceInputType iArticle)
                             (nameToText . resourceName $ Build.resourceInputId iArticle)
@@ -1786,9 +1775,10 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                                       ]
                                   , postTypeTy
                                   )
-                                  <> metadataPropertyTypeProvider
+                                  <> metadataPropertyTypeProvider metadata
                             )
-                        IndexNote iNote html ->
+                        IndexNote iNote html -> do
+                          let metadata = Build.resourceInputMetadata iNote
                           propertiesTypeProvider
                             (Build.resourceInputType iNote)
                             (nameToText . resourceName $ Build.resourceInputId iNote)
@@ -1811,7 +1801,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                                       ]
                                   , postTypeTy
                                   )
-                                  <> metadataPropertyTypeProvider
+                                  <> metadataPropertyTypeProvider metadata
                             )
                     )
                     sortedPosts
