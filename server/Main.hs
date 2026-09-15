@@ -1171,19 +1171,19 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName = do
 
   properties <- handleDiagnosticReports $ do
     body <- liftIO $ Wai.consumeRequestBodyLazy request
-    Toml.Toml (Toml.Located _offset properties) nonKeys <-
-      case Toml.parse $ LazyByteString.toStrict body of
-        Left err -> do
-          let resourceId = renderResourceId (ResourceId resTyName resName)
-          throwError
-            . DiagnosticReports
-              (fromString $ "(" ++ resourceId ++ ":properties)")
-              body
-            $ tomlErrorReport err
-        Right x -> pure x
+    let
+      resourceId = renderResourceId (ResourceId resTyName resName)
+      reportTomlError =
+        throwError
+          . DiagnosticReports (fromString $ "(" ++ resourceId ++ ":properties)") body
+          . tomlErrorReport
 
-    unless (null nonKeys) . error $
-      "TODO: non-key-value properties: " ++ show nonKeys
+    Toml.Toml (Toml.Located _offset properties) nonKeys <-
+      either reportTomlError pure . Toml.parse $ LazyByteString.toStrict body
+
+    -- Tables and arrays are currently not accepted as properties
+    unless (null nonKeys) . reportTomlError $
+      Toml.UnexpectedEntries [] (fmap Toml.locatedOffset nonKeys)
 
     pure properties
 
