@@ -900,6 +900,12 @@ create baseUrl manager mSessionId mXactId mSrcFile properties resourceId = do
         409 -> do
           putStrLn $ "error: " ++ renderResourceId resourceId ++ " already exists"
           exitFailure
+        -- TODO: matching on different response statuses is probably not the
+        -- best way to do this. Something like: always print the response body,
+        -- then succeed for 2xx, `exitFailure` for 4xx/5xx, ??? for 3xx.
+        400 -> do
+          ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+          exitFailure
         201 -> do
           ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
         _ ->
@@ -1040,7 +1046,14 @@ update baseUrl manager mSessionId mXactId mSrcFile properties resourceId = do
               ++ resourceIdHeaders resourceId
         httpPut manager (baseUrl ++ "/.resource") headers body
 
-      ByteString.Lazy.Char8.putStrLn =<< expectOk response
+      case statusCode $ Http.responseStatus response of
+        400 -> do
+          ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+          exitFailure
+        200 -> do
+          ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+        _ ->
+          unexpected response
 
     doProperties mXactId' ps = do
       response <- do
@@ -1056,7 +1069,14 @@ update baseUrl manager mSessionId mXactId mSrcFile properties resourceId = do
           headers
           body
 
-      ByteString.Lazy.Char8.putStrLn =<< expectOk response
+      case statusCode $ Http.responseStatus response of
+        400 -> do
+          ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+          exitFailure
+        200 -> do
+          ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+        _ ->
+          unexpected response
 
   case (mSrcFile, properties) of
     (Nothing, []) -> do
