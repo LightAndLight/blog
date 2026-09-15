@@ -1085,17 +1085,18 @@ loadMarkdown ::
 loadMarkdown input = do
   content <-
     case Text.Encoding.decodeUtf8' $ Build.resourceInputContent input of
-      Left err -> error $ "TODO: " ++ show err
+      Left err ->
+        throwError . DiagnosticSimple $
+          "resource "
+            ++ renderResourceId (Build.resourceInputId input)
+            ++ " is not valid UTF-8: "
+            ++ show err
       Right x -> pure x
 
-  let result = Pandoc.runPure $ Pandoc.readMarkdown markdownReaderOptions content
-  case result of
-    Left err ->
-      error $ "TODO: " ++ show err
-    Right document -> do
-      (deps, document') <- fmap Tuple.swap . runWriterT $ resolveResourceReferences document
-      let document'' = tableOfContents . linkHeaders $ removeMetadata document'
-      pure (deps, document'')
+  document <- pandoc $ Pandoc.readMarkdown markdownReaderOptions content
+  (deps, document') <- fmap Tuple.swap . runWriterT $ resolveResourceReferences document
+  let document'' = tableOfContents . linkHeaders $ removeMetadata document'
+  pure (deps, document'')
   where
     resourceUriParser :: Sage.Parser (Temple.Core, Temple.Type)
     resourceUriParser =
