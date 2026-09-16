@@ -50,6 +50,7 @@ import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Foldable (fold, for_)
+import Data.Functor ((<&>))
 import Data.List (find, sortOn)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
@@ -165,6 +166,15 @@ rules =
       )
       (Build.oResource "feed" (Build.oMatch "index"))
       indexFeed
+    <> Build.rule
+      "sitemap"
+      ( (,,)
+          <$> Build.iResource "config" (Build.iMatch "sitemap-url")
+          <*> Build.iResource "template" (Build.iMatch "sitemap.xml.temple")
+          <*> Build.iResourceAll "html" Build.iAny
+      )
+      (Build.oResource "xml" (Build.oMatch "sitemap"))
+      sitemap
     -- TODO: there should be some catch-all logic for routing via the URL property.
     <> Build.rule
       "html-route"
@@ -210,6 +220,11 @@ rules =
       "feed-route"
       (Build.iResource "feed" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "feed-" *< Build.oBind "name"))
+      resourceRoute
+    <> Build.rule
+      "xml-route"
+      (Build.iResource "xml" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "xml-" *< Build.oBind "name"))
       resourceRoute
 
 -- TODO: expose in `temple`?
@@ -778,6 +793,38 @@ metadataPropertyTypeProvider metadata =
 
             pure metadataValue
 
+formatContent :: Maybe MetadataValue -> ByteString -> ByteString
+formatContent mFormat =
+  case mFormat of
+    Just (VString s) | s == fromString "text" -> id
+    Just (VString s) | s == fromString "line" -> \x -> ByteString.Char8.dropWhileEnd (`elem` "\r\n") x
+    _ -> id
+
+getFormattedContent ::
+  Monad m =>
+  Build.ResourceInput m ByteString ->
+  Build.ActionT m ByteString
+getFormattedContent res = do
+  let content = Build.resourceInputContent res
+  mFormat <- Build.resourceInputProperty res (unsafeName "content-format")
+  pure $ formatContent mFormat content
+
+-- TODO: should this be built into `Store.lookupProperty`?
+getFormattedContentProperty ::
+  MonadError DiagnosticReports m =>
+  Store.ResourceType m ->
+  -- | Resource name
+  Name ->
+  m (Maybe ByteString)
+getFormattedContentProperty resTy resName = do
+  mContent <- Store.readResource resTy resName
+  case mContent of
+    Nothing ->
+      pure Nothing
+    Just content -> do
+      mFormat <- Store.lookupProperty resTy resName (unsafeName "content-format")
+      pure . Just $ formatContent mFormat content
+
 contentPropertyTypeProvider :: MonadError DiagnosticReports m => PropertyTypeProvider m
 contentPropertyTypeProvider =
   PropertyTypeProvider
@@ -789,25 +836,12 @@ contentPropertyTypeProvider =
 
               unifyProvidedType path propTy contentTy
 
-              (mFormat, mContent) <-
-                lift . lift $
-                  (,)
-                    <$> Store.lookupProperty resTy (textToName resName) (unsafeName "content-format")
-                    <*> Store.readResource resTy (textToName resName)
-
-              let
-                format :: ByteString -> ByteString
-                format =
-                  case mFormat of
-                    Just (VString s) | s == fromString "text" -> id
-                    Just (VString s) | s == fromString "line" -> \x -> ByteString.Char8.dropWhileEnd (`elem` "\r\n") x
-                    _ -> id
-
+              mContent <- lift . lift $ getFormattedContentProperty resTy (textToName resName)
               case mContent of
                 Nothing ->
                   pure $ Temple.CString mempty
                 Just content ->
-                  pure $ Temple.CString [Temple.CPartText $ format content]
+                  pure $ Temple.CString [Temple.CPartText content]
           else
             pure Nothing
     )
@@ -1853,6 +1887,27 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
 coreString :: Text -> Temple.Core
 coreString = Temple.CString . pure . Temple.CPartText . Text.Encoding.encodeUtf8
 
+requireStringProperty ::
+  Monad m =>
+  Build.ResourceInput m a ->
+  -- | Property name
+  Name ->
+  Build.ActionT m Text
+requireStringProperty res name = do
+  mValue <- Build.resourceInputProperty res name
+  case mValue of
+    Nothing ->
+      throwError . DiagnosticSimple $
+        "("
+          ++ renderResourceId (Build.resourceInputId res)
+          ++ "): missing property '"
+          ++ renderName name
+          ++ "'"
+    Just (VString s) -> pure s
+    Just _value ->
+      throwError . DiagnosticSimple $
+        "(" ++ renderResourceId (Build.resourceInputId res) ++ ":" ++ renderName name ++ "): not a string"
+
 indexFeed ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
@@ -1865,21 +1920,6 @@ indexFeed ::
 indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
   let
     stringBinding value = bindingTypeProvider $ constantTypeProvider (coreString value, Temple.TString)
-
-    requireStringProperty res name = do
-      mValue <- Build.resourceInputProperty res name
-      case mValue of
-        Nothing ->
-          throwError . DiagnosticSimple $
-            "("
-              ++ renderResourceId (Build.resourceInputId res)
-              ++ "): missing property '"
-              ++ renderName name
-              ++ "'"
-        Just (VString s) -> pure s
-        Just _value ->
-          throwError . DiagnosticSimple $
-            "(" ++ renderResourceId (Build.resourceInputId res) ++ ":" ++ renderName name ++ "): not a string"
 
   url <- requireStringProperty iFeedConfig (unsafeName "url")
   title <- requireStringProperty iFeedConfig (unsafeName "title")
@@ -1908,6 +1948,40 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
   Build.writeResource oFeed () output
 
   Build.setResourceProperty oFeed () (unsafeName "url") $ VString url
+
+sitemap ::
+  MonadIO m =>
+  ( Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
+  , Build.ResourceInputs m ByteString
+  ) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+sitemap (iSitemapUrl, iTemplate, iHtmls) oXml = do
+  url <- getFormattedContent iSitemapUrl
+
+  output <-
+    renderTemplate iTemplate $
+      Map.fromList
+        [ (fromString "resource", resourceBindingTypeProvider)
+        ,
+          ( fromString "pages"
+          , bindingTypeProvider . listTypeProvider $
+              Build.resourceInputs iHtmls <&> \iHtml ->
+                let
+                  resTy = Build.resourceInputType iHtml
+                  resName = nameToText . resourceName $ Build.resourceInputId iHtml
+                in
+                  -- TODO: add `<lastmod>` to sitemap URLs by passing the `updated`
+                  -- property. Requires that either every page has an `updated`
+                  -- property, or there's a way to get a reasonable default (getModificationTime?)
+                  propertiesTypeProvider resTy resName lookupPropertyTypeProvider
+          )
+        ]
+
+  Build.writeResource oXml () output
+
+  Build.setResourceProperty oXml () (unsafeName "url") $ VString (Text.Encoding.decodeUtf8 url)
 
 resourceRoute ::
   forall m.
