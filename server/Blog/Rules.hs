@@ -35,11 +35,12 @@ import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Blog.Time (renderUTCTime)
 import Control.Applicative (many, (<|>))
 import Control.Monad (guard, unless, (<=<))
 import Control.Monad.Error.Class (MonadError, throwError, tryError)
 import Control.Monad.Except (ExceptT (..), mapExceptT, runExceptT)
-import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT, tell)
@@ -64,7 +65,7 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
-import Data.Time.Clock (UTCTime (..))
+import Data.Time.Clock (UTCTime (..), getCurrentTime)
 import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
 import qualified Data.Tuple as Tuple
@@ -150,6 +151,20 @@ rules =
       )
       (Build.oResource "html" (Build.oMatch "index"))
       indexHtml
+    <> Build.rule
+      "index-feed"
+      ( (,,,)
+          <$> Build.iResource "feed-config" (Build.iMatch "index")
+          <*> Build.iResource "template" (Build.iMatch "feed.xml.temple")
+          <*> Build.iAll
+            ( (,)
+                <$> Build.iResource "article" (Build.iBind "name")
+                <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+            )
+          <*> Build.iAll (Build.iResource "note" Build.iAny)
+      )
+      (Build.oResource "feed" (Build.oMatch "index"))
+      indexFeed
     -- TODO: there should be some catch-all logic for routing via the URL property.
     <> Build.rule
       "html-route"
@@ -190,6 +205,11 @@ rules =
       "svg-route"
       (Build.iResource "svg" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "svg-" *< Build.oBind "name"))
+      resourceRoute
+    <> Build.rule
+      "feed-route"
+      (Build.iResource "feed" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "feed-" *< Build.oBind "name"))
       resourceRoute
 
 -- TODO: expose in `temple`?
@@ -610,7 +630,7 @@ forRecord path ty f = do
     value <- f (path <> pure (PField name)) name ty'
     pure (name, value)
 
-unifyPropertyType ::
+unifyProvidedType ::
   Monad m =>
   -- | Path to type
   [Part] ->
@@ -619,7 +639,7 @@ unifyPropertyType ::
   -- | Actual
   Temple.Type ->
   Temple.InferT () (ExceptT TypeProviderError m) ()
-unifyPropertyType path a b = do
+unifyProvidedType path a b = do
   result <- tryError $ Temple.unify () a b
   case result of
     Left err -> lift . throwError $ TypeError path err
@@ -668,6 +688,11 @@ resourceTypeProvider store xactId path resourceTypesTy = do
         )
         path''
         propertiesTy
+
+constantTypeProvider :: Monad m => (Temple.Core, Temple.Type) -> TypeProvider m
+constantTypeProvider (value, ty) path expected = do
+  unifyProvidedType path expected ty
+  pure value
 
 propertiesTypeProvider ::
   MonadError DiagnosticReports m =>
@@ -728,7 +753,7 @@ constantPropertyTypeProvider propName (value, valueTy) =
   PropertyTypeProvider $
     \_resTy _resName propName' ->
       if propName' == propName
-        then pure . Just $ \path propTy -> value <$ unifyPropertyType path propTy valueTy
+        then pure . Just $ \path propTy -> value <$ unifyProvidedType path propTy valueTy
         else pure Nothing
 
 metadataPropertyTypeProvider :: Monad m => Map Text MetadataValue -> PropertyTypeProvider m
@@ -749,7 +774,7 @@ metadataPropertyTypeProvider metadata =
                   Optional -> mkOptional ty
               metadataValue = metaToTempleCore . fromJust $ Map.lookup propName metadata
 
-            unifyPropertyType path propTy metadataType
+            unifyProvidedType path propTy metadataType
 
             pure metadataValue
 
@@ -762,7 +787,7 @@ contentPropertyTypeProvider =
             \path propTy -> do
               let contentTy = Temple.TString
 
-              unifyPropertyType path propTy contentTy
+              unifyProvidedType path propTy contentTy
 
               (mFormat, mContent) <-
                 lift . lift $
@@ -833,7 +858,7 @@ lookupPropertyTypeProvider =
 
           pure . Just $ \path propTy -> do
             actualTy <- Temple.instantiateTypeScheme actualTyScheme
-            unifyPropertyType path propTy actualTy
+            unifyProvidedType path propTy actualTy
 
             pure actualValue
 
@@ -843,7 +868,7 @@ listTypeProvider ::
   TypeProvider m
 listTypeProvider items path ty = do
   itemTy <- Temple.metavar Temple.KType
-  unifyPropertyType path ty (Temple.TStream itemTy)
+  unifyProvidedType path ty (Temple.TStream itemTy)
   itemTy' <- Temple.zonkNoDefault itemTy
   items' <- for (zip [0 ..] items) $ \(ix, item) -> do
     item (path <> pure (PIndex ix)) itemTy'
@@ -914,13 +939,13 @@ articlePropertyTypeProvider mPrev mNext content =
         \path propTy -> do
           -- TODO: is there a better way to ensure the type matches the value?
           -- Some kind of simultaneous typed-value builder?
-          unifyPropertyType path propTy $ mkOptional adjacencyValueType
+          unifyProvidedType path propTy $ mkOptional adjacencyValueType
           pure $ optionalAdjacencyValueCore mPrev
       else
         if propName == fromString "next"
           then pure . Just $
             \path propTy -> do
-              unifyPropertyType path propTy $ mkOptional adjacencyValueType
+              unifyProvidedType path propTy $ mkOptional adjacencyValueType
               pure $ optionalAdjacencyValueCore mNext
           else
             if propName == fromString "content"
@@ -929,7 +954,7 @@ articlePropertyTypeProvider mPrev mNext content =
                   let _contentTy = Temple.TString
 
                   -- `content` is always a string.
-                  -- unifyPropertyType path propTy contentTy
+                  -- unifyProvidedType path propTy contentTy
 
                   pure $
                     Temple.CString
@@ -1620,6 +1645,148 @@ data IndexItem m
       -- | Rendered HTML
       Text
 
+postsBindingTypeProvider ::
+  MonadIO m =>
+  [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))] ->
+  [Build.ResourceInput m ByteString] ->
+  BindingTypeProvider (Build.ActionT m)
+postsBindingTypeProvider iArticlesWithExcerpts iNotes =
+  bindingTypeProvider $ \path ty -> do
+    let
+      getPublished ix input = do
+        let path' = path <> pure (PIndex ix) <> pure (PField $ fromString "metadata")
+        let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata input)
+        case mPublished of
+          Nothing ->
+            throwError $ PropertyNotFound path' (fromString "published")
+          Just published
+            | VString s <- published -> pure s
+            | otherwise -> throwError $ PropertyNotAString path' (fromString "published")
+
+    articlesWithExcerptsWithPublished <-
+      for
+        (zip [0 ..] iArticlesWithExcerpts)
+        ( \(ix, (iArticle, miExcerpt)) -> do
+            published <- lift $ getPublished ix iArticle
+            pure (published, IndexArticle iArticle miExcerpt)
+        )
+
+    notesWithPublished <-
+      for
+        (zip [0 ..] iNotes)
+        ( \(ix, iNote) -> do
+            published <- lift $ getPublished ix iNote
+            (_deps, document) <- lift . lift $ loadMarkdown iNote
+            html <- lift . lift $ renderHtml document
+            pure (published, IndexNote iNote html)
+        )
+
+    let sortedPosts = fmap snd . sortOn (Down . fst) $ articlesWithExcerptsWithPublished ++ notesWithPublished
+
+    let
+      postTypeTy =
+        Temple.TSum $
+          foldr
+            (uncurry Temple.TSumConstructor)
+            Temple.TRowEnd
+            [
+              ( fromString "Article"
+              ,
+                [ Temple.TRecord $
+                    foldr
+                      (uncurry Temple.TRecordField)
+                      Temple.TRowEnd
+                      [
+                        ( fromString "excerpt"
+                        , Temple.TString
+                        )
+                      ]
+                ]
+              )
+            ,
+              ( fromString "Note"
+              ,
+                [ Temple.TRecord $
+                    foldr
+                      (uncurry Temple.TRecordField)
+                      Temple.TRowEnd
+                      [
+                        ( fromString "content"
+                        , Temple.TString
+                        )
+                      ,
+                        ( fromString "references"
+                        , Temple.TStream $
+                            Temple.TRecord $
+                              foldr
+                                (uncurry Temple.TRecordField)
+                                Temple.TRowEnd
+                                [ (fromString "url", Temple.TString)
+                                , (fromString "title", Temple.TString)
+                                ]
+                        )
+                      ]
+                ]
+              )
+            ]
+    listTypeProvider
+      ( fmap
+          ( \case
+              IndexArticle iArticle miExcerpt -> do
+                let metadata = Build.resourceInputMetadata iArticle
+                propertiesTypeProvider
+                  (Build.resourceInputType iArticle)
+                  (nameToText . resourceName $ Build.resourceInputId iArticle)
+                  -- TODO: this property should come from metadata.
+                  --
+                  -- Currently blocked on having a good syntax for sum types in metadata.
+                  ( nestedPropertyTypeProvider (fromString "metadata") $
+                      constantPropertyTypeProvider
+                        (fromString "type")
+                        ( Temple.CConstructor
+                            (fromString "Article")
+                            [ Temple.CRecord
+                                [ ( fromString "excerpt"
+                                  , Temple.CString [Temple.CPartText $ Build.resourceInputContent iExcerpt]
+                                  )
+                                | Just iExcerpt <- [miExcerpt]
+                                ]
+                            ]
+                        , postTypeTy
+                        )
+                        <> metadataPropertyTypeProvider metadata
+                  )
+              IndexNote iNote html -> do
+                let metadata = Build.resourceInputMetadata iNote
+                propertiesTypeProvider
+                  (Build.resourceInputType iNote)
+                  (nameToText . resourceName $ Build.resourceInputId iNote)
+                  -- TODO: this property should come from metadata.
+                  --
+                  -- Currently blocked on having a good syntax for sum types in metadata.
+                  ( nestedPropertyTypeProvider (fromString "metadata") $
+                      constantPropertyTypeProvider
+                        (fromString "type")
+                        ( Temple.CConstructor
+                            (fromString "Note")
+                            [ Temple.CRecord
+                                [ (fromString "content", Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 html])
+                                ,
+                                  ( fromString "references"
+                                  , metaToTempleCore . fromJust $
+                                      Map.lookup (fromString "references") (Build.resourceInputMetadata iNote)
+                                  )
+                                ]
+                            ]
+                        , postTypeTy
+                        )
+                        <> metadataPropertyTypeProvider metadata
+                  )
+          )
+          sortedPosts
+      )
+      path
+      ty
 indexHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
@@ -1668,155 +1835,79 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
                 ty <- Temple.instantiateTypeScheme $ Temple.bindingScheme binding
 
                 let actualTy = mkOptional Temple.TString
-                unifyPropertyType path' ty actualTy
+                unifyProvidedType path' ty actualTy
 
                 pure $ Temple.CConstructor (fromString "None") []
               either (throwError . TypeError path') (pure . snd) result
           )
         ,
           ( fromString "posts"
-          , bindingTypeProvider $ \path ty -> do
-              let
-                getPublished ix input = do
-                  let path' = path <> pure (PIndex ix) <> pure (PField $ fromString "metadata")
-                  let mPublished = Map.lookup (fromString "published") (Build.resourceInputMetadata input)
-                  case mPublished of
-                    Nothing ->
-                      throwError $ PropertyNotFound path' (fromString "published")
-                    Just published
-                      | VString s <- published -> pure s
-                      | otherwise -> throwError $ PropertyNotAString path' (fromString "published")
-
-              articlesWithExcerptsWithPublished <-
-                for
-                  (zip [0 ..] iArticlesWithExcerpts)
-                  ( \(ix, (iArticle, miExcerpt)) -> do
-                      published <- lift $ getPublished ix iArticle
-                      pure (published, IndexArticle iArticle miExcerpt)
-                  )
-
-              notesWithPublished <-
-                for
-                  (zip [0 ..] iNotes)
-                  ( \(ix, iNote) -> do
-                      published <- lift $ getPublished ix iNote
-                      (_deps, document) <- lift . lift $ loadMarkdown iNote
-                      html <- lift . lift $ renderHtml document
-                      pure (published, IndexNote iNote html)
-                  )
-
-              let sortedPosts = fmap snd . sortOn (Down . fst) $ articlesWithExcerptsWithPublished ++ notesWithPublished
-
-              let
-                postTypeTy =
-                  Temple.TSum $
-                    foldr
-                      (uncurry Temple.TSumConstructor)
-                      Temple.TRowEnd
-                      [
-                        ( fromString "Article"
-                        ,
-                          [ Temple.TRecord $
-                              foldr
-                                (uncurry Temple.TRecordField)
-                                Temple.TRowEnd
-                                [
-                                  ( fromString "excerpt"
-                                  , Temple.TString
-                                  )
-                                ]
-                          ]
-                        )
-                      ,
-                        ( fromString "Note"
-                        ,
-                          [ Temple.TRecord $
-                              foldr
-                                (uncurry Temple.TRecordField)
-                                Temple.TRowEnd
-                                [
-                                  ( fromString "content"
-                                  , Temple.TString
-                                  )
-                                ,
-                                  ( fromString "references"
-                                  , Temple.TStream $
-                                      Temple.TRecord $
-                                        foldr
-                                          (uncurry Temple.TRecordField)
-                                          Temple.TRowEnd
-                                          [ (fromString "url", Temple.TString)
-                                          , (fromString "title", Temple.TString)
-                                          ]
-                                  )
-                                ]
-                          ]
-                        )
-                      ]
-              listTypeProvider
-                ( fmap
-                    ( \case
-                        IndexArticle iArticle miExcerpt -> do
-                          let metadata = Build.resourceInputMetadata iArticle
-                          propertiesTypeProvider
-                            (Build.resourceInputType iArticle)
-                            (nameToText . resourceName $ Build.resourceInputId iArticle)
-                            -- TODO: this property should come from metadata.
-                            --
-                            -- Currently blocked on having a good syntax for sum types in metadata.
-                            ( nestedPropertyTypeProvider (fromString "metadata") $
-                                constantPropertyTypeProvider
-                                  (fromString "type")
-                                  ( Temple.CConstructor
-                                      (fromString "Article")
-                                      [ Temple.CRecord
-                                          [ ( fromString "excerpt"
-                                            , Temple.CString [Temple.CPartText $ Build.resourceInputContent iExcerpt]
-                                            )
-                                          | Just iExcerpt <- [miExcerpt]
-                                          ]
-                                      ]
-                                  , postTypeTy
-                                  )
-                                  <> metadataPropertyTypeProvider metadata
-                            )
-                        IndexNote iNote html -> do
-                          let metadata = Build.resourceInputMetadata iNote
-                          propertiesTypeProvider
-                            (Build.resourceInputType iNote)
-                            (nameToText . resourceName $ Build.resourceInputId iNote)
-                            -- TODO: this property should come from metadata.
-                            --
-                            -- Currently blocked on having a good syntax for sum types in metadata.
-                            ( nestedPropertyTypeProvider (fromString "metadata") $
-                                constantPropertyTypeProvider
-                                  (fromString "type")
-                                  ( Temple.CConstructor
-                                      (fromString "Note")
-                                      [ Temple.CRecord
-                                          [ (fromString "content", Temple.CString [Temple.CPartText $ Text.Encoding.encodeUtf8 html])
-                                          ,
-                                            ( fromString "references"
-                                            , metaToTempleCore . fromJust $
-                                                Map.lookup (fromString "references") (Build.resourceInputMetadata iNote)
-                                            )
-                                          ]
-                                      ]
-                                  , postTypeTy
-                                  )
-                                  <> metadataPropertyTypeProvider metadata
-                            )
-                    )
-                    sortedPosts
-                )
-                path
-                ty
+          , postsBindingTypeProvider iArticlesWithExcerpts iNotes
           )
         ]
 
   Build.writeResource oHtml () output
 
   Build.setResourceProperty oHtml () (unsafeName "url") $ VString (fromString "/")
+
+coreString :: Text -> Temple.Core
+coreString = Temple.CString . pure . Temple.CPartText . Text.Encoding.encodeUtf8
+
+indexFeed ::
+  MonadIO m =>
+  ( Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
+  , [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))]
+  , [Build.ResourceInput m ByteString]
+  ) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
+  let
+    stringBinding value = bindingTypeProvider $ constantTypeProvider (coreString value, Temple.TString)
+
+    requireStringProperty res name = do
+      mValue <- Build.resourceInputProperty res name
+      case mValue of
+        Nothing ->
+          throwError . DiagnosticSimple $
+            "("
+              ++ renderResourceId (Build.resourceInputId res)
+              ++ "): missing property '"
+              ++ renderName name
+              ++ "'"
+        Just (VString s) -> pure s
+        Just _value ->
+          throwError . DiagnosticSimple $
+            "(" ++ renderResourceId (Build.resourceInputId res) ++ ":" ++ renderName name ++ "): not a string"
+
+  url <- requireStringProperty iFeedConfig (unsafeName "url")
+  title <- requireStringProperty iFeedConfig (unsafeName "title")
+  description <- requireStringProperty iFeedConfig (unsafeName "description")
+  authorName <- requireStringProperty iFeedConfig (unsafeName "authorName")
+  authorEmail <- requireStringProperty iFeedConfig (unsafeName "authorEmail")
+
+  now <- liftIO getCurrentTime
+
+  output <-
+    renderTemplate iTemplate $
+      Map.fromList
+        [ (fromString "resource", resourceBindingTypeProvider)
+        , (fromString "url", stringBinding url)
+        , (fromString "title", stringBinding title)
+        , (fromString "description", stringBinding description)
+        , (fromString "authorName", stringBinding authorName)
+        , (fromString "authorEmail", stringBinding authorEmail)
+        , (fromString "updated", stringBinding . fromString $ renderUTCTime now)
+        ,
+          ( fromString "posts"
+          , postsBindingTypeProvider iArticlesWithExcerpts iNotes
+          )
+        ]
+
+  Build.writeResource oFeed () output
+
+  Build.setResourceProperty oFeed () (unsafeName "url") $ VString url
 
 resourceRoute ::
   forall m.

@@ -29,7 +29,7 @@ module Blog
   )
 where
 
-import Control.Applicative (many, optional, some, (<|>))
+import Control.Applicative (optional, some, (<|>))
 import qualified Data.Char as Char
 import Data.Map (Map)
 import Data.Maybe (fromMaybe, isJust)
@@ -109,8 +109,7 @@ nameParser =
 
 resourceTypeParser :: Sage.Parser Name
 resourceTypeParser =
-  fmap Name $
-    (:) <$> Sage.satisfy Char.isAlpha <*> many (Sage.satisfy Char.isAlphaNum)
+  nameParser
 
 resourceNameParser :: Sage.Parser Name
 resourceNameParser =

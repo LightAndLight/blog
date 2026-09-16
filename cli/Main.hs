@@ -882,6 +882,10 @@ create baseUrl manager mSessionId mXactId mSrcFile properties resourceId = do
       | isNothing mXactId && not (null properties) = withTransaction baseUrl manager mSessionId (f . Just)
       | otherwise = f mXactId
 
+  -- TODO: this create the resource and attach its properties before any rules
+  -- are run. Currently it will create the resource which triggers the rules,
+  -- and if any of those rules require certain properties on the resource then
+  -- they'll fail. The user has to fall back to a deferred transaction.
   withTransaction'' $ \mXactId' -> do
     do
       let
@@ -955,7 +959,14 @@ commitTransaction baseUrl manager mSessionId xactId = do
   let headers = sessionCookieHeaders mSessionId ++ transactionIdHeaders xactId
   response <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
 
-  void $ expectOk response
+  case statusCode $ Http.responseStatus response of
+    400 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+      exitFailure
+    200 ->
+      pure ()
+    _ ->
+      unexpected response
 
 rollbackTransaction ::
   String ->

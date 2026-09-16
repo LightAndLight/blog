@@ -21,5 +21,8 @@ cradle:
     - path: "./server/Blog/Rules.hs"
       component: "blog:exe:blog-server"
 
+    - path: "./server/Blog/Time.hs"
+      component: "blog:exe:blog-server"
+
     - path: "./test"
       component: "blog:test:blog-server-tests"

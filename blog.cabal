@@ -115,6 +115,7 @@ executable blog-server
         Blog.Build
         Blog.Route
         Blog.Rules
+        Blog.Time
     build-depends:
         argon2,
         base ^>=4.20.2.0,

@@ -28,6 +28,7 @@ import qualified Blog.Rules
 import Blog.Session (sessionIdCookieName)
 import Blog.Store (Store)
 import qualified Blog.Store as Store
+import Blog.Time (renderUTCTime)
 import Control.Applicative ((<**>))
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
@@ -1075,7 +1076,7 @@ httpExport store request = do
       ,
         ( fromString "Content-Disposition"
         , fromString $
-            "attachment; filename=\"" ++ formatTime defaultTimeLocale "%FT%H:%M:%SZ" now ++ "-blog-export.tar\""
+            "attachment; filename=\"" ++ renderUTCTime now ++ "-blog-export.tar\""
         )
       ]
   pure $ Wai.responseLBS ok200 headers content
@@ -1219,7 +1220,7 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName = do
           response =
             ByteString.Lazy.Char8.unlines $
               fromString "updated properties:"
-                : ( fmap (\propName -> fromString $ "* " <> renderName propName <> "\n") names
+                : ( fmap (\propName -> fromString $ "* " <> renderName propName) names
                       ++ if null changes
                         then []
                         else
