@@ -9,7 +9,7 @@ category:           Web
 build-type:         Simple
 
 common warnings
-    ghc-options: -Wall
+    ghc-options: -Wall -Wunused-packages
 
 library
     import:           warnings
@@ -24,7 +24,6 @@ library
         bytestring,
         containers,
         entropy,
-        filepath,
         sage,
         temple,
         text >=2.0,
@@ -83,29 +82,20 @@ library blog-server-lib
         bytestring,
         containers,
         cryptohash-sha256,
-        deepseq,
         diagnostica,
         diagnostica-sage,
         directory,
         exceptions,
         filepath,
-        http-types,
         mtl >=2.3.2,
-        optparse-applicative,
         pandoc,
         pandoc-types,
         sage,
-        stm,
-        syb,
         tar,
         temple,
         text >=2.0,
         time,
-        tomlin,
-        transformers,
-        wai,
-        warp,
-        warp-tls
+        tomlin
     default-language: Haskell2010
 
 executable blog-server
@@ -119,16 +109,12 @@ executable blog-server
     build-depends:
         argon2,
         base ^>=4.20.2.0,
-        base16-bytestring,
         blog,
         blog-server-lib,
         bytestring,
         containers,
         cookie,
-        cryptohash-sha256,
-        deepseq,
         diagnostica,
-        diagnostica-sage,
         directory,
         exceptions,
         filepath,
@@ -140,8 +126,6 @@ executable blog-server
         pandoc-types,
         sage,
         stm,
-        syb,
-        tar,
         temple,
         text >=2.0,
         -- `text-short` is required to use `argon2`
@@ -177,7 +161,6 @@ test-suite blog-server-tests
         filepath,
         hedgehog,
         hspec,
-        hspec-core,
         hspec-hedgehog,
         http-api-data,
         http-client,
