@@ -17,7 +17,7 @@ import Blog.Password (defaultHashOptions, hashPassword)
 import Blog.Session (sessionIdCookieName)
 import Control.Applicative (empty, many, optional, (<**>), (<|>))
 import Control.Exception (bracket, catch, finally, throwIO)
-import Control.Monad (unless, void, when)
+import Control.Monad (unless, when)
 import Control.Monad.Catch (ExitCase (..), generalBracket)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
@@ -143,6 +143,8 @@ data Command
       -- | ID of resource to update
       String
   | Edit
+      -- | Transaction ID
+      (Maybe String)
       -- | ID of resource to edit
       String
   | RefreshAll
@@ -288,7 +290,13 @@ cliParser =
 
     editParser =
       Edit
-        <$> Options.strArgument
+        <$> optional
+          ( Options.strOption $
+              Options.long "transaction-id"
+                <> Options.metavar "ID"
+                <> Options.help "ID of transaction in which to edit"
+          )
+        <*> Options.strArgument
           (Options.metavar "RESOURCE" <> Options.help "ID of resource to edit (format: `TYPE:NAME`)")
 
     refreshAllParser =
@@ -415,9 +423,10 @@ main = do
       resourceId' <- parseResourceId resourceId
       properties' <- parseProperties properties
       update baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
-    Edit resourceId -> do
+    Edit mXactId resourceId -> do
+      let mXactId' = fmap fromString mXactId
       resourceId' <- parseResourceId resourceId
-      edit baseUrl manager mSessionId resourceId'
+      edit baseUrl manager mSessionId mXactId' resourceId'
     RefreshAll resTy ->
       refreshAll baseUrl manager mSessionId resTy
     Import path ->
@@ -1106,9 +1115,11 @@ edit ::
   Http.Manager ->
   -- | Session ID
   Maybe ID ->
+  -- | Transaction ID
+  Maybe ByteString ->
   ResourceId ->
   IO ()
-edit baseUrl manager mSessionId resourceId = do
+edit baseUrl manager mSessionId mXactId resourceId = do
   dataHome <- getDataHome
   editor <- getEditor
 
@@ -1129,6 +1140,7 @@ edit baseUrl manager mSessionId resourceId = do
       let
         headers =
           sessionCookieHeaders mSessionId
+            ++ foldMap transactionIdHeaders mXactId
             ++ resourceIdHeaders resourceId
             ++ [ ( hIfUnmodifiedSince
                  , fromString $ formatTime defaultTimeLocale rfc822DateFormat localModificationTime
@@ -1169,6 +1181,7 @@ edit baseUrl manager mSessionId resourceId = do
         let
           headers =
             sessionCookieHeaders mSessionId
+              ++ foldMap transactionIdHeaders mXactId
               ++ resourceIdHeaders resourceId
               ++ [
                    ( hIfUnmodifiedSince
@@ -1178,13 +1191,20 @@ edit baseUrl manager mSessionId resourceId = do
         body <- LazyByteString.readFile resourcePathLocal
         httpPut manager url headers body
       else do
-        let headers = resourceIdHeaders resourceId
+        let
+          headers =
+            sessionCookieHeaders mSessionId
+              ++ foldMap transactionIdHeaders mXactId
+              ++ resourceIdHeaders resourceId
         body <- LazyByteString.readFile resourcePathLocal
         httpPost manager url headers body
 
   case statusCode $ Http.responseStatus response of
     412 -> do
       putStrLn "error: the server has a newer copy of the resource (update aborted)"
+      exitFailure
+    400 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
       exitFailure
     201 -> do
       ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
