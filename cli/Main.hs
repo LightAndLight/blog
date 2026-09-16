@@ -714,8 +714,8 @@ commit ::
   ByteString ->
   IO ()
 commit baseUrl manager mSessionId xactId = do
-  commitTransaction baseUrl manager mSessionId xactId
-  ByteString.Char8.putStrLn $ fromString "committed " <> xactId
+  msg <- commitTransaction baseUrl manager mSessionId xactId
+  ByteString.Lazy.Char8.putStrLn msg
 
 rollback ::
   String ->
@@ -725,8 +725,8 @@ rollback ::
   ByteString ->
   IO ()
 rollback baseUrl manager mSessionId xactId = do
-  rollbackTransaction baseUrl manager mSessionId xactId
-  ByteString.Char8.putStrLn $ fromString "rolled back " <> xactId
+  msg <- rollbackTransaction baseUrl manager mSessionId xactId
+  ByteString.Lazy.Char8.putStrLn msg
 
 listTransactions ::
   String ->
@@ -963,7 +963,7 @@ commitTransaction ::
   Maybe ID ->
   -- | Transaction ID
   ByteString ->
-  IO ()
+  IO LazyByteString
 commitTransaction baseUrl manager mSessionId xactId = do
   let headers = sessionCookieHeaders mSessionId ++ transactionIdHeaders xactId
   response <- httpPost manager (baseUrl ++ "/.transaction/commit") headers mempty
@@ -973,7 +973,7 @@ commitTransaction baseUrl manager mSessionId xactId = do
       ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
       exitFailure
     200 ->
-      pure ()
+      pure $ Http.responseBody response
     _ ->
       unexpected response
 
@@ -984,12 +984,12 @@ rollbackTransaction ::
   Maybe ID ->
   -- | Transaction ID
   ByteString ->
-  IO ()
+  IO LazyByteString
 rollbackTransaction baseUrl manager mSessionId xactId = do
   let headers = sessionCookieHeaders mSessionId ++ transactionIdHeaders xactId
   response <- httpPost manager (baseUrl ++ "/.transaction/rollback") headers mempty
 
-  void $ expectOk response
+  expectOk response
 
 -- | Run an action in a transaction, committing on success and rolling back on exception/failure.
 withTransaction ::
@@ -1005,7 +1005,7 @@ withTransaction ::
   (ByteString -> IO b) ->
   IO b
 withTransaction baseUrl manager mSessionId f = do
-  (a, ()) <- generalBracket (beginTransaction baseUrl manager mSessionId False) exit $ f
+  (a, _msg) <- generalBracket (beginTransaction baseUrl manager mSessionId False) exit $ f
   pure a
   where
     exit xactId (ExitCaseSuccess _a) = commitTransaction baseUrl manager mSessionId xactId
