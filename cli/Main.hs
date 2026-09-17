@@ -1241,7 +1241,14 @@ import_ baseUrl manager mSessionId path = do
     content <- LazyByteString.readFile path
     httpPut manager (baseUrl ++ "/.import") headers content
 
-  ByteString.Lazy.Char8.putStrLn =<< expectOk response
+  case statusCode $ Http.responseStatus response of
+    400 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+      exitFailure
+    200 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+    _ ->
+      unexpected response
 
 seedUser ::
   -- | Directory in which to create the user

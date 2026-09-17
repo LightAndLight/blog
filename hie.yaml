@@ -12,9 +12,6 @@ cradle:
     - path: "./server/Main.hs"
       component: "blog:exe:blog-server"
 
-    - path: "./server/Blog/Build.hs"
-      component: "blog:exe:blog-server"
-
     - path: "./server/Blog/Route.hs"
       component: "blog:exe:blog-server"
 
