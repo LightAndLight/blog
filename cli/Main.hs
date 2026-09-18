@@ -1226,7 +1226,12 @@ refreshAll baseUrl manager mSessionId resTy = do
   let headers = sessionCookieHeaders mSessionId
   response <- httpRefresh manager (baseUrl ++ "/.resource/" ++ resTy) headers
 
-  ByteString.Lazy.Char8.putStrLn =<< expectOk response
+  case statusCode $ Http.responseStatus response of
+    400 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+      exitFailure
+    200 -> ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+    _ -> unexpected response
 
 import_ ::
   String ->
