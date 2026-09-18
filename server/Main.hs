@@ -646,12 +646,16 @@ createSession sessionTy sessionId username expires = do
   let sessionId' = ID.toString sessionId
   _updated <- Store.writeResource sessionTy (unsafeName sessionId') mempty
 
-  Store.setProperty sessionTy (unsafeName sessionId') (unsafeName "user") $
-    VString . fromString $
-      renderName username
+  _updated <-
+    Store.setProperty sessionTy (unsafeName sessionId') (unsafeName "user") $
+      VString . fromString $
+        renderName username
 
-  Store.setProperty sessionTy (unsafeName sessionId') (unsafeName "expires") $
-    VString (fromString $ iso8601Show expires)
+  _updated <-
+    Store.setProperty sessionTy (unsafeName sessionId') (unsafeName "expires") $
+      VString (fromString $ iso8601Show expires)
+
+  pure ()
 
 httpLogin ::
   (MonadMask m, MonadIO m) =>
@@ -1197,30 +1201,33 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName = do
     resTy <- Store.getResourceType store (Just xactId) resTyName
     let resId = ResourceId resTyName resName
     names <- for properties' $ \(name, value) -> do
-      Store.setProperty
-        resTy
-        (resourceName resId)
-        name
-        (metadataValueFromToml value)
-      pure name
+      updated <- Store.setProperty resTy (resourceName resId) name (metadataValueFromToml value)
+      pure (name, updated)
 
     if defer
       then do
         let
           response =
             fromString "updated properties:\n"
-              <> foldMap (\propName -> fromString $ "* " <> renderName propName <> "\n") names
+              <> foldMap
+                ( \(propName, updated) -> fromString $ "* " <> renderName propName <> (if updated then "" else " (unchanged)") <> "\n"
+                )
+                names
               <> fromString "(rules deferred)"
 
         pure $ Wai.responseLBS ok200 [] response
       else do
-        changes <- evalRules store routesVar xactId [resId]
+        let changed = any snd names
+        changes <- evalRules store routesVar xactId [resId | changed]
 
         let
           response =
             ByteString.Lazy.Char8.unlines $
               fromString "updated properties:"
-                : ( fmap (\propName -> fromString $ "* " <> renderName propName) names
+                : ( fmap
+                      ( \(propName, updated) -> fromString $ "* " <> renderName propName <> (if updated then "" else " (unchanged)")
+                      )
+                      names
                       ++ if null changes
                         then []
                         else

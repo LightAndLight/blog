@@ -611,7 +611,8 @@ import_ store xactId archive = do
                         content
                         (sageErrorReport err)
                   Right value -> do
-                    setProperty resTy resName' propName' $ metadataValueFromToml value
+                    _changed <- setProperty resTy resName' propName' $ metadataValueFromToml value
+                    pure ()
 
               pure Nothing
             [resTyName, part, "dependencies", subKey] | (resName, ":properties") <- break (== ':') part -> do
@@ -648,7 +649,7 @@ data ResourceType m
   , writeResourceImpl :: !(Name -> LazyByteString -> m Bool)
   , removeResourceImpl :: !(Name -> m ())
   , readPropertyImpl :: !(Name -> Name -> m (Maybe ByteString))
-  , setPropertyImpl :: !(Name -> Name -> MetadataValue -> m ())
+  , setPropertyImpl :: !(Name -> Name -> MetadataValue -> m Bool)
   , listPropertiesImpl :: !(Name -> m [Name])
   , listResourceImpl :: !(m [ResourceId])
   , readResourceModificationTimeImpl :: !(Name -> m (Maybe UTCTime))
@@ -696,6 +697,7 @@ resourceTypeFromDirectory storeDir mXactId resTyName config =
         , resourceTypeConfig = config
         , writeResourceImpl = writeResourceImpl self
         , removeResourceImpl = removeResourceImpl self
+        , setPropertyImpl = setPropertyImpl self
         , ..
         }
   where
@@ -747,7 +749,8 @@ resourceTypeFromDirectory storeDir mXactId resTyName config =
       let changed = mOldHash /= Just newHash
       when changed $ do
         liftIO $ overlayWriteFile overlay (nameToPath resName) body
-        setProperty self resName (unsafeName "sha256") $ VString (Text.Encoding.decodeUtf8 newHash)
+        _changed <-
+          setProperty self resName (unsafeName "sha256") $ VString (Text.Encoding.decodeUtf8 newHash)
         mMetadata <- extractMetadata resTyName config resName body
         for_ mMetadata $ updateMetadata resName
 
@@ -786,13 +789,16 @@ resourceTypeFromDirectory storeDir mXactId resTyName config =
     readPropertyImpl resName propName =
       liftIO $ overlayReadFile overlay (propertiesPart resName </> nameToPath propName)
 
-    setPropertyImpl :: Name -> Name -> MetadataValue -> m ()
-    setPropertyImpl resName key value =
-      liftIO $
+    setPropertyImpl :: ResourceType m -> Name -> Name -> MetadataValue -> m Bool
+    setPropertyImpl self resName key value = do
+      mOldValue <- lookupProperty self resName key
+      let changed = mOldValue /= Just value
+      when changed . liftIO $ do
         overlayWriteFile
           overlay
           (propertiesPart resName </> nameToPath key)
           (renderMetadataValueToml value)
+      pure changed
 
     listPropertiesImpl :: Name -> m [Name]
     listPropertiesImpl resName = liftIO $ do
@@ -900,7 +906,14 @@ readProperty :: ResourceType m -> Name -> Name -> m (Maybe ByteString)
 readProperty = readPropertyImpl
 
 -- | Precondition: the resource is writeable (see 'lookupResourceType')
-setProperty :: HasCallStack => ResourceType m -> Name -> Name -> MetadataValue -> m ()
+setProperty ::
+  HasCallStack =>
+  ResourceType m ->
+  Name ->
+  Name ->
+  MetadataValue ->
+  -- | The property changed
+  m Bool
 setProperty = setPropertyImpl
 
 listProperties :: ResourceType m -> Name -> m [Name]

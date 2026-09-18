@@ -235,9 +235,10 @@ setProperty resId@(ResourceId resTyName resName) key value = do
   exists <- Store.doesResourceExist resTy resName
   if exists
     then do
-      Store.setProperty resTy resName key value
-      let changes = Map.singleton resId (Change Updated reasons)
-      ActionT $ tell mempty{asChanges = changes}
+      changed <- Store.setProperty resTy resName key value
+      when changed $ do
+        let changes = Map.singleton resId (Change Updated reasons)
+        ActionT $ tell mempty{asChanges = changes}
     else do
       throwError . DiagnosticSimple $
         "can't set property '" ++ renderName key ++ "' on missing resource " ++ renderResourceId resId
