@@ -63,6 +63,7 @@ import Control.Monad.Writer.Class (tell)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import qualified Data.ByteString.Lazy as LazyByteString
+import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, for_)
 import Data.Functor ((<&>))
 import Data.List (find, sortOn)
@@ -125,6 +126,11 @@ rules =
       )
       articleHtml
     <> Build.rule
+      "article-tags"
+      (Build.iResource "article" (Build.iBind "name"))
+      (Build.oResource "tag" Build.oAny)
+      resourceTags
+    <> Build.rule
       "note-dependency"
       (Build.iResource "note" Build.iAny)
       (pure ())
@@ -138,6 +144,11 @@ rules =
       )
       (Build.oResource "html" (Build.oMatch "note-" *< Build.oBind "name"))
       noteHtml
+    <> Build.rule
+      "note-tags"
+      (Build.iResource "note" (Build.iBind "name"))
+      (Build.oResource "tag" Build.oAny)
+      resourceTags
     <> Build.rule
       "page-dependency"
       (Build.iResource "page" Build.iAny)
@@ -164,6 +175,20 @@ rules =
       )
       (Build.oResource "html" (Build.oMatch "index"))
       indexHtml
+    <> Build.rule
+      "tag-index-html"
+      ( (,,,)
+          <$> Build.iResource "tag" (Build.iBind "name")
+          <*> Build.iResource "template" (Build.iMatch "post-list.html.temple")
+          <*> Build.iAll
+            ( (,)
+                <$> Build.iResource "article" (Build.iBind "article-name")
+                <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "article-name")
+            )
+          <*> Build.iAll (Build.iResource "note" Build.iAny)
+      )
+      (Build.oResource "html" (Build.oMatch "tag-" *< Build.oBind "name"))
+      tagIndexHtml
     <> Build.rule
       "index-feed"
       ( (,,,)
@@ -1016,6 +1041,32 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
   let mUrl = Map.lookup (fromString "url") metadata
   for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
+resourceTags ::
+  forall m.
+  MonadIO m =>
+  Build.ResourceInput m ByteString ->
+  Build.ResourceOutput m String ->
+  Build.ActionT m ()
+resourceTags iArticle oTag = do
+  mTags <- optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
+  for_ mTags $ \tags -> do
+    for_ tags $ \tag -> do
+      let tagName = resourceName . Build.resourceOutputId oTag $ Text.unpack tag
+      mTagContents <- Store.readResource (Build.resourceOutputType oTag) tagName
+      let
+        items =
+          case mTagContents of
+            Nothing ->
+              Set.singleton (fromString $ renderResourceId (Build.resourceInputId iArticle))
+            Just tagContents ->
+              Set.insert (fromString $ renderResourceId (Build.resourceInputId iArticle)) $
+                Set.fromList (ByteString.Char8.lines tagContents)
+      Build.writeResource oTag (Text.unpack tag) $
+        ByteString.Lazy.Char8.unlines (LazyByteString.fromStrict <$> Set.toList items)
+      Build.setResourceProperty oTag (renderName tagName) (unsafeName "url") $
+        VString . fromString $
+          "/tags/" ++ renderName tagName
+
 noteHtml ::
   forall m.
   MonadIO m =>
@@ -1097,15 +1148,23 @@ data IndexItem m
   = IndexArticle
       -- | Article
       (Build.ResourceInput m ByteString)
+      -- | Tags
+      [Text]
       -- | Excerpt
       (Maybe (Build.ResourceInput m ByteString))
   | IndexNote
       -- | Note
       (Build.ResourceInput m ByteString)
-      -- | Rendered HTML
-      Text
+      -- | Tags
+      [Text]
       -- | @references@ metadata
       MetadataValue
+      -- | Rendered HTML
+      Text
+
+indexItemTags :: IndexItem m -> [Text]
+indexItemTags (IndexArticle _article tags _excerpt) = tags
+indexItemTags (IndexNote _note tags _references _content) = tags
 
 sortPosts ::
   MonadIO m =>
@@ -1118,7 +1177,8 @@ sortPosts iArticlesWithExcerpts iNotes = do
       iArticlesWithExcerpts
       ( \(iArticle, miExcerpt) -> do
           published <- requirePublished iArticle
-          pure (published, IndexArticle iArticle miExcerpt)
+          tags <- fromMaybe [] <$> optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
+          pure (published, IndexArticle iArticle tags miExcerpt)
       )
 
   notesWithPublished <-
@@ -1126,10 +1186,11 @@ sortPosts iArticlesWithExcerpts iNotes = do
       iNotes
       ( \iNote -> do
           published <- requirePublished iNote
-          references <- requireMetadata iNote (fromString "references")
+          tags <- fromMaybe [] <$> optionalMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
+          references <- requireMetadata iNote (fromString "references") Metadata.value
           (_deps, document) <- loadMarkdown iNote
           html <- renderHtml document
-          pure (published, IndexNote iNote html references)
+          pure (published, IndexNote iNote tags references html)
       )
 
   pure
@@ -1141,14 +1202,14 @@ postsList :: Monad m => [IndexItem m] -> Value (Build.ActionT m)
 postsList sortedPosts =
   List $
     sortedPosts <&> \case
-      IndexArticle iArticle miExcerpt ->
+      IndexArticle iArticle _tags miExcerpt ->
         post (Build.resourceInputMetadata iArticle) . Constructor (fromString "Article") $
           [ recordValue
               [ (fromString "excerpt", bytestringValue $ Build.resourceInputContent iExcerpt)
               | Just iExcerpt <- [miExcerpt]
               ]
           ]
-      IndexNote iNote html references ->
+      IndexNote iNote _tags references html ->
         post (Build.resourceInputMetadata iNote) . Constructor (fromString "Note") $
           [ recordValue
               [ (fromString "content", textValue html)
@@ -1211,6 +1272,56 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
   Build.writeResource oHtml () output
 
   Build.setResourceProperty oHtml () (unsafeName "url") $ VString (fromString "/")
+
+tagIndexHtml ::
+  MonadIO m =>
+  ( Build.ResourceInput m ByteString
+  , Build.ResourceInput m ByteString
+  , [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))]
+  , [Build.ResourceInput m ByteString]
+  ) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+tagIndexHtml (iTag, iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
+  let tagName = renderName . resourceName $ Build.resourceInputId iTag
+  url <- requireStringProperty iTag (unsafeName "url")
+
+  sortedPosts <-
+    filter ((Text.pack tagName `elem`) . indexItemTags)
+      <$> sortPosts iArticlesWithExcerpts iNotes
+
+  output <-
+    renderTemplate iTemplate $
+      resourceField
+        <> fields
+          [
+            ( fromString "self"
+            , recordValue
+                [
+                  ( fromString "metadata"
+                  , recordValue
+                      [ (fromString "url", stringValue "/")
+                      , (fromString "title", stringValue "blog.ielliott.io")
+                      , (fromString "description", stringValue "Isaac Elliott's personal blog.")
+                      , (fromString "math", boolValue False)
+                      , (fromString "chinese", boolValue False)
+                      , (fromString "asciinema", boolValue False)
+                      ]
+                  )
+                ]
+            )
+          ,
+            ( fromString "tag"
+            , optionalValue . Just $ stringValue tagName
+            )
+          ,
+            ( fromString "posts"
+            , postsList sortedPosts
+            )
+          ]
+
+  Build.writeResource oHtml () output
+  Build.setResourceProperty oHtml () (unsafeName "url") $ VString url
 
 requireStringProperty ::
   Monad m =>
