@@ -26,7 +26,8 @@ import Blog.Build ((*<))
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
-import Blog.Metadata (parseResourceMetadata)
+import Blog.Metadata (MetadataValueDecoder, parseResourceMetadata, runMetadataValueDecoder)
+import qualified Blog.Metadata as Metadata
 import Blog.Pandoc (htmlWriterOptions, markdownReaderOptions, pandoc)
 import Blog.Route (RouteEntry (..), renderRouteEntry)
 import qualified Blog.Route as Routes
@@ -287,16 +288,35 @@ templateDependency iTemplate () = do
         <> fold mResources
   Build.setDependencies (Build.resourceInputId iTemplate) templateDependencies
 
+renderMetadataPath :: [Metadata.Part] -> String
+renderMetadataPath [] = ""
+renderMetadataPath (Metadata.PIndex ix : rest) = "[" ++ show ix ++ "]" ++ renderMetadataPath rest
+
+renderMetadataDecodeError :: Metadata.DecodeError -> String
+renderMetadataDecodeError (Metadata.DecodeError path err) =
+  renderMetadataPath path ++ ": " ++ err
+
 requireMetadata ::
   Monad m =>
   Build.ResourceInput m a ->
   -- | Property name
   Text ->
-  Build.ActionT m MetadataValue
-requireMetadata input name =
+  MetadataValueDecoder b ->
+  Build.ActionT m b
+requireMetadata input name decoder =
   case Map.lookup name (Build.resourceInputMetadata input) of
     Just value ->
-      pure value
+      case runMetadataValueDecoder decoder [] value of
+        Left err ->
+          throwError . DiagnosticSimple $
+            "("
+              ++ renderResourceId (Build.resourceInputId input)
+              ++ ":metadata:"
+              ++ Text.unpack name
+              ++ "): "
+              ++ renderMetadataDecodeError err
+        Right b ->
+          pure b
     Nothing ->
       throwError . DiagnosticSimple $
         "("
@@ -305,18 +325,36 @@ requireMetadata input name =
           ++ Text.unpack name
           ++ "'"
 
+optionalMetadata ::
+  Monad m =>
+  Build.ResourceInput m a ->
+  -- | Property name
+  Text ->
+  MetadataValueDecoder b ->
+  Build.ActionT m (Maybe b)
+optionalMetadata input name decoder =
+  case Map.lookup name (Build.resourceInputMetadata input) of
+    Just value ->
+      case runMetadataValueDecoder decoder [] value of
+        Left err ->
+          throwError . DiagnosticSimple $
+            "("
+              ++ renderResourceId (Build.resourceInputId input)
+              ++ ":metadata:"
+              ++ Text.unpack name
+              ++ "): "
+              ++ renderMetadataDecodeError err
+        Right b ->
+          pure $ Just b
+    Nothing ->
+      pure Nothing
+
 requirePublished ::
   Monad m =>
   Build.ResourceInput m a ->
   Build.ActionT m UTCTime
 requirePublished input = do
-  value <- requireMetadata input (fromString "published")
-  published <-
-    case value of
-      VString s -> pure s
-      _ ->
-        throwError . DiagnosticSimple $
-          "(" ++ renderResourceId (Build.resourceInputId input) ++ ":metadata:published): not a string"
+  published <- requireMetadata input (fromString "published") Metadata.text
   case parseDateTime published <|> parseDate published of
     Just x -> pure x
     Nothing ->

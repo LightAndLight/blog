@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Blog.Metadata
   ( MetadataKeyRequirement (..)
@@ -8,6 +9,17 @@ module Blog.Metadata
   , parseResourceMetadata
   , metadataValueFromToml
   , renderMetadataValueToml
+
+    -- * Value decoding
+  , MetadataValueDecoder
+  , runMetadataValueDecoder
+  , list
+  , text
+  , value
+
+    -- ** Errors
+  , Part (..)
+  , DecodeError (..)
   )
 where
 
@@ -115,10 +127,10 @@ renderMetadataValueToml (VRecord fields) =
     <> fold
       ( intersperse (fromString ", ") $
           fmap
-            ( \(field, value) ->
+            ( \(field, val) ->
                 Text.Lazy.Encoding.encodeUtf8 (LazyText.fromStrict field)
                   <> fromString " = "
-                  <> renderMetadataValueToml value
+                  <> renderMetadataValueToml val
             )
             fields
       )
@@ -149,3 +161,36 @@ metadataValueFromToml (Toml.VRecord fields) =
             VConstructor name' (fmap (metadataValueFromToml . Toml.locatedValue) args')
       _ ->
         error "TODO: support TOML records"
+
+data Part
+  = PIndex Int
+
+newtype MetadataValueDecoder a = MetadataValueDecoder ([Part] -> MetadataValue -> Either DecodeError a)
+
+data DecodeError
+  = DecodeError [Part] String
+
+runMetadataValueDecoder :: MetadataValueDecoder a -> [Part] -> MetadataValue -> Either DecodeError a
+runMetadataValueDecoder (MetadataValueDecoder f) = f
+
+list :: MetadataValueDecoder a -> MetadataValueDecoder [a]
+list item =
+  MetadataValueDecoder $
+    \path val ->
+      case val of
+        VList xs ->
+          traverse
+            (\(ix, x) -> runMetadataValueDecoder item (path <> pure (PIndex ix)) x)
+            (zip [0 ..] xs)
+        _ -> Left $ DecodeError path "not a list"
+
+text :: MetadataValueDecoder Text
+text =
+  MetadataValueDecoder $
+    \path val ->
+      case val of
+        VString s -> pure s
+        _ -> Left $ DecodeError path "not a string"
+
+value :: MetadataValueDecoder MetadataValue
+value = MetadataValueDecoder $ \_path -> pure
