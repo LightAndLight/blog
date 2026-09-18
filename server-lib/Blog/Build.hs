@@ -30,6 +30,7 @@ module Blog.Build
   , iAny
   , Output
   , ResourceOutput
+  , resourceOutputType
   , resourceOutputId
   , writeResource
   , setResourceProperty
@@ -117,7 +118,7 @@ runRule (Rule name inputs outputs f) changes = do
           let input' = inputTupleValue tuple
 
           trace $ show (age, reasons, headers, bindings)
-          let outputs' = makeOutput bindings outputs
+          outputs' <- makeOutput bindings outputs
           withReasons reasons $ f input' outputs'
       )
       news
@@ -675,7 +676,8 @@ instance Applicative (Output m) where
 
 data ResourceOutput m a
   = ResourceOutput
-  { resourceOutputId :: a -> ResourceId
+  { resourceOutputType :: Store.ResourceType (ActionT m)
+  , resourceOutputId :: a -> ResourceId
   , writeResource :: a -> LazyByteString -> ActionT m ()
   , setResourceProperty :: a -> Name -> MetadataValue -> ActionT m ()
   }
@@ -745,19 +747,37 @@ oResource ::
   Output m (ResourceOutput m a)
 oResource resTyName = OResource (unsafeName resTyName)
 
-makeOutput :: MonadIO m => Map String String -> Output m a -> a
+makeOutput :: MonadIO m => Map String String -> Output m a -> ActionT m a
 makeOutput bindings = go
   where
-    go :: MonadIO m => Output m a -> a
-    go (OFmap f a) = f (go a)
-    go (OPure a) = a
-    go (OApply a b) = go a (go b)
-    go (OResourceType resTyName) =
+    go :: MonadIO m => Output m a -> ActionT m a
+    go (OFmap f a) = f <$> go a
+    go (OPure a) = pure a
+    go (OApply a b) = go a <*> go b
+    go (OResourceType resTyName) = do
       let mkResId = ResourceId resTyName . unsafeName
-      in ResourceOutput mkResId (putResource . mkResId) (setProperty . mkResId)
-    go (OResource resTyName pat) =
+      store <- askStore
+      transactionId <- askTransactionId
+      resTy <- Store.getResourceType store (Just transactionId) resTyName
+      pure $
+        ResourceOutput
+          { resourceOutputType = resTy
+          , resourceOutputId = mkResId
+          , writeResource = putResource . mkResId
+          , setResourceProperty = setProperty . mkResId
+          }
+    go (OResource resTyName pat) = do
       let mkResId = ResourceId resTyName . unsafeName . renderOutputResourceNamePattern bindings pat
-      in ResourceOutput mkResId (putResource . mkResId) (setProperty . mkResId)
+      store <- askStore
+      transactionId <- askTransactionId
+      resTy <- Store.getResourceType store (Just transactionId) resTyName
+      pure $
+        ResourceOutput
+          { resourceOutputType = resTy
+          , resourceOutputId = mkResId
+          , writeResource = putResource . mkResId
+          , setResourceProperty = setProperty . mkResId
+          }
 
 data Change
   = Change
