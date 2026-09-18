@@ -263,6 +263,11 @@ rules =
       (Build.iResource "xml" (Build.iBind "name"))
       (Build.oResource "route" (Build.oMatch "xml-" *< Build.oBind "name"))
       resourceRoute
+    <> Build.rule
+      "ico-route"
+      (Build.iResource "ico" (Build.iBind "name"))
+      (Build.oResource "route" (Build.oMatch "ico-" *< Build.oBind "name"))
+      resourceRoute
 
 templateDependency ::
   forall m.
