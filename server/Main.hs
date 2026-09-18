@@ -921,7 +921,7 @@ httpResourceUpdate store routesVar request = do
                         fromString
                           ( "updated "
                               ++ renderResourceId (ResourceId resTyName resName)
-                              ++ if changed then "" else " (nothing changed)"
+                              ++ if changed then "" else " (resource unchanged)"
                           )
                           : renderChangeList changes
                     )
