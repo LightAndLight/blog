@@ -29,7 +29,7 @@ import Blog.Session (sessionIdCookieName)
 import Blog.Store (Store)
 import qualified Blog.Store as Store
 import Blog.Time (renderUTCTime)
-import Control.Applicative ((<**>))
+import Control.Applicative (optional, (<**>))
 import Control.Concurrent.STM (atomically)
 import Control.Concurrent.STM.TVar (TVar, modifyTVar, newTVar, readTVar, readTVarIO)
 import Control.Exception (evaluate)
@@ -94,12 +94,18 @@ data Cli
   = Cli
   { cliData :: !FilePath
   -- ^ Data directory
-  , cliCert :: !FilePath
-  -- ^ TLS certificate
-  , cliKey :: !FilePath
-  -- ^ TLS key
+  , cliTls :: !(Maybe Tls)
+  -- ^ TLS configuration
   , cliPort :: !Int
   -- ^ Port
+  }
+
+data Tls
+  = Tls
+  { tlsCert :: !FilePath
+  -- ^ TLS certificate
+  , tlsKey :: !FilePath
+  -- ^ TLS key
   }
 
 cliParser :: Options.Parser Cli
@@ -107,9 +113,12 @@ cliParser =
   Cli
     <$> Options.strOption
       (Options.long "data" <> Options.metavar "DIR" <> Options.help "Server data directory")
-    <*> Options.strOption
-      (Options.long "cert" <> Options.metavar "FILE" <> Options.help "TLS certificate file")
-    <*> Options.strOption (Options.long "key" <> Options.metavar "FILE" <> Options.help "TLS key file")
+    <*> optional
+      ( Tls
+          <$> Options.strOption
+            (Options.long "cert" <> Options.metavar "FILE" <> Options.help "TLS certificate file")
+          <*> Options.strOption (Options.long "key" <> Options.metavar "FILE" <> Options.help "TLS key file")
+      )
     <*> Options.option
       Options.auto
       (Options.long "port" <> Options.metavar "PORT" <> Options.help "Server port")
@@ -191,11 +200,12 @@ main = do
   store <- initStore $ cliData cli
   routes <- initRoutes store
 
-  let tlsSettings = WarpTLS.tlsSettings (cliCert cli) (cliKey cli)
+  let mTlsSettings = fmap (\tls -> WarpTLS.tlsSettings (tlsCert tls) (tlsKey tls)) (cliTls cli)
 
   let
     startup = do
-      putStrLn $ "Running at https://localhost:" ++ show (cliPort cli)
+      putStrLn $
+        "Running at " ++ maybe "http" (const "https") mTlsSettings ++ "://localhost:" ++ show (cliPort cli)
       putStrLn $ "  Data directory: " ++ cliData cli
 
     settings =
@@ -203,7 +213,9 @@ main = do
         Warp.setBeforeMainLoop startup $
           Warp.defaultSettings
 
-  WarpTLS.runTLS tlsSettings settings $ app store routes
+  case mTlsSettings of
+    Nothing -> Warp.runSettings settings $ app store routes
+    Just tlsSettings -> WarpTLS.runTLS tlsSettings settings $ app store routes
 
 newtype HandlerT m a = HandlerT (ExceptT Wai.Response m a)
   deriving
