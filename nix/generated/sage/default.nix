@@ -13,5 +13,5 @@ mkDerivation {
     base bytestring containers hedgehog hspec hspec-hedgehog text
   ];
   description = "Efficient parser combinators";
-  license = lib.licenses.bsd3;
+  license = lib.meta.getLicenseFromSpdxId "BSD-3-Clause";
 }

@@ -6,5 +6,5 @@ mkDerivation {
   postUnpack = "sourceRoot+=/sage-parsers-instances; echo source root reset to $sourceRoot";
   libraryHaskellDepends = [ base parsers sage ];
   description = "Orphan `parsers` instances for `sage`";
-  license = lib.licenses.bsd3;
+  license = lib.meta.getLicenseFromSpdxId "BSD-3-Clause";
 }

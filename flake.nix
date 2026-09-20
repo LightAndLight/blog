@@ -12,7 +12,28 @@
     flake-utils.lib.eachDefaultSystem (system:
       let 
         pkgs = import nixpkgs { inherit system; };
+
+        pkgsHs = import nixpkgs {
+          inherit system;
+          overlays = [
+            (final: prev: {
+              haskellPackages = prev.haskellPackages.extend (import ./nix/generated/overlay.nix);
+            })
+          ];
+        };
       in {
+        packages.haskellPackages = pkgsHs.haskellPackages;
+        packages.blog = (pkgsHs.haskellPackages.callPackage ./blog.nix {}).overrideAttrs (old: {
+          # TODO: enable tests
+          #
+          # The test suite uses Cabal to build `blog-server`, and then runs the
+          # state machine tests against a `blog-server` process. It's not obvious
+          # to me how to make that work in Nix's `checkPhase`. I think the easiest
+          # solution would be to expose the `blog-server` entrypoint as a Haskell
+          # value and run that in a separate thread.
+          doCheck = false;
+        });
+
         devShell = pkgs.mkShell {
           buildInputs = with pkgs; [
             haskellPackages.ghc

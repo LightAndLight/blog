@@ -17,6 +17,6 @@ mkDerivation {
   ];
   testHaskellDepends = [ base bytestring hspec sage ];
   testToolDepends = [ hspec-discover ];
-  license = lib.licenses.gpl3Only;
+  license = lib.meta.getLicenseFromSpdxId "GPL-3.0-only";
   mainProgram = "temple";
 }

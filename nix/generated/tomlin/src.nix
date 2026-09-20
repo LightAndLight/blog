@@ -1,5 +1,5 @@
 { fetchzip }:
 fetchzip {
-  url = "https://github.com/LightAndLight/tomlin/archive/5673c1640f4c5de14cba49b1f29b57baffb56135.tar.gz";
-  sha256 = "0asir81l94z2l4v2ff91zxjbfwymvpang6pp99gpa9cjp8y8lr7n";
+  url = "https://github.com/LightAndLight/tomlin/archive/f47093874bc4932b8eaf296d8de89ca467515e11.tar.gz";
+  sha256 = "18cf5fgi9ydb59b4d4mjkgchws0lsr78vfjbi6ykci7d0d4xcmil";
 }

@@ -1,0 +1,39 @@
+{ mkDerivation, argon2, async, barbies, base, base16-bytestring
+, bytestring, containers, cookie, cryptohash-sha256
+, crypton-connection, crypton-x509-store, diagnostica
+, diagnostica-sage, directory, entropy, exceptions, filepath
+, hedgehog, hspec, hspec-hedgehog, http-api-data, http-client
+, http-client-tls, http-types, lib, mmorph, mtl
+, optparse-applicative, pandoc, pandoc-types, process, sage, stm
+, tar, temple, temporary, text, text-short, time, tls, tomlin
+, transformers, unix, wai, warp, warp-tls
+}:
+mkDerivation {
+  pname = "blog";
+  version = "0.1.0.0";
+  src = ./.;
+  isLibrary = true;
+  isExecutable = true;
+  libraryHaskellDepends = [
+    argon2 base base16-bytestring bytestring containers
+    cryptohash-sha256 diagnostica diagnostica-sage directory entropy
+    exceptions filepath mtl pandoc pandoc-types sage tar temple text
+    text-short time tomlin transformers
+  ];
+  executableHaskellDepends = [
+    argon2 base bytestring containers cookie crypton-connection
+    crypton-x509-store diagnostica diagnostica-sage directory
+    exceptions filepath http-api-data http-client http-client-tls
+    http-types mtl optparse-applicative pandoc pandoc-types process
+    sage stm temple text text-short time tls tomlin transformers unix
+    wai warp warp-tls
+  ];
+  testHaskellDepends = [
+    async barbies base bytestring containers crypton-connection
+    crypton-x509-store directory filepath hedgehog hspec hspec-hedgehog
+    http-api-data http-client http-client-tls http-types mmorph mtl
+    process temporary text tls
+  ];
+  doHaddock = false;
+  license = lib.licenses.gpl3Only;
+}

@@ -13,6 +13,6 @@ mkDerivation {
   executableHaskellDepends = [ base bytestring ];
   testHaskellDepends = [ base bytestring hspec text ];
   description = "A library for building and rendering error diagnostics";
-  license = lib.licenses.bsd3;
+  license = lib.meta.getLicenseFromSpdxId "BSD-3-Clause";
   mainProgram = "example";
 }

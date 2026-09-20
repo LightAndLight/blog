@@ -1,5 +1,5 @@
 { fetchzip }:
 fetchzip {
-  url = "https://github.com/LightAndLight/argon2/archive/d66e37f1eb3ed10e4df91f9129ab7cbde883c068.tar.gz";
-  sha256 = "0p5vfas33vx84qw4crb6l0ljkc3bkgn2fjvhwwj51v6qjdnm0ya7";
+  url = "https://github.com/LightAndLight/argon2/archive/c7d9ed52d7a64413feab674d5e856d380c2bbcbd.tar.gz";
+  sha256 = "0m83b4xbajfnarg5hvg0r0n6bm7n6j931q1mzghglld94bn56p94";
 }

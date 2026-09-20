@@ -10,6 +10,10 @@ run:
 format:
     fd -e hs | xargs -n 1 -P $(nproc) fourmolu -i -q
 
+# Regenerate cabal2nix files
+cabal2nix:
+    cabal2nix . > blog.nix
+
 # Generate a certificate authority
 ca:
     @# https://learn.microsoft.com/en-us/azure/application-gateway/self-signed-certificates
