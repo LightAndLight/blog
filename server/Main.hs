@@ -94,11 +94,18 @@ data Cli
   = Cli
   { cliData :: !FilePath
   -- ^ Data directory
-  , cliTls :: !(Maybe Tls)
-  -- ^ TLS configuration
-  , cliPort :: !Int
-  -- ^ Port
+  , cliCommand :: !Command
   }
+
+data Command
+  = Run
+      -- | TLS configuration
+      !(Maybe Tls)
+      -- | Port
+      !Int
+  | Restore
+      -- | Archive path
+      FilePath
 
 data Tls
   = Tls
@@ -113,15 +120,26 @@ cliParser =
   Cli
     <$> Options.strOption
       (Options.long "data" <> Options.metavar "DIR" <> Options.help "Server data directory")
-    <*> optional
-      ( Tls
-          <$> Options.strOption
-            (Options.long "cert" <> Options.metavar "FILE" <> Options.help "TLS certificate file")
-          <*> Options.strOption (Options.long "key" <> Options.metavar "FILE" <> Options.help "TLS key file")
+    <*> Options.hsubparser
+      ( Options.command "run" (Options.info runParser Options.fullDesc)
+          <> Options.command "restore" (Options.info restoreParser Options.fullDesc)
       )
-    <*> Options.option
-      Options.auto
-      (Options.long "port" <> Options.metavar "PORT" <> Options.help "Server port")
+  where
+    runParser =
+      Run
+        <$> optional
+          ( Tls
+              <$> Options.strOption
+                (Options.long "cert" <> Options.metavar "FILE" <> Options.help "TLS certificate file")
+              <*> Options.strOption (Options.long "key" <> Options.metavar "FILE" <> Options.help "TLS key file")
+          )
+        <*> Options.option
+          Options.auto
+          (Options.long "port" <> Options.metavar "PORT" <> Options.help "Server port")
+
+    restoreParser =
+      Restore
+        <$> Options.strArgument (Options.metavar "FILE" <> Options.help "Archive from which to restore")
 
 initStore :: FilePath -> IO (Store (ExceptT DiagnosticReports IO))
 initStore data_ = do
@@ -198,24 +216,54 @@ main = do
   hSetBuffering stdout LineBuffering
 
   store <- initStore $ cliData cli
-  routes <- initRoutes store
+  routesVar <- initRoutes store
 
-  let mTlsSettings = fmap (\tls -> WarpTLS.tlsSettings (tlsCert tls) (tlsKey tls)) (cliTls cli)
+  case cliCommand cli of
+    Run mTls port -> do
+      let mTlsSettings = fmap (\tls -> WarpTLS.tlsSettings (tlsCert tls) (tlsKey tls)) mTls
 
-  let
-    startup = do
-      putStrLn $
-        "Running at " ++ maybe "http" (const "https") mTlsSettings ++ "://localhost:" ++ show (cliPort cli)
-      putStrLn $ "  Data directory: " ++ cliData cli
+      let
+        startup = do
+          putStrLn $
+            "Running at " ++ maybe "http" (const "https") mTlsSettings ++ "://localhost:" ++ show port
+          putStrLn $ "  Data directory: " ++ cliData cli
 
-    settings =
-      Warp.setPort (cliPort cli) $
-        Warp.setBeforeMainLoop startup $
-          Warp.defaultSettings
+        settings =
+          Warp.setPort port $
+            Warp.setBeforeMainLoop startup $
+              Warp.defaultSettings
 
-  case mTlsSettings of
-    Nothing -> Warp.runSettings settings $ app store routes
-    Just tlsSettings -> WarpTLS.runTLS tlsSettings settings $ app store routes
+      case mTlsSettings of
+        Nothing -> Warp.runSettings settings $ app store routesVar
+        Just tlsSettings -> WarpTLS.runTLS tlsSettings settings $ app store routesVar
+    Restore archivePath -> do
+      let
+        reportError ma = do
+          result <- runExceptT ma
+          case result of
+            Left err -> do
+              ByteString.Lazy.Char8.putStrLn $ renderDiagnosticReports err
+              exitFailure
+            Right () -> pure ()
+
+      reportError . withTransaction store routesVar Nothing $ \xactId _defer -> do
+        content <- liftIO $ LazyByteString.readFile archivePath
+        imported <- Store.import_ store xactId content
+        changes <- evalRules store routesVar xactId imported
+
+        let
+          response =
+            ByteString.Lazy.Char8.unlines $
+              fromString "imported resources:"
+                : ( fmap (\resId -> fromString $ "* " <> renderResourceId resId) imported
+                      <> if null changes
+                        then []
+                        else
+                          [mempty, fromString ("resource changes:")]
+                            <> renderChangeList changes
+                  )
+
+        liftIO $ ByteString.Lazy.Char8.putStrLn response
 
 newtype HandlerT m a = HandlerT (ExceptT Wai.Response m a)
   deriving
