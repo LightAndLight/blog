@@ -83,20 +83,23 @@ import Web.FormUrlEncoded (urlEncodeAsFormStable)
 import Web.HttpApiData (ToHttpApiData (..))
 
 data Cli
-  = Cli
-  { cliBaseUrl :: String
-  -- ^ Base URL of blog server
-  , cliCaCert :: !(Maybe FilePath)
-  -- ^ CA certificate
-  , cliCommand :: Command
-  }
+  = ServerCommand !ServerEnv !ServerCommand
+  | LocalCommand !LocalCommand
 
 data ViewTarget
   = ViewMetadata
-  | ViewProperty String
+  | ViewProperty !String
   | ViewContent
 
-data Command
+data ServerEnv
+  = ServerEnv
+  { serverBaseUrl :: !String
+  -- ^ Base URL of blog server
+  , serverCaCert :: !(Maybe FilePath)
+  -- ^ CA certificate
+  }
+
+data ServerCommand
   = Login
   | Logout
   | Begin
@@ -153,50 +156,76 @@ data Command
   | Import
       -- | Archive to import
       FilePath
-  | SeedUser
+
+data LocalCommand
+  = SeedUser
       -- | Directory in which to create the user
       FilePath
 
-cliParser :: Options.Parser Cli
-cliParser =
-  Cli
+serverEnvParser :: Options.Parser ServerEnv
+serverEnvParser =
+  ServerEnv
     <$> Options.strOption
       (Options.long "base" <> Options.metavar "URL" <> Options.help "Blog server base URL")
     <*> optional
       ( Options.strOption $
           Options.long "cacert" <> Options.metavar "FILE" <> Options.help "TLS CA certificate"
       )
-    <*> Options.hsubparser
-      ( Options.command "login" (Options.info loginParser $ Options.progDesc "Authenticate with the server")
-          <> Options.command "logout" (Options.info logoutParser $ Options.progDesc "End the current session")
-          <> Options.command "begin" (Options.info beginParser $ Options.progDesc "Begin a transaction")
-          <> Options.command "commit" (Options.info commitParser $ Options.progDesc "Commit a transaction")
-          <> Options.command
-            "rollback"
-            (Options.info rollbackParser $ Options.progDesc "Roll back a transaction")
-          <> Options.command
-            "list-transactions"
-            (Options.info listTransactionsParser $ Options.progDesc "List uncommitted transactions")
-          <> Options.command "view" (Options.info viewParser $ Options.progDesc "View a resource")
-          <> Options.command
-            "list"
-            (Options.info listParser $ Options.progDesc "List resources of a specific type")
-          <> Options.command "create" (Options.info createParser $ Options.progDesc "Create an empty resource")
-          <> Options.command
-            "create-all"
-            (Options.info createAllParser $ Options.progDesc "Create multiple resources")
-          <> Options.command "update" (Options.info updateParser $ Options.progDesc "Update a resource")
-          <> Options.command "edit" (Options.info editParser $ Options.progDesc "Edit a resource")
-          <> Options.command
-            "refresh-all"
-            (Options.info refreshAllParser $ Options.progDesc "Mark resources as changed")
-          <> Options.command
-            "import"
-            (Options.info importParser $ Options.progDesc "Import an archive")
-          <> Options.command
-            "seed-user"
-            (Options.info seedUserParser $ Options.progDesc "Generate a user locally")
-      )
+
+serverCommandParser :: Options.Parser ServerCommand -> Options.Parser Cli
+serverCommandParser commandParser = ServerCommand <$> serverEnvParser <*> commandParser
+
+cliParser :: Options.Parser Cli
+cliParser =
+  Options.hsubparser
+    ( Options.command
+        "login"
+        (Options.info (serverCommandParser loginParser) $ Options.progDesc "Authenticate with the server")
+        <> Options.command
+          "logout"
+          (Options.info (serverCommandParser logoutParser) $ Options.progDesc "End the current session")
+        <> Options.command
+          "begin"
+          (Options.info (serverCommandParser beginParser) $ Options.progDesc "Begin a transaction")
+        <> Options.command
+          "commit"
+          (Options.info (serverCommandParser commitParser) $ Options.progDesc "Commit a transaction")
+        <> Options.command
+          "rollback"
+          (Options.info (serverCommandParser rollbackParser) $ Options.progDesc "Roll back a transaction")
+        <> Options.command
+          "list-transactions"
+          ( Options.info (serverCommandParser listTransactionsParser) $
+              Options.progDesc "List uncommitted transactions"
+          )
+        <> Options.command
+          "view"
+          (Options.info (serverCommandParser viewParser) $ Options.progDesc "View a resource")
+        <> Options.command
+          "list"
+          (Options.info (serverCommandParser listParser) $ Options.progDesc "List resources of a specific type")
+        <> Options.command
+          "create"
+          (Options.info (serverCommandParser createParser) $ Options.progDesc "Create an empty resource")
+        <> Options.command
+          "create-all"
+          (Options.info (serverCommandParser createAllParser) $ Options.progDesc "Create multiple resources")
+        <> Options.command
+          "update"
+          (Options.info (serverCommandParser updateParser) $ Options.progDesc "Update a resource")
+        <> Options.command
+          "edit"
+          (Options.info (serverCommandParser editParser) $ Options.progDesc "Edit a resource")
+        <> Options.command
+          "refresh-all"
+          (Options.info (serverCommandParser refreshAllParser) $ Options.progDesc "Mark resources as changed")
+        <> Options.command
+          "import"
+          (Options.info (serverCommandParser importParser) $ Options.progDesc "Import an archive")
+        <> Options.command
+          "seed-user"
+          (Options.info (LocalCommand <$> seedUserParser) $ Options.progDesc "Generate a user locally")
+    )
   where
     loginParser =
       pure Login
@@ -375,64 +404,68 @@ main :: IO ()
 main = do
   cli <- Options.execParser $ Options.info (cliParser <**> Options.helper) Options.fullDesc
 
-  let baseUrl = cliBaseUrl cli
+  case cli of
+    ServerCommand serverEnv command -> do
+      let baseUrl = serverBaseUrl serverEnv
 
-  mCertificateStore <-
-    case cliCaCert cli of
-      Nothing -> pure Nothing
-      Just caCert -> do
-        mStore <- readCertificateStore caCert
-        case mStore of
-          Nothing -> do
-            putStrLn $ "error: failed to read CA certificate from " ++ caCert
-            exitFailure
-          Just store -> pure $ Just store
-  manager <- httpManager mCertificateStore
+      mCertificateStore <-
+        case serverCaCert serverEnv of
+          Nothing -> pure Nothing
+          Just caCert -> do
+            mStore <- readCertificateStore caCert
+            case mStore of
+              Nothing -> do
+                putStrLn $ "error: failed to read CA certificate from " ++ caCert
+                exitFailure
+              Just store -> pure $ Just store
+      manager <- httpManager mCertificateStore
 
-  mSessionId <- getSessionId
+      mSessionId <- getSessionId
 
-  case cliCommand cli of
-    Login ->
-      login baseUrl manager
-    Logout ->
-      logout baseUrl manager mSessionId
-    Begin defer ->
-      begin baseUrl manager mSessionId defer
-    Commit xactId ->
-      commit baseUrl manager mSessionId $ fromString xactId
-    Rollback xactId ->
-      rollback baseUrl manager mSessionId $ fromString xactId
-    ListTransactions ->
-      listTransactions baseUrl manager mSessionId
-    View viewTarget resourceId -> do
-      resourceId' <- parseResourceId resourceId
-      view baseUrl manager mSessionId viewTarget resourceId'
-    List resourceTyName ->
-      list baseUrl manager mSessionId resourceTyName
-    Create mXactId mSrcFile properties resourceId -> do
-      let mXactId' = fmap fromString mXactId
-      resourceId' <- parseResourceId resourceId
-      properties' <- parseProperties properties
-      create baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
-    CreateAll mXactId srcDir resTy -> do
-      let mXactId' = fmap fromString mXactId
-      resTy' <- parseName resTy
-      createAll baseUrl manager mSessionId mXactId' srcDir resTy'
-    Update mXactId mSrcFile properties resourceId -> do
-      let mXactId' = fmap fromString mXactId
-      resourceId' <- parseResourceId resourceId
-      properties' <- parseProperties properties
-      update baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
-    Edit mXactId resourceId -> do
-      let mXactId' = fmap fromString mXactId
-      resourceId' <- parseResourceId resourceId
-      edit baseUrl manager mSessionId mXactId' resourceId'
-    RefreshAll resTy ->
-      refreshAll baseUrl manager mSessionId resTy
-    Import path ->
-      import_ baseUrl manager mSessionId path
-    SeedUser dir ->
-      seedUser dir
+      case command of
+        Login ->
+          login baseUrl manager
+        Logout ->
+          logout baseUrl manager mSessionId
+        Begin defer ->
+          begin baseUrl manager mSessionId defer
+        Commit xactId ->
+          commit baseUrl manager mSessionId $ fromString xactId
+        Rollback xactId ->
+          rollback baseUrl manager mSessionId $ fromString xactId
+        ListTransactions ->
+          listTransactions baseUrl manager mSessionId
+        View viewTarget resourceId -> do
+          resourceId' <- parseResourceId resourceId
+          view baseUrl manager mSessionId viewTarget resourceId'
+        List resourceTyName ->
+          list baseUrl manager mSessionId resourceTyName
+        Create mXactId mSrcFile properties resourceId -> do
+          let mXactId' = fmap fromString mXactId
+          resourceId' <- parseResourceId resourceId
+          properties' <- parseProperties properties
+          create baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
+        CreateAll mXactId srcDir resTy -> do
+          let mXactId' = fmap fromString mXactId
+          resTy' <- parseName resTy
+          createAll baseUrl manager mSessionId mXactId' srcDir resTy'
+        Update mXactId mSrcFile properties resourceId -> do
+          let mXactId' = fmap fromString mXactId
+          resourceId' <- parseResourceId resourceId
+          properties' <- parseProperties properties
+          update baseUrl manager mSessionId mXactId' mSrcFile properties' resourceId'
+        Edit mXactId resourceId -> do
+          let mXactId' = fmap fromString mXactId
+          resourceId' <- parseResourceId resourceId
+          edit baseUrl manager mSessionId mXactId' resourceId'
+        RefreshAll resTy ->
+          refreshAll baseUrl manager mSessionId resTy
+        Import path ->
+          import_ baseUrl manager mSessionId path
+    LocalCommand command ->
+      case command of
+        SeedUser dir ->
+          seedUser dir
 
 -- <https://stackoverflow.com/a/41816183>
 httpManager :: Maybe CertificateStore -> IO Http.Manager
