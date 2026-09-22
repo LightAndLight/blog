@@ -1,6 +1,6 @@
 # Start the server
 run:
-    cabal run blog:blog-server -- \
+    cabal run blog-server:blog-server -- \
       --data .blog-data \
       run \
       --cert tls/localhost.crt \
@@ -13,7 +13,29 @@ format:
 
 # Regenerate cabal2nix files
 cabal2nix:
-    cabal2nix . > blog.nix
+    #! /usr/bin/env bash
+
+    cabals=$(fd -e cabal)
+    for file in $cabals;
+    do
+        pushd $(dirname $file) >/dev/null
+        nix_file="$(basename -s .cabal $file).nix"
+        cabal2nix . >$nix_file
+        echo "Created $nix_file"
+        popd >/dev/null
+    done
+
+# Update license files
+license:
+    #! /usr/bin/env bash
+
+    cabals=$(fd -e cabal)
+    for file in $cabals;
+    do
+        license_file="$(dirname $file)/LICENSE"
+        ln -f -T LICENSE $license_file
+        echo "Created $license_file"
+    done
 
 # Generate a certificate authority
 ca:

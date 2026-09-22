@@ -17,13 +17,20 @@
           inherit system;
           overlays = [
             (final: prev: {
-              haskellPackages = prev.haskellPackages.extend (import ./nix/generated/overlay.nix);
+              haskellPackages =
+                let
+                  generated = prev.haskellPackages.extend (import ./nix/generated/overlay.nix);
+                in
+                  generated.extend (hfinal: hprev: {
+                    blog-lib = hprev.callPackage ./lib/blog-lib.nix {};
+                  });
             })
           ];
         };
       in {
         packages.haskellPackages = pkgsHs.haskellPackages;
-        packages.blog = (pkgsHs.haskellPackages.callPackage ./blog.nix {}).overrideAttrs (old: {
+        packages.blog-cli = pkgsHs.haskellPackages.callPackage ./cli/blog-cli.nix {};
+        packages.blog-server = (pkgsHs.haskellPackages.callPackage ./server/blog-server.nix {}).overrideAttrs (old: {
           # TODO: enable tests
           #
           # The test suite uses Cabal to build `blog-server`, and then runs the

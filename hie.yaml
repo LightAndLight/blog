@@ -1,25 +1,25 @@
 cradle:
   cabal:
-    - path: "./src"
-      component: "lib:blog"
+    - path: "./cli/app/Main.hs"
+      component: "blog-cli:exe:blog"
 
-    - path: "./cli/Main.hs"
-      component: "blog:exe:blog"
+    - path: "./lib/src"
+      component: "lib:blog-lib"
 
-    - path: "./server-lib"
-      component: "blog:lib:blog-server-lib"
+    - path: "./server/src"
+      component: "lib:blog-server"
 
-    - path: "./server/Main.hs"
-      component: "blog:exe:blog-server"
+    - path: "./server/app/Main.hs"
+      component: "blog-server:exe:blog-server"
 
-    - path: "./server/Blog/Route.hs"
-      component: "blog:exe:blog-server"
+    - path: "./server/app/Blog/Route.hs"
+      component: "blog-server:exe:blog-server"
 
-    - path: "./server/Blog/Rules.hs"
-      component: "blog:exe:blog-server"
+    - path: "./server/app/Blog/Rules.hs"
+      component: "blog-server:exe:blog-server"
 
-    - path: "./server/Blog/Time.hs"
-      component: "blog:exe:blog-server"
+    - path: "./server/app/Blog/Time.hs"
+      component: "blog-server:exe:blog-server"
 
-    - path: "./test"
-      component: "blog:test:blog-server-tests"
+    - path: "./server/test"
+      component: "blog-server:test:blog-server-tests"

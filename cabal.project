@@ -1,5 +1,8 @@
-packages: .
 tests: True
+packages:
+  ./lib
+  ./cli
+  ./server
 
 --- BEGIN HDEPS ---
 
