@@ -41,6 +41,7 @@ import Blog.Template
   , bytestringValue
   , fields
   , inferBindings
+  , intValue
   , loadTemplate
   , mkEvalEnv
   , optionalValue
@@ -880,15 +881,13 @@ metadataValue VFalse = boolValue False
 metadataValue (VString s) = textValue s
 metadataValue (VDatetime y m d hour minute second) =
   recordValue
-    [ (fromString "year", stringValue . padZero 4 $ show y)
-    , (fromString "month", stringValue . padZero 2 $ show m)
-    , (fromString "day", stringValue . padZero 2 $ show d)
-    , (fromString "hour", stringValue . padZero 2 $ show hour)
-    , (fromString "minute", stringValue . padZero 2 $ show minute)
-    , (fromString "second", stringValue . padZero 2 $ show second)
+    [ (fromString "year", intValue y)
+    , (fromString "month", intValue m)
+    , (fromString "day", intValue d)
+    , (fromString "hour", intValue hour)
+    , (fromString "minute", intValue minute)
+    , (fromString "second", intValue second)
     ]
-  where
-    padZero n str = replicate (max 0 (n - length str)) '0' ++ str
 metadataValue (VList items) = List $ metadataValue <$> items
 metadataValue (VConstructor name args) = Constructor name $ metadataValue <$> args
 metadataValue (VRecord record) = recordValue $ (fmap . fmap) metadataValue record

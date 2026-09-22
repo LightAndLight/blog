@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
@@ -15,6 +16,7 @@ module Blog.Template
 
     -- * Values and fields
   , boolValue
+  , intValue
   , stringValue
   , textValue
   , bytestringValue
@@ -54,6 +56,7 @@ import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
+import Data.Int (Int64)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -62,7 +65,9 @@ import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
+import Data.Time.Format (TimeLocale (months), defaultTimeLocale)
 import Data.Traversable (for)
+import GHC.Stack (HasCallStack)
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
 
@@ -138,25 +143,25 @@ builtins =
         , Temple.VFn . Temple.Fn $
             \case
               [Temple.VRecord datetime]
-                | Just (Temple.VString y) <- Map.lookup (fromString "year") datetime
-                , Just (Temple.VString m) <- Map.lookup (fromString "month") datetime
-                , Just (Temple.VString d) <- Map.lookup (fromString "day") datetime
-                , Just (Temple.VString hour) <- Map.lookup (fromString "hour") datetime
-                , Just (Temple.VString minute) <- Map.lookup (fromString "minute") datetime
-                , Just (Temple.VString second) <- Map.lookup (fromString "second") datetime ->
-                    Temple.VString $
-                      y
-                        <> fromString "-"
-                        <> m
-                        <> fromString "-"
-                        <> d
-                        <> fromString "T"
-                        <> hour
-                        <> fromString ":"
-                        <> minute
-                        <> fromString ":"
-                        <> second
-                        <> fromString "Z"
+                | Just (Temple.VInt y) <- Map.lookup (fromString "year") datetime
+                , Just (Temple.VInt m) <- Map.lookup (fromString "month") datetime
+                , Just (Temple.VInt d) <- Map.lookup (fromString "day") datetime
+                , Just (Temple.VInt hour) <- Map.lookup (fromString "hour") datetime
+                , Just (Temple.VInt minute) <- Map.lookup (fromString "minute") datetime
+                , Just (Temple.VInt second) <- Map.lookup (fromString "second") datetime ->
+                    Temple.VString . fromString $
+                      padZero 4 (show y)
+                        ++ "-"
+                        ++ padZero 2 (show m)
+                        ++ "-"
+                        ++ padZero 2 (show d)
+                        ++ "T"
+                        ++ padZero 2 (show hour)
+                        ++ ":"
+                        ++ padZero 2 (show minute)
+                        ++ ":"
+                        ++ padZero 2 (show second)
+                        ++ "Z"
               _ -> undefined
         )
       )
@@ -167,27 +172,34 @@ builtins =
         , Temple.VFn . Temple.Fn $
             \case
               [Temple.VRecord datetime]
-                | Just (Temple.VString y) <- Map.lookup (fromString "year") datetime
-                , Just (Temple.VString m) <- Map.lookup (fromString "month") datetime
-                , Just (Temple.VString d) <- Map.lookup (fromString "day") datetime
-                , Just (Temple.VString _hour) <- Map.lookup (fromString "hour") datetime
-                , Just (Temple.VString _minute) <- Map.lookup (fromString "minute") datetime
-                , Just (Temple.VString _second) <- Map.lookup (fromString "second") datetime ->
-                    Temple.VString $ y <> fromString "-" <> m <> fromString "-" <> d
+                | Just (Temple.VInt y) <- Map.lookup (fromString "year") datetime
+                , Just (Temple.VInt m) <- Map.lookup (fromString "month") datetime
+                , Just (Temple.VInt d) <- Map.lookup (fromString "day") datetime
+                , Just (Temple.VInt _hour) <- Map.lookup (fromString "hour") datetime
+                , Just (Temple.VInt _minute) <- Map.lookup (fromString "minute") datetime
+                , Just (Temple.VInt _second) <- Map.lookup (fromString "second") datetime ->
+                    Temple.VString . fromString $
+                      show d
+                        ++ " "
+                        ++ (fst $ months defaultTimeLocale !! (fromIntegral m - 1))
+                        ++ ", "
+                        ++ show y
               _ -> undefined
         )
       )
     ]
   where
     datetimeTy =
-      Temple.TRecord $
-        Temple.TRecordField (fromString "year") Temple.TString $
-          Temple.TRecordField (fromString "month") Temple.TString $
-            Temple.TRecordField (fromString "day") Temple.TString $
-              Temple.TRecordField (fromString "hour") Temple.TString $
-                Temple.TRecordField (fromString "minute") Temple.TString $
-                  Temple.TRecordField (fromString "second") Temple.TString $
-                    Temple.TRowEnd
+      Temple.TRecord
+        $ Temple.TRecordField (fromString "year") Temple.TInt
+          . Temple.TRecordField (fromString "month") Temple.TInt
+          . Temple.TRecordField (fromString "day") Temple.TInt
+          . Temple.TRecordField (fromString "hour") Temple.TInt
+          . Temple.TRecordField (fromString "minute") Temple.TInt
+          . Temple.TRecordField (fromString "second") Temple.TInt
+        $ Temple.TRowEnd
+
+    padZero n str = replicate (max 0 $ n - length str) '0' ++ str
 
 mkInferEnv ::
   (Temple.TemplateRef -> m (Maybe ByteString)) ->
@@ -273,6 +285,20 @@ instance Monad m => Semigroup (Fields m) where
 boolValue :: Bool -> Value m
 boolValue True = Value Temple.CTrue Temple.TBool
 boolValue False = Value Temple.CFalse Temple.TBool
+
+intValue :: (HasCallStack, Integral a) => a -> Value m
+intValue n =
+  let
+    nInteger :: Integer
+    nInteger = fromIntegral n
+
+    !n64
+      | fromIntegral (minBound :: Int64) <= nInteger
+      , nInteger <= fromIntegral (maxBound :: Int64) =
+          fromIntegral n :: Int64
+      | otherwise = error $ show nInteger ++ " exceeds the bounds of Int64"
+  in
+    Value (Temple.CInt n64) Temple.TInt
 
 stringValue :: String -> Value m
 stringValue value =
