@@ -105,6 +105,6 @@
     type = "github";
     owner = "LightAndLight";
     repository = "tomlin";
-    commit = "960c53dec9d914e242be5ac62a6397fda54900b1";
+    commit = "9e2f30038abc2ab73013abce152c7db0396e6514";
   };
 }
