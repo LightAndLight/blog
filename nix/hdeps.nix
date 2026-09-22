@@ -99,12 +99,12 @@
     type = "github";
     owner = "LightAndLight";
     repository = "temple";
-    commit = "cb93db52d28e372e0d8a9f01f6acddc01c74da3d";
+    commit = "bfaea4d87bd30940bb3841d94f4abfc7115f4d12";
   };
   tomlin = {
     type = "github";
     owner = "LightAndLight";
     repository = "tomlin";
-    commit = "f47093874bc4932b8eaf296d8de89ca467515e11";
+    commit = "960c53dec9d914e242be5ac62a6397fda54900b1";
   };
 }

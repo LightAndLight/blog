@@ -50,11 +50,11 @@ source-repository-package
 source-repository-package
   type: git
   location: https://github.com/LightAndLight/temple.git
-  tag: cb93db52d28e372e0d8a9f01f6acddc01c74da3d
+  tag: bfaea4d87bd30940bb3841d94f4abfc7115f4d12
 
 source-repository-package
   type: git
   location: https://github.com/LightAndLight/tomlin.git
-  tag: f47093874bc4932b8eaf296d8de89ca467515e11
+  tag: 960c53dec9d914e242be5ac62a6397fda54900b1
 
 --- END HDEPS ---

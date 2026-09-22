@@ -83,6 +83,9 @@ tomlErrorReport err =
     Toml.ExpectedString offset ->
       One $
         Diagnostic.emit (Diagnostic.Offset offset) Diagnostic.Caret (fromString "expected a string")
+    Toml.ExpectedDatetime offset ->
+      One $
+        Diagnostic.emit (Diagnostic.Offset offset) Diagnostic.Caret (fromString "expected a datetime")
     Toml.StringParseError offset string err' ->
       More
         (Diagnostic.emit (Diagnostic.Offset offset) Diagnostic.Caret (fromString "parse error in string"))

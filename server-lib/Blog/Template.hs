@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE LambdaCase #-}
 
 module Blog.Template
   ( -- * Loading and rendering templates
@@ -7,6 +8,10 @@ module Blog.Template
   , renderTemplate
   , parseTemplate
   , inferBindings
+
+    -- ** Environment with blog-specific builtins
+  , mkInferEnv
+  , mkEvalEnv
 
     -- * Values and fields
   , boolValue
@@ -84,7 +89,7 @@ inferBindings ::
   Temple.Template Temple.Offset ->
   m (Map Temple.TemplateRef Temple.Core, [Temple.Binding], Temple.Core)
 inferBindings readTemplateRef renderTemplateRef getTemplateRef (location, input) inputRef template = do
-  result <- runExceptT $ Temple.inferBindings readTemplateRef inputRef template
+  result <- runExceptT $ Temple.inferBindings (mkInferEnv readTemplateRef inputRef) template
   case result of
     Right x -> pure x
     Left err -> do
@@ -123,6 +128,80 @@ loadTemplate readTemplateRef renderTemplateRef iTemplate = do
     inputTemplateRef
     template'
 
+builtins :: Map Text (Temple.TypeScheme, Temple.Value)
+builtins =
+  Map.fromList
+    [
+      ( fromString "iso8601"
+      ,
+        ( Temple.Forall [] $ Temple.TFn [datetimeTy] Temple.TString
+        , Temple.VFn . Temple.Fn $
+            \case
+              [Temple.VRecord datetime]
+                | Just (Temple.VString y) <- Map.lookup (fromString "year") datetime
+                , Just (Temple.VString m) <- Map.lookup (fromString "month") datetime
+                , Just (Temple.VString d) <- Map.lookup (fromString "day") datetime
+                , Just (Temple.VString hour) <- Map.lookup (fromString "hour") datetime
+                , Just (Temple.VString minute) <- Map.lookup (fromString "minute") datetime
+                , Just (Temple.VString second) <- Map.lookup (fromString "second") datetime ->
+                    Temple.VString $
+                      y
+                        <> fromString "-"
+                        <> m
+                        <> fromString "-"
+                        <> d
+                        <> fromString "T"
+                        <> hour
+                        <> fromString ":"
+                        <> minute
+                        <> fromString ":"
+                        <> second
+                        <> fromString "Z"
+              _ -> undefined
+        )
+      )
+    ,
+      ( fromString "display-datetime"
+      ,
+        ( Temple.Forall [] $ Temple.TFn [datetimeTy] Temple.TString
+        , Temple.VFn . Temple.Fn $
+            \case
+              [Temple.VRecord datetime]
+                | Just (Temple.VString y) <- Map.lookup (fromString "year") datetime
+                , Just (Temple.VString m) <- Map.lookup (fromString "month") datetime
+                , Just (Temple.VString d) <- Map.lookup (fromString "day") datetime
+                , Just (Temple.VString _hour) <- Map.lookup (fromString "hour") datetime
+                , Just (Temple.VString _minute) <- Map.lookup (fromString "minute") datetime
+                , Just (Temple.VString _second) <- Map.lookup (fromString "second") datetime ->
+                    Temple.VString $ y <> fromString "-" <> m <> fromString "-" <> d
+              _ -> undefined
+        )
+      )
+    ]
+  where
+    datetimeTy =
+      Temple.TRecord $
+        Temple.TRecordField (fromString "year") Temple.TString $
+          Temple.TRecordField (fromString "month") Temple.TString $
+            Temple.TRecordField (fromString "day") Temple.TString $
+              Temple.TRecordField (fromString "hour") Temple.TString $
+                Temple.TRecordField (fromString "minute") Temple.TString $
+                  Temple.TRecordField (fromString "second") Temple.TString $
+                    Temple.TRowEnd
+
+mkInferEnv ::
+  (Temple.TemplateRef -> m (Maybe ByteString)) ->
+  Temple.TemplateRef ->
+  Temple.InferEnv m
+mkInferEnv readTemplateRef currentTemplate = env{Temple.ieScope = fmap fst builtins <> Temple.ieScope env}
+  where
+    env = (Temple.defaultInferEnv readTemplateRef currentTemplate)
+
+mkEvalEnv :: Map Temple.TemplateRef Temple.Core -> Temple.EvalEnv
+mkEvalEnv deps = env{Temple.eeScope = fmap snd builtins <> Temple.eeScope env}
+  where
+    env = Temple.defaultEvalEnv deps
+
 renderTemplate ::
   MonadIO m =>
   ResourceInput m ByteString ->
@@ -156,7 +235,7 @@ renderTemplate iTemplate values = do
         ("(" ++ renderResourceId (resourceInputId iTemplate) ++ ")")
         (provideBinding readTemplateRef currentTemplate binding values)
 
-  pure $ Temple.evalTemplate (Temple.defaultEvalEnv deps) template'' bindings'
+  pure $ Temple.evalTemplate (mkEvalEnv deps) template'' bindings'
 
 data Part
   = PField Text

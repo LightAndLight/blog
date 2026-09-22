@@ -42,6 +42,7 @@ import Blog.Template
   , fields
   , inferBindings
   , loadTemplate
+  , mkEvalEnv
   , optionalValue
   , parseTemplate
   , provideBinding
@@ -53,7 +54,7 @@ import Blog.Template
   , textValue
   )
 import Blog.Time (renderUTCTime)
-import Control.Applicative (many, (<|>))
+import Control.Applicative (many)
 import Control.Monad (unless, (<=<))
 import Control.Monad.Error.Class (MonadError, throwError)
 import Control.Monad.IO.Class (MonadIO, liftIO)
@@ -81,7 +82,6 @@ import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (UTCTime (..), getCurrentTime)
-import Data.Time.Format.ISO8601 (iso8601ParseM)
 import Data.Traversable (for)
 import qualified Data.Tuple as Tuple
 import qualified Temple
@@ -323,6 +323,8 @@ renderMetadataPath [] = ""
 renderMetadataPath (Metadata.PIndex ix : rest) = "[" ++ show ix ++ "]" ++ renderMetadataPath rest
 
 renderMetadataDecodeError :: Metadata.DecodeError -> String
+renderMetadataDecodeError (Metadata.DecodeError [] err) =
+  err
 renderMetadataDecodeError (Metadata.DecodeError path err) =
   renderMetadataPath path ++ ": " ++ err
 
@@ -379,28 +381,8 @@ optionalMetadata input name decoder =
     Nothing ->
       pure Nothing
 
-requirePublished ::
-  Monad m =>
-  Build.ResourceInput m a ->
-  Build.ActionT m UTCTime
-requirePublished input = do
-  published <- requireMetadata input (fromString "published") Metadata.text
-  case parseDateTime published <|> parseDate published of
-    Just x -> pure x
-    Nothing ->
-      throwError . DiagnosticSimple $
-        "("
-          ++ renderResourceId (Build.resourceInputId input)
-          ++ ":metadata:published): invalid date: "
-          ++ Text.unpack published
-  where
-    parseDateTime :: Text -> Maybe UTCTime
-    parseDateTime = iso8601ParseM . Text.unpack
-
-    parseDate :: Text -> Maybe UTCTime
-    parseDate x = do
-      day <- iso8601ParseM $ Text.unpack x
-      pure $ UTCTime day 0
+requirePublished :: Monad m => Build.ResourceInput m a -> Build.ActionT m UTCTime
+requirePublished input = requireMetadata input (fromString "published") Metadata.utcTime
 
 articleAdjacency ::
   MonadIO m =>
@@ -761,7 +743,7 @@ loadMarkdown input = do
           ("(" ++ renderResourceId (Build.resourceInputId input) ++ ")")
           $ provideTypeScheme readTemplateRef currentTemplateRef name (Temple.Forall [] ty) trackedResourceValue
 
-      let env = Temple.defaultEvalEnv mempty
+      let env = mkEvalEnv mempty
       let env' = env{Temple.eeScope = Map.singleton name (Temple.evalCore env providedCore)}
       pure . LazyText.toStrict . Text.Lazy.Encoding.decodeUtf8 . Temple.valueString $
         Temple.evalCore env' core
@@ -804,7 +786,7 @@ loadMarkdown input = do
       pure
         . LazyText.toStrict
         . Text.Lazy.Encoding.decodeUtf8
-        $ Temple.evalTemplate (Temple.defaultEvalEnv deps) template' bindings'
+        $ Temple.evalTemplate (mkEvalEnv deps) template' bindings'
 
     removeMetadata :: Pandoc -> Pandoc
     removeMetadata =
@@ -896,6 +878,17 @@ metadataValue :: Monad m => MetadataValue -> Value m
 metadataValue VTrue = boolValue True
 metadataValue VFalse = boolValue False
 metadataValue (VString s) = textValue s
+metadataValue (VDatetime y m d hour minute second) =
+  recordValue
+    [ (fromString "year", stringValue . padZero 4 $ show y)
+    , (fromString "month", stringValue . padZero 2 $ show m)
+    , (fromString "day", stringValue . padZero 2 $ show d)
+    , (fromString "hour", stringValue . padZero 2 $ show hour)
+    , (fromString "minute", stringValue . padZero 2 $ show minute)
+    , (fromString "second", stringValue . padZero 2 $ show second)
+    ]
+  where
+    padZero n str = replicate (max 0 (n - length str)) '0' ++ str
 metadataValue (VList items) = List $ metadataValue <$> items
 metadataValue (VConstructor name args) = Constructor name $ metadataValue <$> args
 metadataValue (VRecord record) = recordValue $ (fmap . fmap) metadataValue record

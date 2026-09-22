@@ -15,6 +15,7 @@ module Blog.Metadata
   , runMetadataValueDecoder
   , list
   , text
+  , utcTime
   , value
 
     -- ** Errors
@@ -50,7 +51,12 @@ import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
 import qualified Data.Text.Lazy as LazyText
+import qualified Data.Text.Lazy.Builder as Data.Text.Builder
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
+import Data.Time.Calendar.MonthDay (monthAndDayToDayOfYear)
+import Data.Time.Calendar.OrdinalDate (fromOrdinalDate, isLeapYear)
+import Data.Time.Clock (UTCTime (..))
+import Data.Time.LocalTime (TimeOfDay (..), timeOfDayToTime)
 import qualified Toml
 
 data MetadataKeyRequirement
@@ -118,6 +124,9 @@ renderMetadataValueToml (VString s) =
     escape '"' = fromString "\\\""
     escape '\n' = fromString "\\n"
     escape c = Text.Lazy.Encoding.encodeUtf8 $ LazyText.singleton c
+renderMetadataValueToml (VDatetime y m d hour minute second) =
+  Text.Lazy.Encoding.encodeUtf8 . Data.Text.Builder.toLazyText $
+    Toml.datetimePrinter (Toml.Datetime y m d hour minute second)
 renderMetadataValueToml (VList xs) =
   fromString "["
     <> fold (intersperse (fromString ", ") (fmap renderMetadataValueToml xs))
@@ -149,6 +158,7 @@ metadataValueFromToml Toml.VTrue = VTrue
 metadataValueFromToml Toml.VFalse = VFalse
 metadataValueFromToml (Toml.VString s) = VString s
 metadataValueFromToml Toml.VInt{} = error "TODO: support TOML numbers"
+metadataValueFromToml (Toml.VDatetime (Toml.Datetime y m d hour minute second)) = VDatetime y m d hour minute second
 metadataValueFromToml (Toml.VArray xs) = VList $ fmap (metadataValueFromToml . Toml.locatedValue) xs
 metadataValueFromToml (Toml.VRecord fields) =
   let
@@ -191,6 +201,19 @@ text =
       case val of
         VString s -> pure s
         _ -> Left $ DecodeError path "not a string"
+
+utcTime :: MetadataValueDecoder UTCTime
+utcTime =
+  MetadataValueDecoder $
+    \path val ->
+      case val of
+        VDatetime y m d hour minute second ->
+          pure $
+            UTCTime
+              (fromOrdinalDate y $ monthAndDayToDayOfYear (isLeapYear y) m d)
+              (timeOfDayToTime $ TimeOfDay hour minute $ fromIntegral second)
+        _ ->
+          Left $ DecodeError path "not a datetime"
 
 value :: MetadataValueDecoder MetadataValue
 value = MetadataValueDecoder $ \_path -> pure

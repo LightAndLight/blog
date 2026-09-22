@@ -2,6 +2,7 @@
 run:
     cabal run blog:blog-server -- \
       --data .blog-data \
+      run \
       --cert tls/localhost.crt \
       --key tls/localhost.key \
       --port 8080

@@ -25,7 +25,6 @@ module Blog
   , MetadataType (..)
   , metadataTypeDecoder
   , MetadataValue (..)
-  , metadataValueString
   )
 where
 
@@ -172,6 +171,7 @@ data MetadataConfig
 data MetadataType
   = TBool
   | TString
+  | TDatetime
   | TList MetadataType
   | TRecord [(Text, MetadataType)]
   deriving (Show)
@@ -213,6 +213,7 @@ metadataTypeParser :: Sage.Parser MetadataType
 metadataTypeParser =
   TBool <$ Sage.string (fromString "bool")
     <|> TString <$ Sage.string (fromString "string")
+    <|> TDatetime <$ Sage.string (fromString "datetime")
     <|> TList <$ Sage.string (fromString "list") <* Sage.char '(' <*> metadataTypeParser <* Sage.char ')'
     <|> TRecord
       <$ Sage.string (fromString "record")
@@ -226,18 +227,29 @@ data MetadataValue
   = VTrue
   | VFalse
   | VString !Text
+  | VDatetime
+      -- | Year
+      !Integer
+      -- | Month
+      !Int
+      -- | Day
+      !Int
+      -- | Hour
+      !Int
+      -- | Minute
+      !Int
+      -- | Second
+      !Int
   | VList ![MetadataValue]
   | VConstructor !Text ![MetadataValue]
   | VRecord ![(Text, MetadataValue)]
   deriving (Show, Eq)
 
-metadataValueString :: HasCallStack => MetadataValue -> Text
-metadataValueString (VString s) = s
-metadataValueString v = error $ "not a string: " ++ show v
-
 metadataTypeDecoder :: MetadataType -> Toml.ValueDecoder MetadataValue
 metadataTypeDecoder TBool = (\b -> if b then VTrue else VFalse) <$> Toml.bool
 metadataTypeDecoder TString = VString <$> Toml.text
+metadataTypeDecoder TDatetime =
+  (\(Toml.Datetime y m d hour minute second) -> VDatetime y m d hour minute second) <$> Toml.datetime
 metadataTypeDecoder (TList ty) = fmap VList . Toml.list $ metadataTypeDecoder ty
 metadataTypeDecoder (TRecord fields) =
   VRecord

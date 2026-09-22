@@ -35,5 +35,5 @@ mkDerivation {
     process temporary text tls
   ];
   doHaddock = false;
-  license = lib.licenses.gpl3Only;
+  license = lib.meta.getLicenseFromSpdxId "GPL-3.0-only";
 }
