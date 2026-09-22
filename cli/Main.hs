@@ -11,6 +11,8 @@ import Blog
   , renderResourceId
   , resourceIdParser
   )
+import Blog.Diagnostic (DiagnosticReports (..), renderDiagnosticReports)
+import Blog.Error (tomlErrorReport)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
 import Blog.Password (defaultHashOptions, hashPassword)
@@ -81,6 +83,7 @@ import qualified Text.Sage as Sage
 import qualified Toml
 import Web.FormUrlEncoded (urlEncodeAsFormStable)
 import Web.HttpApiData (ToHttpApiData (..))
+import Prelude hiding (init)
 
 data Cli
   = ServerCommand !ServerEnv !ServerCommand
@@ -93,7 +96,7 @@ data ViewTarget
 
 data ServerEnv
   = ServerEnv
-  { serverBaseUrl :: !String
+  { serverBaseUrl :: !(Maybe String)
   -- ^ Base URL of blog server
   , serverCaCert :: !(Maybe FilePath)
   -- ^ CA certificate
@@ -158,15 +161,21 @@ data ServerCommand
       FilePath
 
 data LocalCommand
-  = SeedUser
+  = Init
+  | SeedUser
       -- | Directory in which to create the user
       FilePath
 
 serverEnvParser :: Options.Parser ServerEnv
 serverEnvParser =
   ServerEnv
-    <$> Options.strOption
-      (Options.long "base" <> Options.metavar "URL" <> Options.help "Blog server base URL")
+    <$> optional
+      ( Options.strOption
+          ( Options.long "base"
+              <> Options.metavar "URL"
+              <> Options.help "Blog server base URL (default: config.base-url)"
+          )
+      )
     <*> optional
       ( Options.strOption $
           Options.long "cacert" <> Options.metavar "FILE" <> Options.help "TLS CA certificate"
@@ -179,8 +188,11 @@ cliParser :: Options.Parser Cli
 cliParser =
   Options.hsubparser
     ( Options.command
-        "login"
-        (Options.info (serverCommandParser loginParser) $ Options.progDesc "Authenticate with the server")
+        "init"
+        (Options.info (LocalCommand <$> initParser) $ Options.progDesc "Set up local blog config")
+        <> Options.command
+          "login"
+          (Options.info (serverCommandParser loginParser) $ Options.progDesc "Authenticate with the server")
         <> Options.command
           "logout"
           (Options.info (serverCommandParser logoutParser) $ Options.progDesc "End the current session")
@@ -227,6 +239,9 @@ cliParser =
           (Options.info (LocalCommand <$> seedUserParser) $ Options.progDesc "Generate a user locally")
     )
   where
+    initParser =
+      pure Init
+
     loginParser =
       pure Login
 
@@ -406,7 +421,20 @@ main = do
 
   case cli of
     ServerCommand serverEnv command -> do
-      let baseUrl = serverBaseUrl serverEnv
+      configHome <- getConfigHome
+      mConfig <- lookupConfig $ configHome </> configFileName
+
+      baseUrl <-
+        case fmap configBaseUrl mConfig of
+          Just x -> do
+            putStrLn $ "base-url: " ++ x ++ "\n"
+            pure x
+          Nothing ->
+            case serverBaseUrl serverEnv of
+              Nothing -> do
+                putStrLn "error: missing server base URL"
+                exitFailure
+              Just x -> pure x
 
       mCertificateStore <-
         case serverCaCert serverEnv of
@@ -466,6 +494,8 @@ main = do
       case command of
         SeedUser dir ->
           seedUser dir
+        Init ->
+          init
 
 -- <https://stackoverflow.com/a/41816183>
 httpManager :: Maybe CertificateStore -> IO Http.Manager
@@ -614,6 +644,18 @@ getDataHome = do
       Nothing -> do
         home <- requireEnv "HOME"
         pure $ home </> ".local" </> "share"
+  pure $ dir </> "blog"
+
+getConfigHome :: IO FilePath
+getConfigHome = do
+  mDataHome <- lookupEnv "XDG_CONFIG_HOME"
+  dir <-
+    case mDataHome of
+      Just dataHome ->
+        pure dataHome
+      Nothing -> do
+        home <- requireEnv "HOME"
+        pure $ home </> ".config"
   pure $ dir </> "blog"
 
 resourceIdHeaders :: ResourceId -> RequestHeaders
@@ -1312,3 +1354,83 @@ seedUser dir = do
     hashPassword defaultHashOptions (ByteString.pack $ ID.toBytes salt) (fromString password)
 
   putStrLn $ "created " ++ file
+
+data Config
+  = Config
+  { configBaseUrl :: !String
+  }
+
+configFileName :: String
+configFileName = "config.toml"
+
+configDecoder :: Toml.Decoder Config
+configDecoder =
+  Config
+    <$> Toml.key (fromString "base-url") Toml.string
+
+lookupConfig :: FilePath -> IO (Maybe Config)
+lookupConfig configPath = do
+  mResult <-
+    fmap Just (Toml.load configPath configDecoder)
+      `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+  case mResult of
+    Nothing ->
+      pure Nothing
+    Just (Left err) -> do
+      contents <- LazyByteString.readFile configPath
+      ByteString.Lazy.Char8.putStrLn . renderDiagnosticReports $
+        DiagnosticReports (fromString configPath) contents (tomlErrorReport err)
+      exitFailure
+    Just (Right config) ->
+      pure $ Just config
+
+init :: IO ()
+init = do
+  configHome <- getConfigHome
+  let configPath = configHome </> configFileName
+  mResult <-
+    fmap Just (Toml.load configPath configDecoder)
+      `catch` \err -> if isDoesNotExistError err then pure Nothing else throwIO err
+
+  case mResult of
+    Nothing ->
+      pure ()
+    Just (Left err) -> do
+      contents <- LazyByteString.readFile configPath
+      ByteString.Lazy.Char8.putStrLn . renderDiagnosticReports $
+        DiagnosticReports (fromString configPath) contents (tomlErrorReport err)
+
+      promptOverwrite configPath
+    Just (Right _config) ->
+      promptOverwrite configPath
+
+  config <- promptConfig
+
+  createDirectoryIfMissing True configHome
+  LazyByteString.writeFile configPath $ renderConfig config
+
+  putStrLn $ "Wrote config to " ++ configPath
+  where
+    promptOverwrite path = do
+      putStr (path ++ " already exists. Overwrite? (y/n) ") <* hFlush stdout
+
+      let
+        loop = do
+          line <- getLine
+          case line of
+            "y" -> pure ()
+            "n" -> exitFailure
+            _ -> loop
+
+      loop
+
+    promptConfig = do
+      putStr ("Server base URL: ") <* hFlush stdout
+      baseUrl <- getLine
+
+      pure Config{configBaseUrl = baseUrl}
+
+    -- TODO: add TOML rendering to `tomlin`.
+    renderConfig :: Config -> LazyByteString
+    renderConfig (Config baseUrl) =
+      fromString "base-url = \"" <> fromString baseUrl <> fromString "\"\n"

@@ -15,6 +15,8 @@ library
     import:           warnings
     exposed-modules:
         Blog
+        Blog.Diagnostic
+        Blog.Error
         Blog.ID
         Blog.Password
         Blog.Session
@@ -23,7 +25,10 @@ library
         base ^>=4.20.2.0,
         bytestring,
         containers,
+        diagnostica,
+        diagnostica-sage,
         entropy,
+        mtl,
         sage,
         temple,
         text >=2.0,
@@ -69,8 +74,6 @@ library blog-server-lib
     hs-source-dirs:   server-lib
     exposed-modules:
         Blog.Build
-        Blog.Diagnostic
-        Blog.Error
         Blog.Metadata
         Blog.Pandoc
         Blog.Store

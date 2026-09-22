@@ -38,12 +38,14 @@ module Blog.Template
   , providerErrorDiagnostic
   , Part (..)
   , renderProviderPath
+  , templeTypeErrorMessage
+  , templeTypeErrorReport
   ) where
 
 import Blog (ResourceId (..), renderName, renderResourceId, resourceName, resourceType, unsafeName)
 import Blog.Build (ActionT, ResourceInput (..), resourceInputId)
 import Blog.Diagnostic (DiagnosticReports (..), Reports (..))
-import Blog.Error (sageErrorReport, templeTypeErrorMessage, templeTypeErrorReport)
+import Blog.Error (sageErrorReport)
 import qualified Blog.Store as Store
 import Control.Applicative ((<|>))
 import Control.Monad (guard, (<=<))
@@ -57,6 +59,7 @@ import Data.ByteString (ByteString)
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import Data.Int (Int64)
+import Data.List (intercalate)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -70,6 +73,7 @@ import Data.Traversable (for)
 import GHC.Stack (HasCallStack)
 import qualified Temple
 import qualified Text.Diagnostic as Diagnostic
+import qualified Text.Diagnostic.Sage
 
 parseTemplate ::
   MonadError DiagnosticReports m => String -> ByteString -> m (Temple.Template Temple.Offset)
@@ -525,3 +529,123 @@ providerErrorDiagnostic renderTemplateRef getTemplateRef location err =
     TypeError path err' ->
       pure . DiagnosticSimple $
         location ++ ": " ++ renderProviderPath path ++ ": " ++ templeTypeErrorMessage err'
+
+templeTypeErrorMessage ::
+  Temple.TypeError loc ->
+  String
+templeTypeErrorMessage err =
+  case err of
+    Temple.NotInScope _loc ->
+      "not in scope"
+    Temple.TypeMismatch _loc expected actual ->
+      "expected " ++ Temple.renderType expected ++ ", got " ++ Temple.renderType actual
+    Temple.UnexpectedFields _loc fields ->
+      "unexpected fields: " ++ renderFields fields
+    Temple.MissingFields _loc fields ->
+      "missing fields: " ++ renderFields fields
+    Temple.UnexpectedConstructors _loc ctors ->
+      "unexpected constructors: " ++ renderConstructors ctors
+    Temple.MissingConstructors _loc ctors ->
+      "missing constructors: " ++ renderConstructors ctors
+    Temple.ArityMismatch _loc expected actual ->
+      "expected " ++ show expected ++ plural expected " argument" ++ ", got " ++ show actual
+    Temple.KindMismatch _loc expected actual ->
+      "expected kind " ++ Temple.renderKind expected ++ ", got " ++ Temple.renderKind actual
+    Temple.NotRequirement _loc name ->
+      "'" ++ Text.unpack name ++ "' is not a requirement"
+    Temple.BlockBadRequirementType _loc ty ->
+      "block cannot satisfy requirement of type " ++ Temple.renderType ty
+    Temple.RequirementAlreadySatisfied _loc ->
+      "requirement already satisfied"
+    Temple.FileNotFound _loc ->
+      "file not found"
+    Temple.ParentParseError _loc _file _parseError ->
+      "parse error in parent"
+    Temple.ParentTypeError _loc _file _typeError ->
+      "type error in parent"
+    Temple.IncludeDisabled _loc ->
+      "includes are disabled"
+    Temple.IncludeParseError _loc _file _parseError ->
+      "parse error in include"
+    Temple.IncludeTypeError _loc _file _typeError ->
+      "type error in include"
+    Temple.NotParam _loc ->
+      "not a parameter"
+    Temple.ParamAlreadyBound _loc ->
+      "parameter already bound"
+  where
+    plural n word = if n == 1 then word else word ++ "s"
+
+    renderFields =
+      intercalate ", " . fmap (\(name, ty) -> Text.unpack name ++ " : " ++ Temple.renderType ty)
+
+    renderConstructors =
+      intercalate ", "
+        . fmap
+          (\(name, tys) -> Text.unpack name ++ "(" ++ intercalate ", " (fmap Temple.renderType tys) ++ ")")
+
+templeTypeErrorReport ::
+  Monad m =>
+  (Temple.TemplateRef -> String) ->
+  (Temple.TemplateRef -> m ByteString) ->
+  Temple.TypeError Temple.Offset ->
+  m Reports
+templeTypeErrorReport renderTemplateRef loadTemplateRef err =
+  let
+    simple e = pure . One $ emit (Temple.typeErrorLoc e) (templeTypeErrorMessage err)
+  in
+    case err of
+      Temple.NotInScope{} ->
+        simple err
+      Temple.TypeMismatch{} ->
+        simple err
+      Temple.UnexpectedFields{} ->
+        simple err
+      Temple.MissingFields{} ->
+        simple err
+      Temple.UnexpectedConstructors{} ->
+        simple err
+      Temple.MissingConstructors{} ->
+        simple err
+      Temple.ArityMismatch{} ->
+        simple err
+      Temple.KindMismatch{} ->
+        simple err
+      Temple.NotRequirement{} ->
+        simple err
+      Temple.BlockBadRequirementType{} ->
+        simple err
+      Temple.RequirementAlreadySatisfied{} ->
+        simple err
+      Temple.FileNotFound{} ->
+        simple err
+      Temple.ParentParseError loc file parseError ->
+        inResource loc (templeTypeErrorMessage err) file . One $
+          Text.Diagnostic.Sage.parseError parseError
+      Temple.ParentTypeError loc file typeError ->
+        inResource loc (templeTypeErrorMessage err) file
+          =<< templeTypeErrorReport renderTemplateRef loadTemplateRef typeError
+      Temple.IncludeDisabled{} ->
+        simple err
+      Temple.IncludeParseError loc file parseError ->
+        inResource loc (templeTypeErrorMessage err) file . One $
+          Text.Diagnostic.Sage.parseError parseError
+      Temple.IncludeTypeError loc file typeError ->
+        inResource loc (templeTypeErrorMessage err) file
+          =<< templeTypeErrorReport renderTemplateRef loadTemplateRef typeError
+      Temple.NotParam{} ->
+        simple err
+      Temple.ParamAlreadyBound{} ->
+        simple err
+  where
+    emit loc =
+      Diagnostic.emit (Diagnostic.Offset $ Temple.getOffset loc) Diagnostic.Caret . fromString
+
+    inResource loc message ref reports = do
+      contents <- loadTemplateRef ref
+      pure $
+        More
+          (emit loc message)
+          (fromString $ renderTemplateRef ref)
+          (LazyByteString.fromStrict contents)
+          reports
