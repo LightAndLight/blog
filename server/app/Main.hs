@@ -578,6 +578,9 @@ app store routesVar request respond = do
         (ByteString.Char8.unpack . renderQuery True $ Wai.queryString request)
       Log.attach (fromString "method") (ByteString.Char8.unpack $ Wai.requestMethod request)
       Log.attach
+        (fromString "referer")
+        (ByteString.Char8.unpack <$> Wai.requestHeaderReferer request)
+      Log.attach
         (fromString "user-agent")
         (ByteString.Char8.unpack <$> Wai.requestHeaderUserAgent request)
       Log.attach
