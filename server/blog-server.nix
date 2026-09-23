@@ -1,8 +1,8 @@
-{ mkDerivation, argon2, async, barbies, base, base16-bytestring
-, blog-lib, bytestring, containers, cookie, cryptohash-sha256
-, crypton-connection, crypton-x509-store, diagnostica
-, diagnostica-sage, directory, exceptions, filepath, hedgehog
-, hspec, hspec-hedgehog, http-api-data, http-client
+{ mkDerivation, aeson, argon2, async, barbies, base
+, base16-bytestring, blog-lib, bytestring, containers, cookie
+, cryptohash-sha256, crypton-connection, crypton-x509-store
+, diagnostica, diagnostica-sage, directory, exceptions, filepath
+, hedgehog, hspec, hspec-hedgehog, http-api-data, http-client
 , http-client-tls, http-types, lib, mmorph, mtl
 , optparse-applicative, pandoc, pandoc-types, process, sage, stm
 , tar, temple, temporary, text, text-short, time, tls, tomlin
@@ -15,10 +15,10 @@ mkDerivation {
   isLibrary = true;
   isExecutable = true;
   libraryHaskellDepends = [
-    base base16-bytestring blog-lib bytestring containers
+    aeson base base16-bytestring blog-lib bytestring containers
     cryptohash-sha256 diagnostica diagnostica-sage directory exceptions
-    filepath mtl pandoc pandoc-types sage tar temple text time tomlin
-    transformers
+    filepath mmorph mtl pandoc pandoc-types sage tar temple text time
+    tomlin transformers
   ];
   executableHaskellDepends = [
     argon2 base blog-lib bytestring containers cookie directory

@@ -16,6 +16,7 @@ library
     hs-source-dirs:   src
     exposed-modules:
         Blog.Build
+        Blog.Log
         Blog.Metadata
         Blog.Pandoc
         Blog.Store
@@ -23,6 +24,7 @@ library
         Blog.Template
         IO
     build-depends:
+        aeson,
         base ^>=4.20.2.0,
         base16-bytestring,
         blog-lib,
@@ -34,6 +36,7 @@ library
         directory,
         exceptions,
         filepath,
+        mmorph,
         mtl,
         pandoc >=3.8 && <3.11,
         pandoc-types,

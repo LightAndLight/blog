@@ -46,7 +46,6 @@ module Blog.Build
   , askStore
   , askTransactionId
   , setDependencies
-  , trace
 
     -- * Internals
   , resourcePatternsOverlap
@@ -72,7 +71,7 @@ import qualified Blog.Store as Store
 import Control.Monad (guard, unless, when)
 import Control.Monad.Error.Class (MonadError, liftEither, throwError)
 import Control.Monad.Except (ExceptT, runExceptT)
-import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Reader (ReaderT, runReaderT)
 import Control.Monad.Reader.Class (asks, local)
 import Control.Monad.State.Class (get)
@@ -106,23 +105,20 @@ runRule ::
   -- | Changes
   Set ResourceId ->
   ActionT m ()
-runRule (Rule name inputs outputs f) changes = do
-  InputTuples headers _olds news <- queryInputs inputs changes
+runRule (Rule _name inputs outputs f) changes = do
+  InputTuples _headers _olds news <- queryInputs inputs changes
   unless (null news) $ do
-    trace $ "begin " ++ name
     traverse_
       ( \tuple -> do
-          let age = inputTupleAge tuple
+          let _age = inputTupleAge tuple
           let reasons = inputTupleReasons tuple
           let bindings = inputTupleBindings tuple
           let input' = inputTupleValue tuple
 
-          trace $ show (age, reasons, headers, bindings)
           outputs' <- makeOutput bindings outputs
           withReasons reasons $ f input' outputs'
       )
       news
-    trace $ "end " ++ name
 
 withReasons :: Monad m => [Reason] -> ActionT m a -> ActionT m a
 withReasons rs (ActionT ma) = ActionT $ local (\env -> env{aeReasons = rs}) ma
@@ -136,8 +132,7 @@ instance MonadTrans ActionT where
 
 data ActionEnv m
   = ActionEnv
-  { aeTrace :: !(String -> IO ())
-  , aeStore :: !(Store (ActionT m))
+  { aeStore :: !(Store (ActionT m))
   , aeTransactionId :: !TransactionId
   , aeReasons :: ![Reason]
   }
@@ -156,19 +151,16 @@ instance Monoid ActionSummary where
 
 runActionT ::
   (MonadError DiagnosticReports m, MonadIO m) =>
-  -- | Trace
-  (String -> IO ()) ->
   Store m ->
   TransactionId ->
   -- | Why the action was triggered
   [Reason] ->
   ActionT m a ->
   m ([ResourceId], Map ResourceId Change, a)
-runActionT fTrace store transactionId reasons (ActionT ma) = do
+runActionT store transactionId reasons (ActionT ma) = do
   let env =
         ActionEnv
-          { aeTrace = fTrace
-          , aeStore = hoistStore lift store
+          { aeStore = hoistStore lift store
           , aeTransactionId = transactionId
           , aeReasons = reasons
           }
@@ -181,11 +173,6 @@ askStore = ActionT $ asks aeStore
 
 askTransactionId :: Monad m => ActionT m TransactionId
 askTransactionId = ActionT $ asks aeTransactionId
-
-trace :: MonadIO m => String -> ActionT m ()
-trace s = ActionT $ do
-  f <- asks aeTrace
-  liftIO $ f s
 
 setDependencies :: MonadIO m => ResourceId -> Set ResourceId -> ActionT m ()
 setDependencies a bs = do
@@ -209,8 +196,6 @@ setDependencies a bs = do
 
 putResource :: MonadIO m => ResourceId -> LazyByteString -> ActionT m ()
 putResource resId@(ResourceId resTyName resName) content = do
-  trace $ "putResource: " ++ renderResourceId resId
-
   store <- askStore
   transactionId <- askTransactionId
 
@@ -844,15 +829,13 @@ resourceIdPatternMatches (ResourceIdPattern resTyName resNamePattern) (ResourceI
 evalRules ::
   forall m.
   (MonadError DiagnosticReports m, MonadIO m) =>
-  -- | Trace
-  (String -> IO ()) ->
   Store m ->
   TransactionId ->
   Rules m ->
   -- | The created/updated resources
   [ResourceId] ->
   m (Map ResourceId Change)
-evalRules fTrace store transactionId (Rules rs) resIds = do
+evalRules store transactionId (Rules rs) resIds = do
   execWriterT . flip evalStateT (Set.fromList resIds) $ do
     dependents <- lift . lift . for resIds $ \resId -> do
       resTy <- Store.getResourceType store (Just transactionId) $ resourceType resId
@@ -881,7 +864,7 @@ evalRules fTrace store transactionId (Rules rs) resIds = do
       let (r, _, _) = fromVertex vertex
       changedResources <- get
       (changedResources', changes, ()) <-
-        lift . lift . runActionT fTrace store transactionId [] $
+        lift . lift . runActionT store transactionId [] $
           runRule r changedResources
       dependents <-
         lift . lift $

@@ -1359,6 +1359,7 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
 
   sortedPosts <- sortPosts iArticlesWithExcerpts iNotes
 
+  -- TODO: this could actually be the max of all inputs' `updated` properties.
   now <- liftIO getCurrentTime
 
   output <-
