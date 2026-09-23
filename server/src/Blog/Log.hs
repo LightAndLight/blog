@@ -21,7 +21,7 @@ where
 import Control.Monad (unless)
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow)
 import Control.Monad.Except (ExceptT (..))
-import Control.Monad.IO.Class (MonadIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Morph (MFunctor, hoist)
 import Control.Monad.State.Strict (StateT, get, modify, put, runStateT)
 import Control.Monad.Trans.Class (MonadTrans, lift)
@@ -30,7 +30,9 @@ import qualified Data.Aeson as Json
 import qualified Data.Aeson.Key as Key
 import qualified Data.Aeson.KeyMap as KeyMap
 import Data.ByteString.Lazy (LazyByteString)
+import Data.String (fromString)
 import Data.Text (Text)
+import Data.Time.Clock (getCurrentTime)
 
 -- TODO: ideally we wouldn't use `aeson` for this (it's such a heavy dependency),
 -- but we already depend on it for `pandoc` so might as well.
@@ -49,14 +51,16 @@ newtype LogT m a = LogT (StateT ([(Json.Object, Text)], Json.Object) m a)
   deriving (Functor, Applicative, Monad, MonadIO, MonadTrans, MonadThrow, MonadCatch, MonadMask)
 
 runLogT ::
-  Monad m =>
+  MonadIO m =>
   -- | How to emit a log item
   (LazyByteString -> m ()) ->
   LogT m a ->
   m a
 runLogT emit (LogT ma) = do
+  now <- liftIO getCurrentTime
   (a, (_stack, obj)) <- runStateT ma mempty
-  unless (KeyMap.null obj) . emit $ Json.encode obj
+  unless (KeyMap.null obj) $ do
+    emit $ Json.encode (KeyMap.insert (fromString "timestamp") (Json.toJSON now) obj)
   pure a
 
 instance Monad m => MonadLog (LogT m) where
