@@ -572,7 +572,9 @@ app ::
 app store routesVar request respond = do
   runLogT (liftIO . ByteString.Lazy.Char8.putStrLn) . handleT respond $ do
     Log.scope (fromString "request") $ do
-      Log.attach (fromString "path") (foldMap (fromString "/" <>) $ Wai.pathInfo request)
+      Log.attach
+        (fromString "path")
+        (fromString "/" <> Text.intercalate (fromString "/") (Wai.pathInfo request))
       Log.attach
         (fromString "query")
         (ByteString.Char8.unpack . renderQuery True $ Wai.queryString request)
