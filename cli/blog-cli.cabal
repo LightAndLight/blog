@@ -15,6 +15,7 @@ executable blog
     import:           warnings
     hs-source-dirs:   app
     main-is:          Main.hs
+    other-modules:    Paths_blog_cli
     build-depends:
         base ^>=4.20.2.0,
         blog-lib,

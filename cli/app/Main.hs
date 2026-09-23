@@ -41,17 +41,19 @@ import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import Data.Time.Clock (getCurrentTime)
 import Data.Time.Format (defaultTimeLocale, formatTime, rfc822DateFormat)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
+import Data.Version (showVersion)
 import Data.X509.CertificateStore (CertificateStore, readCertificateStore)
 import GHC.Stack (HasCallStack)
 import Network.Connection (TLSSettings (..))
 import qualified Network.HTTP.Client as Http
 import Network.HTTP.Client.TLS (tlsManagerSettings)
 import qualified Network.HTTP.Client.TLS as Http.Tls
-import Network.HTTP.Types.Header (RequestHeaders, hContentType, hIfUnmodifiedSince)
+import Network.HTTP.Types.Header (RequestHeaders, hContentType, hIfUnmodifiedSince, hUserAgent)
 import Network.HTTP.Types.Status (statusCode, unauthorized401)
 import qualified Network.TLS as Tls
 import Network.TLS.Extra.Cipher (ciphersuite_default)
 import qualified Options.Applicative as Options
+import qualified Paths_blog_cli
 import System.Directory
   ( createDirectoryIfMissing
   , doesDirectoryExist
@@ -527,6 +529,9 @@ unexpected x = error $ "unexpected response: " ++ show x
 getResponseCookies :: Http.Response body -> [Http.Cookie]
 getResponseCookies = Http.destroyCookieJar . Http.responseCookieJar
 
+userAgent :: ByteString
+userAgent = fromString $ "blog-cli/" ++ showVersion Paths_blog_cli.version
+
 httpWithCookies ::
   Http.Manager ->
   [Http.Cookie] ->
@@ -544,7 +549,7 @@ httpWithCookies manager cookies url method headers body = do
       request
         { Http.cookieJar = Just $ Http.createCookieJar cookies
         , Http.method = method
-        , Http.requestHeaders = headers
+        , Http.requestHeaders = (hUserAgent, userAgent) : headers
         , Http.requestBody = Http.RequestBodyLBS body
         }
   response <- Http.httpLbs request manager
