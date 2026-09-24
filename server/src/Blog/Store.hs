@@ -77,6 +77,7 @@ import Blog
   , resourceConfigDecoder
   , resourceIdToPath
   , unsafeName
+  , utctimeMetadataValue
   )
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
@@ -121,7 +122,7 @@ import Data.String (fromString)
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
-import Data.Time.Clock (UTCTime)
+import Data.Time.Clock (UTCTime, getCurrentTime)
 import Data.Traversable (for)
 import GHC.Stack (HasCallStack, callStack, getCallStack, prettySrcLoc)
 import IO (WithCallStack (..))
@@ -748,9 +749,16 @@ resourceTypeFromDirectory storeDir mXactId resTyName config =
 
       let changed = mOldHash /= Just newHash
       when changed $ do
+        now <- liftIO getCurrentTime
+
         liftIO $ overlayWriteFile overlay (nameToPath resName) body
         _changed <-
           setProperty self resName (unsafeName "sha256") $ VString (Text.Encoding.decodeUtf8 newHash)
+        unless exists $ do
+          _changed <- setProperty self resName (unsafeName "created") $ utctimeMetadataValue now
+          pure ()
+        _changed <- setProperty self resName (unsafeName "updated") $ utctimeMetadataValue now
+
         mMetadata <- extractMetadata resTyName config resName body
         for_ mMetadata $ updateMetadata resName
 

@@ -25,6 +25,7 @@ module Blog
   , MetadataType (..)
   , metadataTypeDecoder
   , MetadataValue (..)
+  , utctimeMetadataValue
   )
 where
 
@@ -34,6 +35,10 @@ import Data.Map (Map)
 import Data.Maybe (fromMaybe, isJust)
 import Data.String (fromString)
 import Data.Text (Text)
+import Data.Time.Calendar.MonthDay (dayOfYearToMonthAndDay)
+import Data.Time.Calendar.OrdinalDate (isLeapYear, toOrdinalDate)
+import Data.Time.Clock (UTCTime (..))
+import Data.Time.LocalTime (TimeOfDay (..), timeToTimeOfDay)
 import GHC.Stack (HasCallStack)
 import qualified Temple
 import qualified Text.Sage as Sage
@@ -244,6 +249,15 @@ data MetadataValue
   | VConstructor !Text ![MetadataValue]
   | VRecord ![(Text, MetadataValue)]
   deriving (Show, Eq)
+
+utctimeMetadataValue :: UTCTime -> MetadataValue
+utctimeMetadataValue (UTCTime day diffTime) =
+  let
+    (y, dayOfYear) = toOrdinalDate day
+    (m, d) = dayOfYearToMonthAndDay (isLeapYear y) dayOfYear
+    TimeOfDay hour minute second = timeToTimeOfDay diffTime
+  in
+    VDatetime y m d hour minute (truncate second)
 
 metadataTypeDecoder :: MetadataType -> Toml.ValueDecoder MetadataValue
 metadataTypeDecoder TBool = (\b -> if b then VTrue else VFalse) <$> Toml.bool
