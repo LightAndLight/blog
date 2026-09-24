@@ -32,7 +32,7 @@ import qualified Data.Char as Char
 import Data.Foldable (for_)
 import Data.Functor.Classes (Eq1)
 import Data.Kind (Type)
-import Data.List (find, sort, stripPrefix)
+import Data.List (find, isInfixOf, sort)
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Maybe (isJust, isNothing, listToMaybe)
@@ -73,6 +73,7 @@ import System.IO (hClose, hGetContents)
 import System.IO.Temp (createTempDirectory, getCanonicalTemporaryDirectory)
 import System.Process (callProcess, createProcess, readProcess, terminateProcess, waitForProcess)
 import qualified System.Process as Process
+import System.Timeout (timeout)
 import qualified Test.Blog.Store.Overlay
 import Test.Hspec (Spec, describe, hspec, it, runIO)
 import Test.Hspec.Hedgehog (hedgehog)
@@ -284,6 +285,7 @@ spec = do
                   blogServerPath
                   [ "--data"
                   , dataDir
+                  , "run"
                   , "--cert"
                   , "tls/localhost.crt"
                   , "--key"
@@ -306,12 +308,23 @@ spec = do
                 liftIO . async $ do
                   let path = tmpDir </> "stdout"
                   contents <- hGetContents hStdout
-                  case filter (isJust . stripPrefix "Running at") $ lines contents of
-                    _ : _ ->
-                      putMVar readyVar $ Right ()
-                    [] ->
+                  mComplete <- timeout (10 * 1000000) $
+                    case filter (isInfixOf "startup-complete") $ lines contents of
+                      _ : _ ->
+                        putMVar readyVar $ Right ()
+                      [] ->
+                        putMVar readyVar . Left $
+                          "missing log start phrase (got: " ++ show contents ++ ") (logs stored in " ++ tmpDir ++ ")"
+                  case mComplete of
+                    Nothing ->
                       putMVar readyVar . Left $
-                        "missing log start phrase (got: " ++ show contents ++ ") (logs stored in " ++ tmpDir ++ ")"
+                        "timed out waiting for log start phrase (got: "
+                          ++ show contents
+                          ++ ") (logs stored in "
+                          ++ tmpDir
+                          ++ ")"
+                    Just () ->
+                      pure ()
                   writeFile path contents
                   hClose hStdout
           stderrThread <-
@@ -332,9 +345,9 @@ spec = do
               wait stderrThread
 
           result <- liftIO $ takeMVar readyVar
-          either error pure result
 
           hoist (`finally` cleanup) $ do
+            either error pure result
             runReaderT (executeSequential state cs) manager
 
           liftIO $ removeDirectoryRecursive tmpDir
