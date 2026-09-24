@@ -58,7 +58,7 @@ import Blog.Time (renderUTCTime)
 import Control.Applicative (many)
 import Control.Monad (unless, (<=<))
 import Control.Monad.Error.Class (MonadError, throwError)
-import Control.Monad.IO.Class (MonadIO, liftIO)
+import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans.Class (lift)
 import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT)
 import Control.Monad.Writer.Class (tell)
@@ -66,7 +66,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
-import Data.Foldable (fold, for_)
+import Data.Foldable (fold, foldlM, for_)
 import Data.Functor ((<&>))
 import Data.List (find, sortOn)
 import Data.Map (Map)
@@ -82,7 +82,8 @@ import qualified Data.Text as Text
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
-import Data.Time.Clock (UTCTime (..), getCurrentTime)
+import Data.Time.Clock (UTCTime (..))
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Data.Traversable (for)
 import qualified Data.Tuple as Tuple
 import qualified Temple
@@ -1341,8 +1342,19 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
 
   sortedPosts <- sortPosts iArticlesWithExcerpts iNotes
 
-  -- TODO: this could actually be the max of all inputs' `updated` properties.
-  now <- liftIO getCurrentTime
+  updated <-
+    foldlM
+      ( \acc res -> do
+          mUpdated <- Build.resourceInputProperty res (unsafeName "updated")
+          case mUpdated of
+            Just value
+              | Right updated <- runMetadataValueDecoder Metadata.utcTime [] value ->
+                  pure $ max acc updated
+            _ ->
+              pure acc
+      )
+      (posixSecondsToUTCTime 0)
+      (fmap fst iArticlesWithExcerpts ++ iNotes)
 
   output <-
     renderTemplate iTemplate $
@@ -1353,7 +1365,7 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
           , (fromString "description", textValue description)
           , (fromString "authorName", textValue authorName)
           , (fromString "authorEmail", textValue authorEmail)
-          , (fromString "updated", stringValue $ renderUTCTime now)
+          , (fromString "updated", stringValue $ renderUTCTime updated)
           , (fromString "posts", postsList sortedPosts)
           ]
 
