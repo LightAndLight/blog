@@ -25,6 +25,7 @@ import qualified Blog.ID as ID
 import Blog.Log (LogT, MonadLog, runLogT, (.=))
 import qualified Blog.Log as Log
 import Blog.Metadata (metadataValueFromToml)
+import Blog.Migration (migrate)
 import qualified Blog.Route
 import qualified Blog.Rules
 import Blog.Session (sessionIdCookieName)
@@ -229,6 +230,7 @@ main = do
 
   store <- initStore $ cliData cli
   routesVar <- runLogT ByteString.Lazy.Char8.putStrLn $ initRoutes store
+  runLogT ByteString.Lazy.Char8.putStrLn $ migrate store
 
   case cliCommand cli of
     Run mTls port -> do

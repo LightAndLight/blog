@@ -48,6 +48,7 @@ module Blog.Store
   , readResource
   , writeResource
   , removeResource
+  , getMetadata
   , lookupProperty
   , setProperty
   , readProperty
@@ -83,7 +84,12 @@ import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
 import Blog.ID (ID)
 import qualified Blog.ID as ID
-import Blog.Metadata (metadataValueFromToml, renderMetadataValueToml, resourceMetadataDecoder)
+import Blog.Metadata
+  ( metadataValueFromToml
+  , parseResourceMetadata
+  , renderMetadataValueToml
+  , resourceMetadataDecoder
+  )
 import Blog.Pandoc (markdownReaderOptions, pandoc)
 import Blog.Store.Overlay
   ( Overlay (..)
@@ -115,10 +121,12 @@ import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.Char as Char
 import Data.Foldable (for_, traverse_)
 import Data.List (intercalate)
+import Data.Map (Map)
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe, mapMaybe)
 import Data.Monoid (First (..))
 import qualified Data.Set as Set
 import Data.String (fromString)
+import Data.Text (Text)
 import qualified Data.Text.Encoding as Text.Encoding
 import qualified Data.Text.Lazy as LazyText
 import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
@@ -909,6 +917,24 @@ writeResource = writeResourceImpl
 -- | Precondition: the resource is writeable (see 'lookupResourceType')
 removeResource :: HasCallStack => ResourceType m -> Name -> m ()
 removeResource = removeResourceImpl
+
+getMetadata ::
+  MonadError DiagnosticReports m =>
+  ResourceType m ->
+  -- | Resource name
+  Name ->
+  m (Map Text MetadataValue)
+getMetadata resTy resName = do
+  mContent <- readProperty resTy resName (unsafeName "metadata")
+  case mContent of
+    Nothing ->
+      pure mempty
+    Just content ->
+      parseResourceMetadata
+        (resourceTypeConfig resTy)
+        (resourceTypeName resTy)
+        resName
+        content
 
 readProperty :: ResourceType m -> Name -> Name -> m (Maybe ByteString)
 readProperty = readPropertyImpl

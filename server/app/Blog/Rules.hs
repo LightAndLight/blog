@@ -26,7 +26,7 @@ import Blog.Build ((*<))
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
-import Blog.Metadata (MetadataValueDecoder, parseResourceMetadata, runMetadataValueDecoder)
+import Blog.Metadata (MetadataValueDecoder, runMetadataValueDecoder)
 import qualified Blog.Metadata as Metadata
 import Blog.Pandoc (htmlWriterOptions, markdownReaderOptions, pandoc)
 import Blog.Route (RouteEntry (..), renderRouteEntry)
@@ -804,24 +804,6 @@ loadMarkdown input = do
 renderHtml :: MonadError DiagnosticReports m => Pandoc -> m Text
 renderHtml = pandoc . Pandoc.writeHtml5String htmlWriterOptions
 
-loadMetadata ::
-  MonadError DiagnosticReports m =>
-  Store.ResourceType m ->
-  -- | Resource name
-  Name ->
-  m (Map Text MetadataValue)
-loadMetadata resTy resName = do
-  mContent <- Store.readProperty resTy resName (unsafeName "metadata")
-  case mContent of
-    Nothing ->
-      pure mempty
-    Just content ->
-      parseResourceMetadata
-        (Store.resourceTypeConfig resTy)
-        (Store.resourceTypeName resTy)
-        resName
-        content
-
 -- TODO: should this be a separate rule? Is there a way to maintain dependencies inside `articleHtml`?
 markdownDependency ::
   forall m.
@@ -855,7 +837,7 @@ getAdjacency iAdjacency = do
       xactId <- Build.askTransactionId
 
       resTy <- Store.getResourceType store (Just xactId) resTyName
-      metadata <- loadMetadata resTy resName
+      metadata <- Store.getMetadata resTy resName
       let
         requireString name =
           case Map.lookup (fromString name) metadata of
@@ -974,7 +956,7 @@ resourceValue liftAction track =
                   mFormat <- Store.lookupProperty resTy (textToName resName) (unsafeName "content-format")
                   pure $ formatContent mFormat content
           )
-          (liftAction $ loadMetadata resTy (textToName resName))
+          (liftAction $ Store.getMetadata resTy (textToName resName))
           (liftAction . Store.lookupProperty resTy (textToName resName))
 
 articleHtml ::

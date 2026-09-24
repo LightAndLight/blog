@@ -53,6 +53,7 @@ executable blog-server
     import:           warnings
     main-is:          Main.hs
     other-modules:
+        Blog.Migration
         Blog.Route
         Blog.Rules
         Blog.Time
