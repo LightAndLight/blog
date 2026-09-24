@@ -427,16 +427,16 @@ main = do
       mConfig <- lookupConfig $ configHome </> configFileName
 
       baseUrl <-
-        case fmap configBaseUrl mConfig of
-          Just x -> do
-            putStrLn $ "base-url: " ++ x ++ "\n"
-            pure x
+        case serverBaseUrl serverEnv of
+          Just x -> pure x
           Nothing ->
-            case serverBaseUrl serverEnv of
+            case fmap configBaseUrl mConfig of
+              Just x -> do
+                putStrLn $ "base-url: " ++ x ++ "\n"
+                pure x
               Nothing -> do
                 putStrLn "error: missing server base URL"
                 exitFailure
-              Just x -> pure x
 
       mCertificateStore <-
         case serverCaCert serverEnv of
