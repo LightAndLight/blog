@@ -1183,14 +1183,14 @@ postsList sortedPosts =
   List $
     sortedPosts <&> \case
       IndexArticle iArticle _tags miExcerpt ->
-        post (Build.resourceInputMetadata iArticle) . Constructor (fromString "Article") $
+        post iArticle . Constructor (fromString "Article") $
           [ recordValue
               [ (fromString "excerpt", bytestringValue $ Build.resourceInputContent iExcerpt)
               | Just iExcerpt <- [miExcerpt]
               ]
           ]
       IndexNote iNote _tags references html ->
-        post (Build.resourceInputMetadata iNote) . Constructor (fromString "Note") $
+        post iNote . Constructor (fromString "Note") $
           [ recordValue
               [ (fromString "content", textValue html)
               , (fromString "references", metadataValue references)
@@ -1200,13 +1200,15 @@ postsList sortedPosts =
     -- TODO: the `type` property should come from metadata.
     --
     -- Currently blocked on having a good syntax for sum types in metadata.
-    post metadata postType =
-      recordValue
-        [
-          ( fromString "metadata"
-          , Record $ fields [(fromString "type", postType)] <> metadataFields metadata
-          )
-        ]
+    post res postType =
+      Record $
+        fields
+          [
+            ( fromString "metadata"
+            , Record $ fields [(fromString "type", postType)] <> metadataFields (Build.resourceInputMetadata res)
+            )
+          ]
+          <> propertyFields res
 
 indexHtml ::
   MonadIO m =>
