@@ -7,6 +7,10 @@ run:
       --key tls/localhost.key \
       --port 8080
 
+# Run all tests
+test:
+    cabal run all:tests
+
 # Format project
 format:
     fd -e hs | xargs -n 1 -P $(nproc) fourmolu -i -q
