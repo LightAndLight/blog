@@ -3,6 +3,7 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE TypeApplications #-}
 
 module Main (main) where
@@ -26,8 +27,7 @@ import Blog.Log (LogT, MonadLog, runLogT, (.=))
 import qualified Blog.Log as Log
 import Blog.Metadata (metadataValueFromToml)
 import Blog.Migration (migrate)
-import Blog.Route (Entry (..))
-import qualified Blog.Route
+import qualified Blog.Route as Routes
 import qualified Blog.Rules
 import Blog.Session (sessionIdCookieName)
 import Blog.Store (Store)
@@ -73,12 +73,20 @@ import Data.Time.Clock
 import Data.Time.Format (defaultTimeLocale, formatTime, parseTimeM, rfc822DateFormat)
 import Data.Time.Format.ISO8601 (iso8601ParseM, iso8601Show)
 import Data.Traversable (for)
-import Network.HTTP.Types.Header (Header, RequestHeaders, hContentType, hLastModified, hSetCookie)
+import Network.HTTP.Types.Header
+  ( Header
+  , RequestHeaders
+  , hContentType
+  , hLastModified
+  , hLocation
+  , hSetCookie
+  )
 import Network.HTTP.Types.Status
   ( badRequest400
   , created201
   , internalServerError500
   , methodNotAllowed405
+  , movedPermanently301
   , notFound404
   , notImplemented501
   , ok200
@@ -162,15 +170,15 @@ initStore data_ = do
 
 data Routes
   = Routes
-  { routesActive :: TVar Blog.Route.Routes
-  , routesPending :: TVar (Map Store.TransactionId Blog.Route.Routes)
+  { routesActive :: TVar Routes.Routes
+  , routesPending :: TVar (Map Store.TransactionId Routes.Routes)
   }
 
-readActiveRoutes :: Routes -> IO Blog.Route.Routes
+readActiveRoutes :: Routes -> IO Routes.Routes
 readActiveRoutes = readTVarIO . routesActive
 
 beginRoutes :: Routes -> Store.TransactionId -> IO ()
-beginRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.insert xactId Blog.Route.empty)
+beginRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.insert xactId Routes.empty)
 
 commitRoutes :: Routes -> Store.TransactionId -> IO ()
 commitRoutes routes xactId = atomically $ do
@@ -184,16 +192,16 @@ commitRoutes routes xactId = atomically $ do
 rollbackRoutes :: Routes -> Store.TransactionId -> IO ()
 rollbackRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.delete xactId)
 
-insertRoute :: Store.TransactionId -> [Text] -> ResourceId -> Routes -> IO ()
+insertRoute :: Store.TransactionId -> [Text] -> Routes.Entry -> Routes -> IO ()
 insertRoute xactId path value routes =
   atomically $
     modifyTVar
       (routesPending routes)
-      (Map.insertWith (<>) xactId (Blog.Route.singleton path $ EntryResourceId value))
+      (Map.insertWith (<>) xactId (Routes.singleton path value))
 
 initRoutes :: Store (ExceptT DiagnosticReports (LogT IO)) -> LogT IO Routes
 initRoutes store = do
-  routesVar <- liftIO . atomically $ Routes <$> newTVar Blog.Route.empty <*> newTVar mempty
+  routesVar <- liftIO . atomically $ Routes <$> newTVar Routes.empty <*> newTVar mempty
 
   result <- runExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
     mResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "route")
@@ -206,8 +214,8 @@ initRoutes store = do
         for_ entries $ \entry -> do
           mContent <- Store.readResource resTy (resourceName entry)
           content <- maybe (error $ "missing " ++ renderResourceId entry) pure mContent
-          Blog.Route.RouteEntry path resId <-
-            case Sage.parse (Blog.Route.routeEntryParser <* Sage.eof) content of
+          Routes.RouteEntry path resId <-
+            case Sage.parse (Routes.routeEntryParser <* Sage.eof) content of
               Right x ->
                 pure x
               Left err ->
@@ -216,7 +224,7 @@ initRoutes store = do
                     (fromString $ renderResourceId entry)
                     (LazyByteString.fromStrict content)
                     (sageErrorReport err)
-          liftIO $ insertRoute xactId path resId routesVar
+          liftIO $ insertRoute xactId path (Routes.EntryResourceId resId) routesVar
 
   case result of
     Right () ->
@@ -271,13 +279,18 @@ main = do
       runLogT (const $ pure ()) . reportError . withTransaction store routesVar Nothing $ \xactId _defer -> do
         content <- liftIO $ LazyByteString.readFile archivePath
         imported <- Store.import_ store xactId content
-        changes <- evalRules store routesVar xactId imported
+        changes <-
+          evalRules
+            store
+            routesVar
+            xactId
+            [(resId, if existed then Build.Updated else Build.Created) | (resId, existed) <- imported]
 
         let
           response =
             ByteString.Lazy.Char8.unlines $
               fromString "imported resources:"
-                : ( fmap (\resId -> fromString $ "* " <> renderResourceId resId) imported
+                : ( fmap (\(resId, _existed) -> fromString $ "* " <> renderResourceId resId) imported
                       <> if null changes
                         then []
                         else
@@ -376,12 +389,16 @@ withTransaction store _routes (Just xactId) f = do
       =<< Store.lookupTransaction store xactId
   f xactId $ Store.xactDefer transaction
 
-getRouteEntry ::
-  MonadError DiagnosticReports m => Store.ResourceType m -> ResourceId -> m Blog.Route.RouteEntry
-getRouteEntry resTy resId = do
+getEntry ::
+  MonadError DiagnosticReports m =>
+  Store.ResourceType m ->
+  ResourceId ->
+  Sage.Parser a ->
+  m a
+getEntry resTy resId entryParser = do
   mContent <- Store.readResource resTy (resourceName resId)
   content <- maybe (error $ "missing " ++ renderResourceId resId) pure mContent
-  case Sage.parse (Blog.Route.routeEntryParser <* Sage.eof) content of
+  case Sage.parse (entryParser <* Sage.eof) content of
     Right x ->
       pure x
     Left err ->
@@ -396,12 +413,13 @@ evalRules ::
   Store m ->
   Routes ->
   Store.TransactionId ->
-  [ResourceId] ->
+  [(ResourceId, Build.Status)] ->
   m (Map ResourceId Build.Change)
 evalRules store routesVar xactId resIds =
   Log.scope (fromString "eval-rules") $ do
     start <- liftIO getCurrentTime
-    changes <- Build.evalRules store xactId Blog.Rules.rules resIds
+    changes <- Build.evalRules store xactId Blog.Rules.rules $ fmap fst resIds
+    let allChanges = changes <> Map.fromList [(resId, Build.Change status []) | (resId, status) <- resIds]
 
     Log.attach
       (fromString "changes")
@@ -413,7 +431,7 @@ evalRules store routesVar xactId resIds =
                       Build.Created -> "created"
                       Build.Updated -> "updated"
           ]
-      | (resId, change) <- Map.toList changes
+      | (resId, change) <- Map.toList allChanges
       ]
 
     mRouteResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "route")
@@ -422,16 +440,36 @@ evalRules store routesVar xactId resIds =
       Nothing ->
         Log.attach (fromString "missing-resource") "route"
       Just routeResTy ->
-        for_ (Map.toList changes) $ \(changedId, Build.Change status _reasons) ->
+        for_ (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
           case renderName $ resourceType changedId of
             "route" -> do
+              let
+                addRouteEntry = do
+                  Routes.RouteEntry path value <- getEntry routeResTy changedId Routes.routeEntryParser
+                  liftIO $ insertRoute xactId path (Routes.EntryResourceId value) routesVar
+
               case status of
-                Build.Created -> do
-                  Blog.Route.RouteEntry path value <- getRouteEntry routeResTy changedId
-                  liftIO $ insertRoute xactId path value routesVar
-                Build.Updated -> do
-                  Blog.Route.RouteEntry path value <- getRouteEntry routeResTy changedId
-                  liftIO $ insertRoute xactId path value routesVar
+                Build.Created -> addRouteEntry
+                Build.Updated -> addRouteEntry
+            _ -> pure ()
+
+    mRedirectResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "redirect")
+    -- TODO: not sure if this is a good idea
+    case mRedirectResTy of
+      Nothing ->
+        Log.attach (fromString "missing-resource") "redirect"
+      Just redirectResTy ->
+        for_ (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
+          case renderName $ resourceType changedId of
+            "redirect" -> do
+              let
+                addRedirectEntry = do
+                  Routes.RedirectEntry path value <- getEntry redirectResTy changedId Routes.redirectEntryParser
+                  liftIO $ insertRoute xactId path (Routes.EntryRedirect value) routesVar
+
+              case status of
+                Build.Created -> addRedirectEntry
+                Build.Updated -> addRedirectEntry
             _ -> pure ()
 
     end <- liftIO getCurrentTime
@@ -991,7 +1029,7 @@ httpResourceCreate store routesVar request =
                       ]
                   )
             else do
-              changes <- evalRules store routesVar xactId [resId]
+              changes <- evalRules store routesVar xactId [(resId, Build.Created)]
               pure $
                 Wai.responseLBS
                   created201
@@ -1062,7 +1100,7 @@ httpResourceUpdate store routesVar request = do
                           ]
                       )
                 else do
-                  changes <- evalRules store routesVar xactId [resId | changed]
+                  changes <- evalRules store routesVar xactId [(resId, Build.Updated) | changed]
                   pure $
                     Wai.responseLBS
                       ok200
@@ -1123,7 +1161,7 @@ httpResourceTypeRefresh store routesVar request resTyName = do
         pure $ Wai.responseLBS notFound404 [] (fromString "resource not found")
       Just resTy -> do
         entries <- Store.listResource resTy
-        changes <- evalRules store routesVar xactId entries
+        changes <- evalRules store routesVar xactId (fmap (,Build.Updated) entries)
 
         pure $
           Wai.responseLBS
@@ -1186,7 +1224,17 @@ httpTransactionCommit store routesVar request =
       if Store.xactDefer transaction
         then do
           changes <- do
-            let resIds = fmap Store.xactChangeId (Store.xactChanges transaction)
+            let
+              resIds =
+                ( \change ->
+                    ( Store.xactChangeId change
+                    , case Store.xactChange change of
+                        Store.Create -> Build.Created
+                        Store.Update -> Build.Updated
+                        Store.Delete -> error "TODO: handle delete"
+                    )
+                )
+                  <$> Store.xactChanges transaction
             Store.saveDeferred store xactId
             evalRules store routesVar xactId resIds `onException` Store.restoreDeferred store xactId
           commit
@@ -1262,18 +1310,23 @@ httpImport store routesVar request =
           let
             response =
               fromString "imported resources:\n"
-                <> foldMap (\resId -> fromString $ "* " <> renderResourceId resId <> "\n") imported
+                <> foldMap (\(resId, _existed) -> fromString $ "* " <> renderResourceId resId <> "\n") imported
                 <> fromString "(rules deferred)"
 
           pure $ Wai.responseLBS ok200 [] response
         else do
-          changes <- evalRules store routesVar xactId imported
+          changes <-
+            evalRules
+              store
+              routesVar
+              xactId
+              [(resId, if existed then Build.Updated else Build.Created) | (resId, existed) <- imported]
 
           let
             response =
               ByteString.Lazy.Char8.unlines $
                 fromString "imported resources:"
-                  : ( fmap (\resId -> fromString $ "* " <> renderResourceId resId) imported
+                  : ( fmap (\(resId, _existed) -> fromString $ "* " <> renderResourceId resId) imported
                         <> if null changes
                           then []
                           else
@@ -1383,7 +1436,7 @@ httpResourcePropertiesUpdate store routesVar request resTyName resName =
           pure $ Wai.responseLBS ok200 [] response
         else do
           let changed = any snd names
-          changes <- evalRules store routesVar xactId [resId | changed]
+          changes <- evalRules store routesVar xactId [(resId, Build.Updated) | changed]
 
           let
             response =
@@ -1441,10 +1494,10 @@ httpRouteGet store routesVar request path =
 
     handleDiagnosticReports $ do
       routes <- liftIO $ readActiveRoutes routesVar
-      case Blog.Route.lookup path routes of
+      case Routes.lookup path routes of
         Nothing ->
           pure $ Wai.responseLBS notFound404 [] (fromString "not found")
-        Just (EntryResourceId resId) -> do
+        Just (Routes.EntryResourceId resId) -> do
           resTy <- Store.getResourceType store mXactId $ resourceType resId
           mContent <- Store.readResource resTy $ resourceName resId
           case mContent of
@@ -1453,3 +1506,9 @@ httpRouteGet store routesVar request path =
             Just content -> do
               let contentType = Text.Encoding.encodeUtf8 . cfgContentType $ Store.resourceTypeConfig resTy
               pure $ Wai.responseLBS ok200 [(hContentType, contentType)] (LazyByteString.fromStrict content)
+        Just (Routes.EntryRedirect target) -> do
+          pure $
+            Wai.responseLBS
+              movedPermanently301
+              [(hLocation, target), (hContentType, fromString "text/plain")]
+              (fromString "moved to " <> LazyByteString.fromStrict target)

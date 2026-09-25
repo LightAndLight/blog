@@ -569,7 +569,8 @@ import_ ::
   Store m ->
   TransactionId ->
   LazyByteString ->
-  m [ResourceId]
+  -- | @(resource ID, resource already existed)@
+  m [(ResourceId, Bool)]
 import_ store xactId archive = do
   let entries = Tar.decodeLongNames $ Tar.read archive
   Tar.foldEntries
@@ -600,8 +601,9 @@ import_ store xactId archive = do
               let resTyName' = pathToName resTyName
               let resName' = pathToName resName
               resTy <- getResourceType store (Just xactId) resTyName'
+              exists <- doesResourceExist resTy resName'
               _changed <- writeResource resTy resName' content
-              pure . Just $ ResourceId resTyName' resName'
+              pure $ Just (ResourceId resTyName' resName', exists)
             [resTyName, part, propName] | (resName, ":properties") <- break (== ':') part -> do
               let resTyName' = pathToName resTyName
               let resName' = pathToName resName
@@ -636,7 +638,7 @@ import_ store xactId archive = do
 
         case mResourceId of
           Nothing -> rest
-          Just resId -> (resId :) <$> rest
+          Just (resId, existed) -> ((resId, existed) :) <$> rest
     )
     (pure [])
     ( \err -> do
