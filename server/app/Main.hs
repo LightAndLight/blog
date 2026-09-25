@@ -26,6 +26,7 @@ import Blog.Log (LogT, MonadLog, runLogT, (.=))
 import qualified Blog.Log as Log
 import Blog.Metadata (metadataValueFromToml)
 import Blog.Migration (migrate)
+import Blog.Route (Entry (..))
 import qualified Blog.Route
 import qualified Blog.Rules
 import Blog.Session (sessionIdCookieName)
@@ -161,11 +162,11 @@ initStore data_ = do
 
 data Routes
   = Routes
-  { routesActive :: TVar (Blog.Route.Routes ResourceId)
-  , routesPending :: TVar (Map Store.TransactionId (Blog.Route.Routes ResourceId))
+  { routesActive :: TVar Blog.Route.Routes
+  , routesPending :: TVar (Map Store.TransactionId Blog.Route.Routes)
   }
 
-readActiveRoutes :: Routes -> IO (Blog.Route.Routes ResourceId)
+readActiveRoutes :: Routes -> IO Blog.Route.Routes
 readActiveRoutes = readTVarIO . routesActive
 
 beginRoutes :: Routes -> Store.TransactionId -> IO ()
@@ -186,7 +187,9 @@ rollbackRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (M
 insertRoute :: Store.TransactionId -> [Text] -> ResourceId -> Routes -> IO ()
 insertRoute xactId path value routes =
   atomically $
-    modifyTVar (routesPending routes) (Map.insertWith (<>) xactId (Blog.Route.singleton path value))
+    modifyTVar
+      (routesPending routes)
+      (Map.insertWith (<>) xactId (Blog.Route.singleton path $ EntryResourceId value))
 
 initRoutes :: Store (ExceptT DiagnosticReports (LogT IO)) -> LogT IO Routes
 initRoutes store = do
@@ -1441,7 +1444,7 @@ httpRouteGet store routesVar request path =
       case Blog.Route.lookup path routes of
         Nothing ->
           pure $ Wai.responseLBS notFound404 [] (fromString "not found")
-        Just resId -> do
+        Just (EntryResourceId resId) -> do
           resTy <- Store.getResourceType store mXactId $ resourceType resId
           mContent <- Store.readResource resTy $ resourceName resId
           case mContent of

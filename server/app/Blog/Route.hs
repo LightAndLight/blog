@@ -2,6 +2,7 @@
 
 module Blog.Route
   ( Routes
+  , Entry (..)
   , empty
   , null
   , singleton
@@ -33,52 +34,55 @@ import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Text.Sage as Sage
 import Prelude hiding (lookup, null)
 
-data Routes a = Routes !(Maybe a) !(Map Text (Routes a))
+data Routes = Routes !(Maybe Entry) !(Map Text Routes)
 
-instance Semigroup (Routes a) where
+data Entry
+  = EntryResourceId !ResourceId
+
+instance Semigroup Routes where
   rs <> rs' = unionWith (\l _r -> l) rs rs'
 
-instance Monoid (Routes a) where
+instance Monoid Routes where
   mempty = empty
 
-empty :: Routes a
+empty :: Routes
 empty = Routes Nothing mempty
 
-null :: Routes a -> Bool
+null :: Routes -> Bool
 null (Routes root rest) = isNothing root && Map.null rest
 
-singleton :: [Text] -> a -> Routes a
+singleton :: [Text] -> Entry -> Routes
 singleton [] value =
   Routes (Just value) mempty
 singleton (p : ps) value =
   Routes Nothing $ Map.singleton p (singleton ps value)
 
-insert :: forall a. [Text] -> a -> Routes a -> Routes a
+insert :: [Text] -> Entry -> Routes -> Routes
 insert [] value (Routes _ rest) = Routes (Just value) rest
 insert (p : ps) value (Routes root rest) = Routes root (Map.alter f p rest)
   where
-    f :: Maybe (Routes a) -> Maybe (Routes a)
+    f :: Maybe Routes -> Maybe Routes
     f Nothing = Just $ singleton ps value
     f (Just routes) = Just $ insert ps value routes
 
-delete :: [Text] -> Routes a -> Routes a
+delete :: [Text] -> Routes -> Routes
 delete [] (Routes _ rest) = Routes Nothing rest
 delete (p : ps) (Routes root rest) = Routes root (Map.alter f p rest)
   where
-    f :: Maybe (Routes a) -> Maybe (Routes a)
+    f :: Maybe Routes -> Maybe Routes
     f Nothing = Nothing
     f (Just routes) = do
       let routes' = delete ps routes
       guard . not $ null routes'
       pure routes'
 
-lookup :: [Text] -> Routes a -> Maybe a
+lookup :: [Text] -> Routes -> Maybe Entry
 lookup [] (Routes root _) = root
 lookup (p : ps) (Routes _ rest) = do
   routes <- Map.lookup p rest
   lookup ps routes
 
-unionWith :: (a -> a -> a) -> Routes a -> Routes a -> Routes a
+unionWith :: (Entry -> Entry -> Entry) -> Routes -> Routes -> Routes
 unionWith f (Routes root rest) (Routes root' rest') =
   Routes
     ( f <$> root <*> root'
