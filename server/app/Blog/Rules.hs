@@ -1437,6 +1437,7 @@ resourceRoute iContent oRoute = do
   let resTy = Build.resourceInputType iContent
   let resName = resourceName resId
   mUrl <- Store.lookupProperty resTy resName (unsafeName "url")
+  mDraft <- Store.lookupProperty resTy resName (unsafeName "draft")
   for_ mUrl $ \url -> do
     {-
     At first glance it seemed wasteful to parse the `url` property only to
@@ -1459,5 +1460,13 @@ resourceRoute iContent oRoute = do
                   (sageErrorReport err)
         _ ->
           throwError . DiagnosticSimple $ "(" ++ renderResourceId resId ++ ":metadata:url): not a string"
+    let
+      visibility =
+        case mDraft of
+          Nothing -> Routes.Public
+          Just VFalse -> Routes.Public
+          Just VTrue -> Routes.Private
+          -- TODO: decode this properly
+          _ -> error $ show resId ++ "'s 'draft' property is not a bool"
     Build.writeResource oRoute () $
-      renderRouteEntry (RouteEntry path (Build.resourceInputId iContent))
+      renderRouteEntry (RouteEntry visibility path (Build.resourceInputId iContent))

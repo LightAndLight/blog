@@ -11,12 +11,14 @@ module Blog.Route
   , lookup
   , unionWith
   , RouteEntry (..)
+  , Visibility (..)
   , routeEntryParser
   , renderRouteEntry
   , RedirectEntry (..)
   , redirectEntryParser
   , renderRedirectEntry
   , parsePath
+  , renderPath
   )
 where
 
@@ -43,7 +45,9 @@ import Prelude hiding (lookup, null)
 data Routes = Routes !(Maybe Entry) !(Map Text Routes)
 
 data Entry
-  = EntryResourceId !ResourceId
+  = EntryResourceId
+      !Visibility
+      !ResourceId
   | EntryRedirect
       -- | Destination URL
       !ByteString
@@ -102,15 +106,19 @@ unionWith f (Routes root rest) (Routes root' rest') =
 
 data RouteEntry
   = RouteEntry
+      Visibility
       -- | Path
       [Text]
       -- | Target
       ResourceId
 
+data Visibility = Public | Private
+
 routeEntryParser :: Sage.Parser RouteEntry
 routeEntryParser =
   RouteEntry
-    <$> pathParser
+    <$> (Private <$ Sage.string (fromString "private") <* spaces <|> pure Public)
+    <*> pathParser
     <* spaces
     <* Sage.string (fromString "->")
     <* spaces
@@ -120,8 +128,11 @@ routeEntryParser =
       Sage.skipSome (Sage.satisfy Char.isSpace)
 
 renderRouteEntry :: RouteEntry -> LazyByteString
-renderRouteEntry (RouteEntry path resId) =
-  renderPath path <> fromString " -> " <> fromString (renderResourceId resId)
+renderRouteEntry (RouteEntry visibility path resId) =
+  (case visibility of Private -> fromString "private "; Public -> mempty)
+    <> renderPath path
+    <> fromString " -> "
+    <> fromString (renderResourceId resId)
 
 data RedirectEntry
   = RedirectEntry

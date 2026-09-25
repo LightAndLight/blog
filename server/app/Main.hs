@@ -40,21 +40,24 @@ import Control.Exception (evaluate)
 import Control.Monad (unless, when, (<=<))
 import Control.Monad.Catch (MonadCatch, MonadMask, MonadThrow, onException)
 import Control.Monad.Error.Class (MonadError (..))
-import Control.Monad.Except (ExceptT (..), runExceptT)
+import Control.Monad.Except (ExceptT (..), mapExceptT, runExceptT)
 import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans (MonadTrans, lift)
 import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Crypto.Argon2 (Argon2Status (..))
 import qualified Crypto.Argon2 as Argon2
+import Data.Bifunctor (first)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import qualified Data.Char as Char
-import Data.Foldable (for_)
+import Data.Either (isLeft)
+import Data.Foldable (for_, traverse_)
 import Data.Map (Map)
 import qualified Data.Map as Map
+import Data.Maybe (catMaybes)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -199,32 +202,30 @@ insertRoute xactId path value routes =
       (routesPending routes)
       (Map.insertWith (<>) xactId (Routes.singleton path value))
 
+routeEntryParser :: Sage.Parser ([Text], Routes.Entry)
+routeEntryParser =
+  fmap
+    (\(Routes.RouteEntry visibility path resId) -> (path, Routes.EntryResourceId visibility resId))
+    (Routes.routeEntryParser <* Sage.eof)
+
+redirectEntryParser :: Sage.Parser ([Text], Routes.Entry)
+redirectEntryParser =
+  fmap
+    (\(Routes.RedirectEntry path target) -> (path, Routes.EntryRedirect target))
+    (Routes.redirectEntryParser <* Sage.eof)
+
+routeSources :: [(Name, Sage.Parser ([Text], Routes.Entry))]
+routeSources =
+  [ (unsafeName "route", routeEntryParser)
+  , (unsafeName "redirect", redirectEntryParser)
+  ]
+
 initRoutes :: Store (ExceptT DiagnosticReports (LogT IO)) -> LogT IO Routes
 initRoutes store = do
   routesVar <- liftIO . atomically $ Routes <$> newTVar Routes.empty <*> newTVar mempty
 
-  result <- runExceptT . withTransaction store routesVar Nothing $ \xactId _defer -> do
-    mResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "route")
-    case mResTy of
-      Nothing ->
-        Log.scope (fromString "init-routes") $ do
-          Log.attach (fromString "missing-resource") "route"
-      Just resTy -> do
-        entries <- Store.listResource resTy
-        for_ entries $ \entry -> do
-          mContent <- Store.readResource resTy (resourceName entry)
-          content <- maybe (error $ "missing " ++ renderResourceId entry) pure mContent
-          Routes.RouteEntry path resId <-
-            case Sage.parse (Routes.routeEntryParser <* Sage.eof) content of
-              Right x ->
-                pure x
-              Left err ->
-                throwError $
-                  DiagnosticReports
-                    (fromString $ renderResourceId entry)
-                    (LazyByteString.fromStrict content)
-                    (sageErrorReport err)
-          liftIO $ insertRoute xactId path (Routes.EntryResourceId resId) routesVar
+  result <- runExceptT . withTransaction store routesVar Nothing $ \xactId _defer ->
+    traverse_ (uncurry $ doInit routesVar xactId) routeSources
 
   case result of
     Right () ->
@@ -232,6 +233,91 @@ initRoutes store = do
     Left err -> liftIO $ do
       ByteString.Lazy.Char8.putStrLn $ renderDiagnosticReports err
       exitFailure
+  where
+    doInit routesVar xactId resTyName entryParser = do
+      mResTy <- Store.lookupResourceType store (Just xactId) resTyName
+      case mResTy of
+        Nothing ->
+          Log.scope (fromString "init-routes") $ do
+            Log.attach (fromString "missing-resource") $ renderName resTyName
+        Just resTy -> do
+          entries <- Store.listResource resTy
+          for_ entries $ \entry -> do
+            mContent <- Store.readResource resTy (resourceName entry)
+            content <- maybe (error $ "missing " ++ renderResourceId entry) pure mContent
+            (path, route) <-
+              case Sage.parse entryParser content of
+                Right x ->
+                  pure x
+                Left err ->
+                  throwError $
+                    DiagnosticReports
+                      (fromString $ renderResourceId entry)
+                      (LazyByteString.fromStrict content)
+                      (sageErrorReport err)
+            liftIO $ insertRoute xactId path route routesVar
+
+updateRoutes ::
+  (MonadError DiagnosticReports m, MonadLog m, MonadIO m) =>
+  Store m ->
+  Routes ->
+  Store.TransactionId ->
+  Map ResourceId Build.Change ->
+  m ()
+updateRoutes store routesVar xactId allChanges = do
+  routes <- traverse (uncurry doUpdate) routeSources
+  Log.attach (fromString "update-routes") $ concat routes
+  where
+    doUpdate resTyName entryParser = do
+      mResTy <- Store.lookupResourceType store (Just xactId) resTyName
+      -- TODO: not sure if this is a good idea
+      case mResTy of
+        Nothing -> do
+          Log.attach (fromString "missing-resource") $ renderName resTyName
+          pure []
+        Just resTy ->
+          fmap catMaybes . for (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
+            if resourceType changedId == resTyName
+              then do
+                let
+                  addRouteEntry = do
+                    mContent <- Store.readResource resTy (resourceName changedId)
+                    content <- maybe (error $ "missing " ++ renderResourceId changedId) pure mContent
+                    (path, entry) <-
+                      case Sage.parse entryParser content of
+                        Right x ->
+                          pure x
+                        Left err ->
+                          throwError $
+                            DiagnosticReports
+                              (fromString $ renderResourceId changedId)
+                              (LazyByteString.fromStrict content)
+                              (sageErrorReport err)
+                    liftIO $ insertRoute xactId path entry routesVar
+
+                    case entry of
+                      Routes.EntryRedirect target ->
+                        pure $
+                          Log.object
+                            [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
+                            , fromString "type" .= "redirect"
+                            , fromString "target" .= ByteString.Char8.unpack target
+                            ]
+                      Routes.EntryResourceId visibility target ->
+                        pure $
+                          Log.object
+                            [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
+                            , fromString "type" .= "route"
+                            , fromString "visibility"
+                                .= (case visibility of Routes.Public -> "public"; Routes.Private -> "private")
+                            , fromString "target" .= renderResourceId target
+                            ]
+
+                Just <$> case status of
+                  Build.Created -> addRouteEntry
+                  Build.Updated -> addRouteEntry
+              else
+                pure Nothing
 
 main :: IO ()
 main = do
@@ -389,25 +475,6 @@ withTransaction store _routes (Just xactId) f = do
       =<< Store.lookupTransaction store xactId
   f xactId $ Store.xactDefer transaction
 
-getEntry ::
-  MonadError DiagnosticReports m =>
-  Store.ResourceType m ->
-  ResourceId ->
-  Sage.Parser a ->
-  m a
-getEntry resTy resId entryParser = do
-  mContent <- Store.readResource resTy (resourceName resId)
-  content <- maybe (error $ "missing " ++ renderResourceId resId) pure mContent
-  case Sage.parse (entryParser <* Sage.eof) content of
-    Right x ->
-      pure x
-    Left err ->
-      throwError $
-        DiagnosticReports
-          (fromString $ renderResourceId resId)
-          (LazyByteString.fromStrict content)
-          (sageErrorReport err)
-
 evalRules ::
   (MonadLog m, MonadError DiagnosticReports m, MonadIO m) =>
   Store m ->
@@ -434,43 +501,7 @@ evalRules store routesVar xactId resIds =
       | (resId, change) <- Map.toList allChanges
       ]
 
-    mRouteResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "route")
-    -- TODO: not sure if this is a good idea
-    case mRouteResTy of
-      Nothing ->
-        Log.attach (fromString "missing-resource") "route"
-      Just routeResTy ->
-        for_ (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
-          case renderName $ resourceType changedId of
-            "route" -> do
-              let
-                addRouteEntry = do
-                  Routes.RouteEntry path value <- getEntry routeResTy changedId Routes.routeEntryParser
-                  liftIO $ insertRoute xactId path (Routes.EntryResourceId value) routesVar
-
-              case status of
-                Build.Created -> addRouteEntry
-                Build.Updated -> addRouteEntry
-            _ -> pure ()
-
-    mRedirectResTy <- Store.lookupResourceType store (Just xactId) (unsafeName "redirect")
-    -- TODO: not sure if this is a good idea
-    case mRedirectResTy of
-      Nothing ->
-        Log.attach (fromString "missing-resource") "redirect"
-      Just redirectResTy ->
-        for_ (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
-          case renderName $ resourceType changedId of
-            "redirect" -> do
-              let
-                addRedirectEntry = do
-                  Routes.RedirectEntry path value <- getEntry redirectResTy changedId Routes.redirectEntryParser
-                  liftIO $ insertRoute xactId path (Routes.EntryRedirect value) routesVar
-
-              case status of
-                Build.Created -> addRedirectEntry
-                Build.Updated -> addRedirectEntry
-            _ -> pure ()
+    updateRoutes store routesVar xactId allChanges
 
     end <- liftIO getCurrentTime
     Log.attach (fromString "duration-ms") (truncate (1000 * diffUTCTime end start) :: Int)
@@ -493,120 +524,140 @@ handleDiagnosticReports ma = do
 
 newtype AuthenticatedUser = AuthenticatedUser String
 
+data AuthenticationError
+  = NoSessionResource
+  | NoUserResource
+  | InvalidSession
+  | AuthenticationRequired
+  | InternalError DiagnosticReports
+
+tryAuthenticate ::
+  (MonadLog m, MonadIO m, MonadMask m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Wai.Request ->
+  HandlerT m (Either AuthenticationError AuthenticatedUser)
+tryAuthenticate store request =
+  let handleInternalError = mapExceptT (lift . fmap (first InternalError))
+  in runExceptT . Log.scope (fromString "authentication") $ do
+       sessionTy <- do
+         mSessionTy <- handleInternalError $ Store.lookupResourceType store Nothing (unsafeName "session")
+         case mSessionTy of
+           Nothing -> do
+             Log.scope (fromString "failure") $ do
+               Log.attach (fromString "missing-resource") "session"
+
+             throwError NoSessionResource
+           Just x -> pure x
+
+       value <- maybe (throwError AuthenticationRequired) pure $ lookupSessionCookie request
+
+       sessionId <-
+         case mkName $ ByteString.Char8.unpack value of
+           Nothing -> throwError InvalidSession
+           Just x -> pure x
+       exists <- handleInternalError $ Store.doesResourceExist sessionTy sessionId
+       if exists
+         then do
+           let
+             getStringProperty key = do
+               mValue <- handleInternalError $ Store.lookupProperty sessionTy sessionId key
+               case mValue of
+                 Just (VString x) ->
+                   pure x
+                 Just x -> do
+                   Log.scope (fromString "failure") $ do
+                     Log.attach (fromString "function") "getStringProperty"
+                     Log.attach (fromString "property") (renderName key)
+                     Log.scope (fromString "error") $ do
+                       Log.attach (fromString "expected-type") "string"
+                       Log.attach (fromString "actual-value") (show x)
+
+                   throwError InvalidSession
+                 Nothing -> do
+                   Log.scope (fromString "failure") $ do
+                     Log.attach (fromString "function") "getStringProperty"
+                     Log.attach (fromString "property") (renderName key)
+                     Log.scope (fromString "error") $ do
+                       Log.attach (fromString "description") "missing property"
+
+                   throwError InvalidSession
+
+           expires <- do
+             expires <- getStringProperty (unsafeName "expires")
+             case iso8601ParseM $ Text.unpack expires of
+               Nothing -> do
+                 Log.scope (fromString "failure") $ do
+                   Log.attach (fromString "function") "iso8601ParseM"
+                   Log.attach (fromString "input") expires
+                   Log.attach (fromString "property") "expires"
+                   Log.scope (fromString "error") $ do
+                     Log.attach (fromString "description") "failed to parse as a datetime"
+
+                 throwError InvalidSession
+               Just x -> pure (x :: UTCTime)
+
+           now <- liftIO getCurrentTime
+           if now >= expires
+             then throwError InvalidSession
+             else do
+               user <- getStringProperty (unsafeName "user")
+               Log.attach (fromString "username") user
+
+               userName <-
+                 case mkName $ Text.unpack user of
+                   Nothing -> do
+                     Log.scope (fromString "failure") $ do
+                       Log.attach (fromString "function") "mkName"
+                       Log.scope (fromString "resource") $ do
+                         Log.attach (fromString "type") (renderName $ Store.resourceTypeName sessionTy)
+                         Log.attach (fromString "name") (renderName sessionId)
+                       Log.scope (fromString "error") $ do
+                         Log.attach (fromString "message") "invalid username"
+
+                     throwError InvalidSession
+                   Just x -> pure x
+
+               mUserTy <- handleInternalError $ Store.lookupResourceType store Nothing (unsafeName "user")
+               case mUserTy of
+                 Nothing -> do
+                   Log.scope (fromString "failure") $ do
+                     Log.attach (fromString "missing-resource") "user"
+                   throwError NoUserResource
+                 Just userTy -> do
+                   userExists <- handleInternalError $ Store.doesResourceExist userTy userName
+                   if userExists
+                     then pure . AuthenticatedUser $ renderName userName
+                     else throwError InvalidSession
+         else throwError InvalidSession
+
 authenticate ::
   (MonadLog m, MonadIO m, MonadMask m) =>
   Store (ExceptT DiagnosticReports m) ->
   Wai.Request ->
   HandlerT m AuthenticatedUser
-authenticate store request =
-  Log.scope (fromString "authentication") $ do
-    sessionTy <- do
-      mSessionTy <-
-        handleDiagnosticReports $ Store.lookupResourceType store Nothing (unsafeName "session")
-      case mSessionTy of
-        Nothing -> do
-          Log.scope (fromString "failure") $ do
-            Log.attach (fromString "missing-resource") "session"
-
-          throwError $
+authenticate store request = do
+  result <- tryAuthenticate store request
+  case result of
+    Right a -> pure a
+    Left err ->
+      throwError $
+        case err of
+          NoSessionResource ->
             Wai.responseLBS
               notImplemented501
               []
               (fromString $ "error: server has no 'session' resource type")
-        Just x -> pure x
-
-    value <- maybe authenticationRequired pure $ lookupSessionCookie request
-
-    sessionId <-
-      case mkName $ ByteString.Char8.unpack value of
-        Nothing -> invalidSession
-        Just x -> pure x
-    exists <- handleDiagnosticReports $ Store.doesResourceExist sessionTy sessionId
-    if exists
-      then do
-        let
-          getStringProperty key = do
-            mValue <- handleDiagnosticReports $ Store.lookupProperty sessionTy sessionId key
-            case mValue of
-              Just (VString x) ->
-                pure x
-              Just x -> do
-                Log.scope (fromString "failure") $ do
-                  Log.attach (fromString "function") "getStringProperty"
-                  Log.attach (fromString "property") (renderName key)
-                  Log.scope (fromString "error") $ do
-                    Log.attach (fromString "expected-type") "string"
-                    Log.attach (fromString "actual-value") (show x)
-
-                invalidSession
-              Nothing -> do
-                Log.scope (fromString "failure") $ do
-                  Log.attach (fromString "function") "getStringProperty"
-                  Log.attach (fromString "property") (renderName key)
-                  Log.scope (fromString "error") $ do
-                    Log.attach (fromString "description") "missing property"
-
-                invalidSession
-
-        expires <- do
-          expires <- getStringProperty (unsafeName "expires")
-          case iso8601ParseM $ Text.unpack expires of
-            Nothing -> do
-              Log.scope (fromString "failure") $ do
-                Log.attach (fromString "function") "iso8601ParseM"
-                Log.attach (fromString "input") expires
-                Log.attach (fromString "property") "expires"
-                Log.scope (fromString "error") $ do
-                  Log.attach (fromString "description") "failed to parse as a datetime"
-
-              invalidSession
-            Just x -> pure (x :: UTCTime)
-
-        now <- liftIO getCurrentTime
-        if now >= expires
-          then invalidSession
-          else do
-            user <- getStringProperty (unsafeName "user")
-            Log.attach (fromString "username") user
-
-            userName <-
-              case mkName $ Text.unpack user of
-                Nothing -> do
-                  Log.scope (fromString "failure") $ do
-                    Log.attach (fromString "function") "mkName"
-                    Log.scope (fromString "resource") $ do
-                      Log.attach (fromString "type") (renderName $ Store.resourceTypeName sessionTy)
-                      Log.attach (fromString "name") (renderName sessionId)
-                    Log.scope (fromString "error") $ do
-                      Log.attach (fromString "message") "invalid username"
-
-                  invalidSession
-                Just x -> pure x
-
-            mUserTy <- handleDiagnosticReports $ Store.lookupResourceType store Nothing (unsafeName "user")
-            case mUserTy of
-              Nothing -> do
-                Log.scope (fromString "failure") $ do
-                  Log.attach (fromString "missing-resource") "user"
-                throwError $
-                  Wai.responseLBS
-                    notImplemented501
-                    []
-                    (fromString $ "error: server has no 'user' resource type")
-              Just userTy -> do
-                userExists <- handleDiagnosticReports $ Store.doesResourceExist userTy userName
-                if userExists
-                  then pure . AuthenticatedUser $ renderName userName
-                  else invalidSession
-      else invalidSession
-  where
-    authenticationRequired =
-      throwError $
-        Wai.responseLBS unauthorized401 [] (fromString "authentication required")
-
-    invalidSession =
-      throwError $
-        Wai.responseLBS unauthorized401 [] (fromString "invalid session ID")
+          NoUserResource ->
+            Wai.responseLBS
+              notImplemented501
+              []
+              (fromString $ "error: server has no 'user' resource type")
+          InvalidSession ->
+            Wai.responseLBS unauthorized401 [] (fromString "invalid session ID")
+          AuthenticationRequired ->
+            Wai.responseLBS unauthorized401 [] (fromString "authentication required")
+          InternalError reports ->
+            Wai.responseLBS badRequest400 [] (renderDiagnosticReports reports)
 
 app ::
   Store (ExceptT DiagnosticReports (LogT IO)) ->
@@ -1492,12 +1543,19 @@ httpRouteGet store routesVar request path =
   Log.scope (fromString "endpoint.route-get") $ do
     mXactId <- optionalTransactionIdHeader store (Wai.requestHeaders request)
 
-    handleDiagnosticReports $ do
-      routes <- liftIO $ readActiveRoutes routesVar
-      case Routes.lookup path routes of
-        Nothing ->
-          pure $ Wai.responseLBS notFound404 [] (fromString "not found")
-        Just (Routes.EntryResourceId resId) -> do
+    routes <- liftIO $ readActiveRoutes routesVar
+    case Routes.lookup path routes of
+      Nothing ->
+        pure $ Wai.responseLBS notFound404 [] (fromString "not found")
+      Just (Routes.EntryResourceId visibility resId) -> do
+        case visibility of
+          Routes.Public ->
+            pure ()
+          Routes.Private -> do
+            result <- tryAuthenticate store request
+            when (isLeft result) . throwError $ Wai.responseLBS notFound404 [] (fromString "not found")
+
+        handleDiagnosticReports $ do
           resTy <- Store.getResourceType store mXactId $ resourceType resId
           mContent <- Store.readResource resTy $ resourceName resId
           case mContent of
@@ -1506,9 +1564,9 @@ httpRouteGet store routesVar request path =
             Just content -> do
               let contentType = Text.Encoding.encodeUtf8 . cfgContentType $ Store.resourceTypeConfig resTy
               pure $ Wai.responseLBS ok200 [(hContentType, contentType)] (LazyByteString.fromStrict content)
-        Just (Routes.EntryRedirect target) -> do
-          pure $
-            Wai.responseLBS
-              movedPermanently301
-              [(hLocation, target), (hContentType, fromString "text/plain")]
-              (fromString "moved to " <> LazyByteString.fromStrict target)
+      Just (Routes.EntryRedirect target) -> do
+        pure $
+          Wai.responseLBS
+            movedPermanently301
+            [(hLocation, target), (hContentType, fromString "text/plain")]
+            (fromString "moved to " <> LazyByteString.fromStrict target)
