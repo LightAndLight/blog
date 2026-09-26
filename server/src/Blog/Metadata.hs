@@ -13,6 +13,7 @@ module Blog.Metadata
     -- * Value decoding
   , MetadataValueDecoder
   , runMetadataValueDecoder
+  , option
   , list
   , text
   , utcTime
@@ -174,6 +175,7 @@ metadataValueFromToml (Toml.VRecord fields) =
 
 data Part
   = PIndex Int
+  | PCtor Text Int
 
 newtype MetadataValueDecoder a = MetadataValueDecoder ([Part] -> MetadataValue -> Either DecodeError a)
 
@@ -182,6 +184,19 @@ data DecodeError
 
 runMetadataValueDecoder :: MetadataValueDecoder a -> [Part] -> MetadataValue -> Either DecodeError a
 runMetadataValueDecoder (MetadataValueDecoder f) = f
+
+option :: MetadataValueDecoder a -> MetadataValueDecoder (Maybe a)
+option item =
+  MetadataValueDecoder $
+    \path val ->
+      case val of
+        VConstructor ctor [x]
+          | ctor == fromString "Some" ->
+              Just <$> runMetadataValueDecoder item (path <> pure (PCtor ctor 0)) x
+        VConstructor ctor []
+          | ctor == fromString "None" ->
+              pure Nothing
+        _ -> Left $ DecodeError path "not None() | Some(_)"
 
 list :: MetadataValueDecoder a -> MetadataValueDecoder [a]
 list item =

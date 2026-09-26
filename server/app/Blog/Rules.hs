@@ -71,7 +71,7 @@ import Data.Functor ((<&>))
 import Data.List (find, sortOn)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (catMaybes, fromMaybe, isJust)
 import Data.Monoid (All (..), First (..), getAll, getFirst)
 import Data.Ord (Down (..))
 import Data.Set (Set)
@@ -323,6 +323,7 @@ templateDependency iTemplate () = do
 renderMetadataPath :: [Metadata.Part] -> String
 renderMetadataPath [] = ""
 renderMetadataPath (Metadata.PIndex ix : rest) = "[" ++ show ix ++ "]" ++ renderMetadataPath rest
+renderMetadataPath (Metadata.PCtor ctor ix : rest) = "|" ++ Text.unpack ctor ++ "(" ++ show ix ++ ")" ++ renderMetadataPath rest
 
 renderMetadataDecodeError :: Metadata.DecodeError -> String
 renderMetadataDecodeError (Metadata.DecodeError [] err) =
@@ -414,8 +415,9 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
       Build.ResourceInputs m a ->
       Build.ActionT m [(UTCTime, ResourceId)]
     getResourcesWithPublished inputs =
-      for (Build.resourceInputs inputs) $ \input ->
-        (,Build.resourceInputId input) <$> requireMetadata input (fromString "published") Metadata.utcTime
+      fmap catMaybes . for (Build.resourceInputs inputs) $ \input -> do
+        mPublished <- requireMetadata input (fromString "published") (Metadata.option Metadata.utcTime)
+        pure $ fmap (,Build.resourceInputId input) mPublished
 
 data Adjacency a
   = Adjacency
@@ -1150,25 +1152,27 @@ sortPosts ::
   Build.ActionT m [IndexItem m]
 sortPosts iArticlesWithExcerpts iNotes = do
   articlesWithExcerptsWithPublished <-
-    for
-      iArticlesWithExcerpts
-      ( \(iArticle, miExcerpt) -> do
-          published <- requireMetadata iArticle (fromString "published") Metadata.utcTime
-          tags <- fromMaybe [] <$> optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
-          pure (published, IndexArticle iArticle tags miExcerpt)
-      )
+    catMaybes
+      <$> for
+        iArticlesWithExcerpts
+        ( \(iArticle, miExcerpt) -> do
+            mPublished <- requireMetadata iArticle (fromString "published") (Metadata.option Metadata.utcTime)
+            tags <- fromMaybe [] <$> optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
+            pure $ fmap (,IndexArticle iArticle tags miExcerpt) mPublished
+        )
 
   notesWithPublished <-
-    for
-      iNotes
-      ( \iNote -> do
-          published <- requireMetadata iNote (fromString "published") Metadata.utcTime
-          tags <- fromMaybe [] <$> optionalMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
-          references <- requireMetadata iNote (fromString "references") Metadata.value
-          (_deps, document) <- loadMarkdown iNote
-          html <- renderHtml document
-          pure (published, IndexNote iNote tags references html)
-      )
+    catMaybes
+      <$> for
+        iNotes
+        ( \iNote -> do
+            mPublished <- requireMetadata iNote (fromString "published") (Metadata.option Metadata.utcTime)
+            tags <- fromMaybe [] <$> optionalMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
+            references <- requireMetadata iNote (fromString "references") Metadata.value
+            (_deps, document) <- loadMarkdown iNote
+            html <- renderHtml document
+            pure $ fmap (,IndexNote iNote tags references html) mPublished
+        )
 
   pure
     . fmap snd
