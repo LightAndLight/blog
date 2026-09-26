@@ -383,9 +383,6 @@ optionalMetadata input name decoder =
     Nothing ->
       pure Nothing
 
-requirePublished :: Monad m => Build.ResourceInput m a -> Build.ActionT m UTCTime
-requirePublished input = requireMetadata input (fromString "published") Metadata.utcTime
-
 articleAdjacency ::
   MonadIO m =>
   (Build.ResourceInputs m ByteString, Build.ResourceInputs m ByteString) ->
@@ -418,7 +415,7 @@ articleAdjacency (iArticles, iNotes) oAdjacency = do
       Build.ActionT m [(UTCTime, ResourceId)]
     getResourcesWithPublished inputs =
       for (Build.resourceInputs inputs) $ \input ->
-        (,Build.resourceInputId input) <$> requirePublished input
+        (,Build.resourceInputId input) <$> requireMetadata input (fromString "published") Metadata.utcTime
 
 data Adjacency a
   = Adjacency
@@ -1156,7 +1153,7 @@ sortPosts iArticlesWithExcerpts iNotes = do
     for
       iArticlesWithExcerpts
       ( \(iArticle, miExcerpt) -> do
-          published <- requirePublished iArticle
+          published <- requireMetadata iArticle (fromString "published") Metadata.utcTime
           tags <- fromMaybe [] <$> optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
           pure (published, IndexArticle iArticle tags miExcerpt)
       )
@@ -1165,7 +1162,7 @@ sortPosts iArticlesWithExcerpts iNotes = do
     for
       iNotes
       ( \iNote -> do
-          published <- requirePublished iNote
+          published <- requireMetadata iNote (fromString "published") Metadata.utcTime
           tags <- fromMaybe [] <$> optionalMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
           references <- requireMetadata iNote (fromString "references") Metadata.value
           (_deps, document) <- loadMarkdown iNote
