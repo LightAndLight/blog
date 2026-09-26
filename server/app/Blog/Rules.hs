@@ -21,6 +21,7 @@ import Blog
   , resourceNameParser
   , resourceTypeParser
   , unsafeName
+  , utctimeMetadataValue
   )
 import Blog.Build ((*<))
 import qualified Blog.Build as Build
@@ -1131,6 +1132,8 @@ data IndexItem m
       [Text]
       -- | Excerpt
       (Maybe (Build.ResourceInput m ByteString))
+      -- | Published
+      UTCTime
   | IndexNote
       -- | Note
       (Build.ResourceInput m ByteString)
@@ -1138,12 +1141,18 @@ data IndexItem m
       [Text]
       -- | @references@ metadata
       MetadataValue
+      -- | Published
+      UTCTime
       -- | Rendered HTML
       Text
 
 indexItemTags :: IndexItem m -> [Text]
-indexItemTags (IndexArticle _article tags _excerpt) = tags
-indexItemTags (IndexNote _note tags _references _content) = tags
+indexItemTags (IndexArticle _article tags _excerpt _published) = tags
+indexItemTags (IndexNote _note tags _references _published _content) = tags
+
+indexItemPublished :: IndexItem m -> UTCTime
+indexItemPublished (IndexArticle _article _tags _excerpt published) = published
+indexItemPublished (IndexNote _note _tags _references published _content) = published
 
 sortPosts ::
   MonadIO m =>
@@ -1158,7 +1167,7 @@ sortPosts iArticlesWithExcerpts iNotes = do
         ( \(iArticle, miExcerpt) -> do
             mPublished <- requireMetadata iArticle (fromString "published") (Metadata.option Metadata.utcTime)
             tags <- fromMaybe [] <$> optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
-            pure $ fmap (,IndexArticle iArticle tags miExcerpt) mPublished
+            pure $ fmap (\published -> IndexArticle iArticle tags miExcerpt published) mPublished
         )
 
   notesWithPublished <-
@@ -1171,27 +1180,26 @@ sortPosts iArticlesWithExcerpts iNotes = do
             references <- requireMetadata iNote (fromString "references") Metadata.value
             (_deps, document) <- loadMarkdown iNote
             html <- renderHtml document
-            pure $ fmap (,IndexNote iNote tags references html) mPublished
+            pure $ fmap (\published -> IndexNote iNote tags references published html) mPublished
         )
 
   pure
-    . fmap snd
-    . sortOn (Down . fst)
+    . sortOn (Down . indexItemPublished)
     $ articlesWithExcerptsWithPublished ++ notesWithPublished
 
-postsList :: Monad m => [IndexItem m] -> Value (Build.ActionT m)
-postsList sortedPosts =
+publishedPostsList :: Monad m => [IndexItem m] -> Value (Build.ActionT m)
+publishedPostsList sortedPosts =
   List $
     sortedPosts <&> \case
-      IndexArticle iArticle _tags miExcerpt ->
-        post iArticle . Constructor (fromString "Article") $
+      IndexArticle iArticle _tags miExcerpt published ->
+        post iArticle published . Constructor (fromString "Article") $
           [ recordValue
               [ (fromString "excerpt", bytestringValue $ Build.resourceInputContent iExcerpt)
               | Just iExcerpt <- [miExcerpt]
               ]
           ]
-      IndexNote iNote _tags references html ->
-        post iNote . Constructor (fromString "Note") $
+      IndexNote iNote _tags references published html ->
+        post iNote published . Constructor (fromString "Note") $
           [ recordValue
               [ (fromString "content", textValue html)
               , (fromString "references", metadataValue references)
@@ -1201,12 +1209,17 @@ postsList sortedPosts =
     -- TODO: the `type` property should come from metadata.
     --
     -- Currently blocked on having a good syntax for sum types in metadata.
-    post res postType =
+    post res published postType =
       Record $
         fields
           [
             ( fromString "metadata"
-            , Record $ fields [(fromString "type", postType)] <> metadataFields (Build.resourceInputMetadata res)
+            , Record $
+                fields
+                  [ (fromString "type", postType)
+                  , (fromString "published", metadataValue $ utctimeMetadataValue published)
+                  ]
+                  <> metadataFields (Build.resourceInputMetadata res)
             )
           ]
           <> propertyFields res
@@ -1248,7 +1261,7 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
             )
           ,
             ( fromString "posts"
-            , postsList sortedPosts
+            , publishedPostsList sortedPosts
             )
           ]
 
@@ -1299,7 +1312,7 @@ tagIndexHtml (iTag, iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
             )
           ,
             ( fromString "posts"
-            , postsList sortedPosts
+            , publishedPostsList sortedPosts
             )
           ]
 
@@ -1369,7 +1382,7 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
           , (fromString "authorName", textValue authorName)
           , (fromString "authorEmail", textValue authorEmail)
           , (fromString "updated", stringValue $ renderUTCTime updated)
-          , (fromString "posts", postsList sortedPosts)
+          , (fromString "posts", publishedPostsList sortedPosts)
           ]
 
   Build.writeResource oFeed () output
