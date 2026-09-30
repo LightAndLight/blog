@@ -23,7 +23,7 @@ import Blog
   , unsafeName
   , utctimeMetadataValue
   )
-import Blog.Build ((*<))
+import Blog.Build ((*<), (<*?>))
 import qualified Blog.Build as Build
 import Blog.Diagnostic (DiagnosticReports (..))
 import Blog.Error (sageErrorReport, tomlResult)
@@ -122,7 +122,7 @@ rules =
       ( (,,)
           <$> Build.iResource "template" (Build.iMatch "article.html.temple")
           <*> Build.iResource "article" (Build.iBind "name")
-          <*> Build.iResource "adjacency" (Build.iMatch "article-" <> Build.iBind "name")
+            <*?> Build.iResource "adjacency" (Build.iMatch "article-" <> Build.iBind "name")
       )
       ( (,)
           <$> Build.oResource "excerpt" (Build.oMatch "article-" *< Build.oBind "name")
@@ -144,7 +144,7 @@ rules =
       ( (,,)
           <$> Build.iResource "template" (Build.iMatch "note.html.temple")
           <*> Build.iResource "note" (Build.iBind "name")
-          <*> Build.iResource "adjacency" (Build.iMatch "note-" <> Build.iBind "name")
+            <*?> Build.iResource "adjacency" (Build.iMatch "note-" <> Build.iBind "name")
       )
       (Build.oResource "html" (Build.oMatch "note-" *< Build.oBind "name"))
       noteHtml
@@ -173,7 +173,7 @@ rules =
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "name")
-                <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+                  <*?> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
             )
           <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
@@ -187,7 +187,7 @@ rules =
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "article-name")
-                <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "article-name")
+                  <*?> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "article-name")
             )
           <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
@@ -201,7 +201,7 @@ rules =
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "name")
-                <*> Build.iResourceOptional "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+                  <*?> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
             )
           <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
@@ -942,11 +942,11 @@ articleHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
   , Build.ResourceInput m ByteString
-  , Build.ResourceInput m ByteString
+  , Maybe (Build.ResourceInput m ByteString)
   ) ->
   (Build.ResourceOutput m (), Build.ResourceOutput m ()) ->
   Build.ActionT m ()
-articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
+articleHtml (iTemplate, iArticle, miAdjacency) (oExcerpt, oHtml) = do
   (mExcerpt, html) <- do
     (_deps, document) <- loadMarkdown iArticle
 
@@ -977,7 +977,8 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
   for_ mExcerpt $
     Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict
 
-  (prev, next) <- getAdjacency iAdjacency
+  -- unpublished articles don't have adjacencies
+  (prev, next) <- maybe (pure (Nothing, Nothing)) getAdjacency miAdjacency
 
   output <-
     renderTemplate iTemplate $
@@ -1060,16 +1061,17 @@ noteHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
   , Build.ResourceInput m ByteString
-  , Build.ResourceInput m ByteString
+  , Maybe (Build.ResourceInput m ByteString)
   ) ->
   Build.ResourceOutput m () ->
   Build.ActionT m ()
-noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
+noteHtml (iTemplate, iNote, miAdjacency) oHtml = do
   html <- do
     (_deps, document) <- loadMarkdown iNote
     pandoc (Pandoc.writeHtml5String htmlWriterOptions document)
 
-  (prev, next) <- getAdjacency iAdjacency
+  -- unpublished notes don't have adjacencies
+  (prev, next) <- maybe (pure (Nothing, Nothing)) getAdjacency miAdjacency
 
   output <-
     renderTemplate iTemplate $

@@ -18,10 +18,10 @@ module Blog.Build
   , evalRules
   , rule
   , Input
+  , (<*?>)
   , ResourceInput (..)
   , ResourceInputs (..)
   , iResource
-  , iResourceOptional
   , iResourceAll
   , iAll
   , ResourceNamePattern
@@ -243,6 +243,7 @@ data Input m :: Type -> Type where
   IFmap :: (a -> b) -> Input m a -> Input m b
   IPure :: a -> Input m a
   IApply :: Input m (a -> b) -> Input m a -> Input m b
+  IApplyMaybe :: Input m (Maybe a -> b) -> Input m a -> Input m b
   IResource :: InputQuantifier m a -> Name -> ResourceNamePattern -> Input m a
   IMany :: Input m a -> Input m [a]
 
@@ -253,9 +254,13 @@ instance Applicative (Input m) where
   pure = IPure
   (<*>) = IApply
 
+(<*?>) :: Input m (Maybe a -> b) -> Input m a -> Input m b
+(<*?>) = IApplyMaybe
+
+infixl 4 <*?>
+
 data InputQuantifier m :: Type -> Type where
   IAny :: InputQuantifier m (ResourceInput m ByteString)
-  IOptional :: InputQuantifier m (Maybe (ResourceInput m ByteString))
   IAll :: InputQuantifier m (ResourceInputs m ByteString)
 
 data ResourceInput m a
@@ -311,55 +316,75 @@ data InputTuple a
 
 data InputTuples a
   = InputTuples
-      -- | Headers
-      [String]
-      -- | Olds
-      [InputTuple a]
-      -- | News
-      [InputTuple a]
+  { inputTuplesHeader :: [String]
+  , inputTuplesOld :: [InputTuple a]
+  , inputTuplesNew :: [InputTuple a]
+  }
   deriving (Functor)
+
+joinedBindings ::
+  Map String String ->
+  Map String String ->
+  Maybe (Map String String)
+joinedBindings b1 b2 = sequence $ Map.intersectionWith (\x y -> x <$ guard (x == y)) b1 b2
 
 inputTupleJoin ::
   InputTuple (a -> b) ->
   InputTuple a ->
   Maybe (InputTuple b)
 inputTupleJoin t1 t2 = do
-  let
-    common :: Map String (Maybe String)
-    common =
-      Map.intersectionWith (\x y -> x <$ guard (x == y)) (inputTupleBindings t1) (inputTupleBindings t2)
+  common <- joinedBindings (inputTupleBindings t1) (inputTupleBindings t2)
 
+  let
     left = Map.difference (inputTupleBindings t1) common
     right = Map.difference (inputTupleBindings t2) common
 
-  common' <- sequence common
   pure $!
     InputTuple
       { inputTupleAge = inputTupleAge t1 <> inputTupleAge t2
       , inputTupleReasons = inputTupleReasons t1 <> inputTupleReasons t2
-      , inputTupleBindings = left <> right <> common'
+      , inputTupleBindings = left <> right <> common
       , inputTupleValue = inputTupleValue t1 (inputTupleValue t2)
       }
+
+innerJoin :: [InputTuple (a -> b)] -> [InputTuple a] -> [InputTuple b]
+innerJoin xs ys = [z | x <- xs, y <- ys, Just z <- [inputTupleJoin x y]]
+
+antijoin :: [InputTuple (Maybe a -> b)] -> [InputTuple x] -> [InputTuple b]
+antijoin xs ys =
+  [ fmap ($ Nothing) x
+  | x <- xs
+  , null [() | y <- ys, Just{} <- [joinedBindings (inputTupleBindings x) (inputTupleBindings y)]]
+  ]
+
+leftOuterJoin :: [InputTuple (Maybe a -> b)] -> [InputTuple a] -> [InputTuple b]
+leftOuterJoin xs ys =
+  [ z
+  | x <- xs
+  , let result = [z | y <- ys, Just z <- [inputTupleJoin x $ fmap Just y]]
+  , z <- if null result then [x{inputTupleValue = inputTupleValue x Nothing}] else result
+  ]
 
 instance Applicative InputTuples where
   pure a =
     InputTuples
-      ["it"]
-      [ InputTuple
-          { inputTupleAge = Old
-          , inputTupleReasons = []
-          , inputTupleBindings = mempty
-          , inputTupleValue = a
-          }
-      ]
-      []
+      { inputTuplesHeader = ["it"]
+      , inputTuplesOld =
+          [ InputTuple
+              { inputTupleAge = Old
+              , inputTupleReasons = []
+              , inputTupleBindings = mempty
+              , inputTupleValue = a
+              }
+          ]
+      , inputTuplesNew = []
+      }
   (<*>) (InputTuples headers1 old1 new1) (InputTuples headers2 old2 new2) =
     InputTuples
-      (headers1 ++ headers2)
-      [z | x <- old1, y <- old2, Just z <- [inputTupleJoin x y]]
-      ( [z | x <- new1, y <- old2 ++ new2, Just z <- [inputTupleJoin x y]]
-          ++ [z | x <- old1, y <- new2, Just z <- [inputTupleJoin x y]]
-      )
+      { inputTuplesHeader = headers1 ++ headers2
+      , inputTuplesOld = innerJoin old1 old2
+      , inputTuplesNew = innerJoin new1 (old2 ++ new2) ++ innerJoin old1 new2
+      }
 
 queryInputs ::
   MonadIO m =>
@@ -382,6 +407,17 @@ queryInputs i = go i
         (<*>)
         (go deps changes)
         (go deps' changes)
+    go (IApplyMaybe deps deps') changes =
+      liftA2
+        ( \(InputTuples headers1 old1 new1) (InputTuples headers2 old2 new2) -> do
+            InputTuples
+              { inputTuplesHeader = headers1 ++ ["optional(" ++ intercalate ", " headers2 ++ ")"]
+              , inputTuplesOld = antijoin old1 (old2 ++ new2) ++ innerJoin old1 ((fmap . fmap) Just old2)
+              , inputTuplesNew = leftOuterJoin new1 (old2 ++ new2) ++ innerJoin old1 ((fmap . fmap) Just new2)
+              }
+        )
+        (go deps changes)
+        (go deps' changes)
     go (IResource quant resTyName resNamePat) changes = do
       store <- askStore
       transactionId <- askTransactionId
@@ -392,7 +428,7 @@ queryInputs i = go i
           -- TODO: not sure if this is the best way to handle missing resource types,
           -- but right now anything stricter stops me from state-machine-testing the
           -- system due to the built-in rules.
-          pure $ InputTuples [] [] []
+          pure $ InputTuples{inputTuplesHeader = [], inputTuplesOld = [], inputTuplesNew = []}
         Just resTy -> do
           resources <- Store.listResource resTy
 
@@ -435,42 +471,43 @@ queryInputs i = go i
             IAny ->
               pure $
                 InputTuples
-                  [renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat]
-                  (mapMaybe sequence olds)
-                  (mapMaybe sequence news)
-            IOptional ->
-              pure $
-                InputTuples
-                  ["optional(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
-                  olds
-                  news
+                  { inputTuplesHeader = [renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat]
+                  , inputTuplesOld = mapMaybe sequence olds
+                  , inputTuplesNew = mapMaybe sequence news
+                  }
             IAll ->
               if null news
                 then
                   pure $
                     InputTuples
-                      ["all(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
-                      [ InputTuple
-                          { inputTupleAge = Old
-                          , inputTupleReasons = []
-                          , inputTupleBindings = mempty
-                          , inputTupleValue = ResourceInputs resTyName . mapMaybe inputTupleValue $ news ++ olds
-                          }
-                      ]
-                      []
+                      { inputTuplesHeader =
+                          ["all(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
+                      , inputTuplesOld =
+                          [ InputTuple
+                              { inputTupleAge = Old
+                              , inputTupleReasons = []
+                              , inputTupleBindings = mempty
+                              , inputTupleValue = ResourceInputs resTyName . mapMaybe inputTupleValue $ news ++ olds
+                              }
+                          ]
+                      , inputTuplesNew = []
+                      }
                 else do
                   let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
                   pure $
                     InputTuples
-                      ["all(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
-                      []
-                      [ InputTuple
-                          { inputTupleAge = New
-                          , inputTupleReasons = reasons
-                          , inputTupleBindings = mempty
-                          , inputTupleValue = ResourceInputs resTyName . mapMaybe inputTupleValue $ news ++ olds
-                          }
-                      ]
+                      { inputTuplesHeader =
+                          ["all(" ++ renderName resTyName ++ ":" ++ renderResourceNamePattern resNamePat ++ ")"]
+                      , inputTuplesOld = []
+                      , inputTuplesNew =
+                          [ InputTuple
+                              { inputTupleAge = New
+                              , inputTupleReasons = reasons
+                              , inputTupleBindings = mempty
+                              , inputTupleValue = ResourceInputs resTyName . mapMaybe inputTupleValue $ news ++ olds
+                              }
+                          ]
+                      }
     go (IMany input) changes = do
       tuples <- go input changes
       let InputTuples headers olds news = tuples
@@ -478,28 +515,32 @@ queryInputs i = go i
         then
           pure $
             InputTuples
-              ["all(" ++ intercalate ", " headers ++ ")"]
-              [ InputTuple
-                  { inputTupleAge = Old
-                  , inputTupleReasons = []
-                  , inputTupleBindings = mempty
-                  , inputTupleValue = fmap inputTupleValue $ news ++ olds
-                  }
-              ]
-              []
+              { inputTuplesHeader = ["all(" ++ intercalate ", " headers ++ ")"]
+              , inputTuplesOld =
+                  [ InputTuple
+                      { inputTupleAge = Old
+                      , inputTupleReasons = []
+                      , inputTupleBindings = mempty
+                      , inputTupleValue = fmap inputTupleValue $ news ++ olds
+                      }
+                  ]
+              , inputTuplesNew = []
+              }
         else do
           let reasons = nub [reason' | new <- news, reason' <- inputTupleReasons new]
           pure $
             InputTuples
-              ["all(" ++ intercalate ", " headers ++ ")"]
-              []
-              [ InputTuple
-                  { inputTupleAge = New
-                  , inputTupleReasons = reasons
-                  , inputTupleBindings = mempty
-                  , inputTupleValue = fmap inputTupleValue $ news ++ olds
-                  }
-              ]
+              { inputTuplesHeader = ["all(" ++ intercalate ", " headers ++ ")"]
+              , inputTuplesOld = []
+              , inputTuplesNew =
+                  [ InputTuple
+                      { inputTupleAge = New
+                      , inputTupleReasons = reasons
+                      , inputTupleBindings = mempty
+                      , inputTupleValue = fmap inputTupleValue $ news ++ olds
+                      }
+                  ]
+              }
 
 makeResource ::
   MonadIO m =>
@@ -622,14 +663,6 @@ iResource ::
   ResourceNamePattern ->
   Input m (ResourceInput m ByteString)
 iResource resTyName = IResource IAny (unsafeName resTyName)
-
-iResourceOptional ::
-  -- | Resource type
-  String ->
-  -- | Resource name
-  ResourceNamePattern ->
-  Input m (Maybe (ResourceInput m ByteString))
-iResourceOptional = IResource IOptional . unsafeName
 
 {-| Declare a bulk input of a particular resource type, matching the given pattern.
 
@@ -811,6 +844,7 @@ inputResourceIdPatterns :: Input m a -> [ResourceIdPattern]
 inputResourceIdPatterns (IFmap _f a) = inputResourceIdPatterns a
 inputResourceIdPatterns (IPure _a) = []
 inputResourceIdPatterns (IApply a b) = inputResourceIdPatterns a ++ inputResourceIdPatterns b
+inputResourceIdPatterns (IApplyMaybe a b) = inputResourceIdPatterns a ++ inputResourceIdPatterns b
 inputResourceIdPatterns (IResource _quant resTyName resNamePat) = [ResourceIdPattern resTyName resNamePat]
 inputResourceIdPatterns (IMany a) = inputResourceIdPatterns a
 
