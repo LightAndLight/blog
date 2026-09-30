@@ -361,30 +361,6 @@ requireMetadata input name decoder =
           ++ Text.unpack name
           ++ "'"
 
-optionalMetadata ::
-  Monad m =>
-  Build.ResourceInput m a ->
-  -- | Property name
-  Text ->
-  MetadataValueDecoder b ->
-  Build.ActionT m (Maybe b)
-optionalMetadata input name decoder =
-  case Map.lookup name (Build.resourceInputMetadata input) of
-    Just value ->
-      case runMetadataValueDecoder decoder [] value of
-        Left err ->
-          throwError . DiagnosticSimple $
-            "("
-              ++ renderResourceId (Build.resourceInputId input)
-              ++ ":metadata:"
-              ++ Text.unpack name
-              ++ "): "
-              ++ renderMetadataDecodeError err
-        Right b ->
-          pure $ Just b
-    Nothing ->
-      pure Nothing
-
 articleAdjacency ::
   MonadIO m =>
   (Build.ResourceInputs m ByteString, Build.ResourceInputs m ByteString) ->
@@ -1028,24 +1004,23 @@ resourceTags ::
   Build.ResourceOutput m String ->
   Build.ActionT m ()
 resourceTags iArticle oTag = do
-  mTags <- optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
-  for_ mTags $ \tags -> do
-    for_ tags $ \tag -> do
-      let tagName = resourceName . Build.resourceOutputId oTag $ Text.unpack tag
-      mTagContents <- Store.readResource (Build.resourceOutputType oTag) tagName
-      let
-        items =
-          case mTagContents of
-            Nothing ->
-              Set.singleton (fromString $ renderResourceId (Build.resourceInputId iArticle))
-            Just tagContents ->
-              Set.insert (fromString $ renderResourceId (Build.resourceInputId iArticle)) $
-                Set.fromList (ByteString.Char8.lines tagContents)
-      Build.writeResource oTag (Text.unpack tag) $
-        ByteString.Lazy.Char8.unlines (LazyByteString.fromStrict <$> Set.toList items)
-      Build.setResourceProperty oTag (renderName tagName) (unsafeName "url") $
-        VString . fromString $
-          "/tags/" ++ renderName tagName
+  tags <- requireMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
+  for_ tags $ \tag -> do
+    let tagName = resourceName . Build.resourceOutputId oTag $ Text.unpack tag
+    mTagContents <- Store.readResource (Build.resourceOutputType oTag) tagName
+    let
+      items =
+        case mTagContents of
+          Nothing ->
+            Set.singleton (fromString $ renderResourceId (Build.resourceInputId iArticle))
+          Just tagContents ->
+            Set.insert (fromString $ renderResourceId (Build.resourceInputId iArticle)) $
+              Set.fromList (ByteString.Char8.lines tagContents)
+    Build.writeResource oTag (Text.unpack tag) $
+      ByteString.Lazy.Char8.unlines (LazyByteString.fromStrict <$> Set.toList items)
+    Build.setResourceProperty oTag (renderName tagName) (unsafeName "url") $
+      VString . fromString $
+        "/tags/" ++ renderName tagName
 
 noteHtml ::
   forall m.
@@ -1166,7 +1141,7 @@ sortPosts iArticlesWithExcerpts iNotes = do
         iArticlesWithExcerpts
         ( \(iArticle, miExcerpt) -> do
             mPublished <- requireMetadata iArticle (fromString "published") (Metadata.option Metadata.utcTime)
-            tags <- fromMaybe [] <$> optionalMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
+            tags <- requireMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
             pure $ fmap (\published -> IndexArticle iArticle tags miExcerpt published) mPublished
         )
 
@@ -1176,7 +1151,7 @@ sortPosts iArticlesWithExcerpts iNotes = do
         iNotes
         ( \iNote -> do
             mPublished <- requireMetadata iNote (fromString "published") (Metadata.option Metadata.utcTime)
-            tags <- fromMaybe [] <$> optionalMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
+            tags <- requireMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
             references <- requireMetadata iNote (fromString "references") Metadata.value
             (_deps, document) <- loadMarkdown iNote
             html <- renderHtml document
