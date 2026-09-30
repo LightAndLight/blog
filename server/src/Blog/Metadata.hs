@@ -13,6 +13,7 @@ module Blog.Metadata
     -- * Value decoding
   , MetadataValueDecoder
   , runMetadataValueDecoder
+  , bool
   , option
   , list
   , text
@@ -184,6 +185,15 @@ data DecodeError
 
 runMetadataValueDecoder :: MetadataValueDecoder a -> [Part] -> MetadataValue -> Either DecodeError a
 runMetadataValueDecoder (MetadataValueDecoder f) = f
+
+bool :: MetadataValueDecoder Bool
+bool =
+  MetadataValueDecoder $
+    \path val ->
+      case val of
+        VTrue -> pure True
+        VFalse -> pure False
+        _ -> Left $ DecodeError path "not a bool"
 
 option :: MetadataValueDecoder a -> MetadataValueDecoder (Maybe a)
 option item =

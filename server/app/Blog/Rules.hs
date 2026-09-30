@@ -65,6 +65,7 @@ import Control.Monad.Trans.Writer.CPS (WriterT, runWriterT)
 import Control.Monad.Writer.Class (tell)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as ByteString.Char8
+import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
 import Data.Foldable (fold, foldlM, for_)
@@ -978,8 +979,6 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
 
   (prev, next) <- getAdjacency iAdjacency
 
-  let metadata = Build.resourceInputMetadata iArticle
-
   output <-
     renderTemplate iTemplate $
       resourceField
@@ -992,34 +991,44 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
             )
           ]
 
-  publishHtml iArticle oHtml output
+  publishHtml
+    iArticle
+    ( \iContent -> isJust <$> requireMetadata iContent (fromString "published") (Metadata.option Metadata.utcTime)
+    )
+    oHtml
+    output
 
 publishHtml ::
   Monad m =>
+  -- | Resource to publish
   Build.ResourceInput m a ->
+  {-|
+  * @True@ - the resource is publishable
+  * @False@ - the resource is a draft
+  -}
+  (Build.ResourceInput m a -> Build.ActionT m Bool) ->
   Build.ResourceOutput m () ->
   -- | HTML content
   LazyByteString ->
   Build.ActionT m ()
-publishHtml iContent oHtml output = do
+publishHtml iContent getIsPublished oHtml output = do
   Build.writeResource oHtml () output
 
   let mUrl = Map.lookup (fromString "url") (Build.resourceInputMetadata iContent)
   for_ mUrl $ \url -> do
-    mPublished <- requireMetadata iContent (fromString "published") (Metadata.option Metadata.utcTime)
-    case mPublished of
-      Nothing ->
-        case url of
-          VString url' -> do
-            Build.setResourceProperty oHtml () (unsafeName "url") $ VString $ fromString "/drafts" <> url'
-            Build.setResourceProperty oHtml () (unsafeName "draft") VTrue
-          _ ->
-            -- TODO: properly decode this and throw an error when the type is
-            -- wrong.
-            error "article's metadata.url is not a string"
-      Just{} -> do
+    isPublished <- getIsPublished iContent
+    if isPublished
+      then do
         Build.setResourceProperty oHtml () (unsafeName "url") url
         Build.setResourceProperty oHtml () (unsafeName "draft") VFalse
+      else case url of
+        VString url' -> do
+          Build.setResourceProperty oHtml () (unsafeName "url") $ VString $ fromString "/drafts" <> url'
+          Build.setResourceProperty oHtml () (unsafeName "draft") VTrue
+        _ ->
+          -- TODO: properly decode this and throw an error when the type is
+          -- wrong.
+          error "article's metadata.url is not a string"
 
 resourceTags ::
   forall m.
@@ -1062,8 +1071,6 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
 
   (prev, next) <- getAdjacency iAdjacency
 
-  let metadata = Build.resourceInputMetadata iNote
-
   output <-
     renderTemplate iTemplate $
       resourceField
@@ -1076,7 +1083,12 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
             )
           ]
 
-  publishHtml iNote oHtml output
+  publishHtml
+    iNote
+    ( \iContent -> isJust <$> requireMetadata iContent (fromString "published") (Metadata.option Metadata.utcTime)
+    )
+    oHtml
+    output
 
 pageDependency ::
   forall m.
@@ -1113,7 +1125,11 @@ pageHtml (iTemplate, iPage) oHtml = do
             )
           ]
 
-  publishHtml iPage oHtml output
+  publishHtml
+    iPage
+    (\iContent -> requireMetadata iContent (fromString "published") Metadata.bool)
+    oHtml
+    output
 
 data IndexItem m
   = IndexArticle
