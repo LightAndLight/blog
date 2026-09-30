@@ -992,9 +992,19 @@ articleHtml (iTemplate, iArticle, iAdjacency) (oExcerpt, oHtml) = do
             )
           ]
 
+  publishHtml iArticle oHtml output
+
+publishHtml ::
+  Monad m =>
+  Build.ResourceInput m a ->
+  Build.ResourceOutput m () ->
+  -- | HTML content
+  LazyByteString ->
+  Build.ActionT m ()
+publishHtml iContent oHtml output = do
   Build.writeResource oHtml () output
 
-  let mUrl = Map.lookup (fromString "url") metadata
+  let mUrl = Map.lookup (fromString "url") (Build.resourceInputMetadata iContent)
   for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
 
 resourceTags ::
@@ -1052,10 +1062,7 @@ noteHtml (iTemplate, iNote, iAdjacency) oHtml = do
             )
           ]
 
-  Build.writeResource oHtml () output
-
-  let mUrl = Map.lookup (fromString "url") metadata
-  for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
+  publishHtml iNote oHtml output
 
 pageDependency ::
   forall m.
@@ -1080,8 +1087,6 @@ pageHtml (iTemplate, iPage) oHtml = do
     (_deps, markdown) <- loadMarkdown iPage
     pandoc $ Pandoc.writeHtml5String htmlWriterOptions markdown
 
-  let metadata = Build.resourceInputMetadata iPage
-
   output <-
     renderTemplate iTemplate $
       resourceField
@@ -1094,10 +1099,7 @@ pageHtml (iTemplate, iPage) oHtml = do
             )
           ]
 
-  Build.writeResource oHtml () output
-
-  let mUrl = Map.lookup (fromString "url") metadata
-  for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
+  publishHtml iPage oHtml output
 
 data IndexItem m
   = IndexArticle
