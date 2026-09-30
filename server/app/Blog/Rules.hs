@@ -1005,7 +1005,21 @@ publishHtml iContent oHtml output = do
   Build.writeResource oHtml () output
 
   let mUrl = Map.lookup (fromString "url") (Build.resourceInputMetadata iContent)
-  for_ mUrl $ Build.setResourceProperty oHtml () (unsafeName "url")
+  for_ mUrl $ \url -> do
+    mPublished <- requireMetadata iContent (fromString "published") (Metadata.option Metadata.utcTime)
+    case mPublished of
+      Nothing ->
+        case url of
+          VString url' -> do
+            Build.setResourceProperty oHtml () (unsafeName "url") $ VString $ fromString "/drafts" <> url'
+            Build.setResourceProperty oHtml () (unsafeName "draft") VTrue
+          _ ->
+            -- TODO: properly decode this and throw an error when the type is
+            -- wrong.
+            error "article's metadata.url is not a string"
+      Just{} -> do
+        Build.setResourceProperty oHtml () (unsafeName "url") url
+        Build.setResourceProperty oHtml () (unsafeName "draft") VFalse
 
 resourceTags ::
   forall m.
