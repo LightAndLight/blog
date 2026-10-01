@@ -173,7 +173,7 @@ rules =
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "name")
-                  <*?> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+                <*> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
             )
           <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
@@ -187,7 +187,7 @@ rules =
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "article-name")
-                  <*?> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "article-name")
+                <*> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "article-name")
             )
           <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
@@ -201,7 +201,7 @@ rules =
           <*> Build.iAll
             ( (,)
                 <$> Build.iResource "article" (Build.iBind "name")
-                  <*?> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+                <*> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
             )
           <*> Build.iAll (Build.iResource "note" Build.iAny)
       )
@@ -974,8 +974,12 @@ articleHtml (iTemplate, iArticle, miAdjacency) (oExcerpt, oHtml) = do
           )
       <*> renderHtml document
 
-  for_ mExcerpt $
-    Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 . LazyText.fromStrict
+  case mExcerpt of
+    Nothing ->
+      throwError . DiagnosticSimple $
+        "failed to extract excerpt from " ++ renderResourceId (Build.resourceInputId iArticle)
+    Just excerpt ->
+      Build.writeResource oExcerpt () . Text.Lazy.Encoding.encodeUtf8 $ LazyText.fromStrict excerpt
 
   -- unpublished articles don't have adjacencies
   (prev, next) <- maybe (pure (Nothing, Nothing)) getAdjacency miAdjacency
@@ -1140,7 +1144,7 @@ data IndexItem m
       -- | Tags
       [Text]
       -- | Excerpt
-      (Maybe (Build.ResourceInput m ByteString))
+      (Build.ResourceInput m ByteString)
       -- | Published
       UTCTime
   | IndexNote
@@ -1165,7 +1169,7 @@ indexItemPublished (IndexNote _note _tags _references published _content) = publ
 
 sortPosts ::
   MonadIO m =>
-  [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))] ->
+  [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)] ->
   [Build.ResourceInput m ByteString] ->
   Build.ActionT m [IndexItem m]
 sortPosts iArticlesWithExcerpts iNotes = do
@@ -1173,10 +1177,10 @@ sortPosts iArticlesWithExcerpts iNotes = do
     catMaybes
       <$> for
         iArticlesWithExcerpts
-        ( \(iArticle, miExcerpt) -> do
+        ( \(iArticle, iExcerpt) -> do
             mPublished <- requireMetadata iArticle (fromString "published") (Metadata.option Metadata.utcTime)
             tags <- requireMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
-            pure $ fmap (\published -> IndexArticle iArticle tags miExcerpt published) mPublished
+            pure $ fmap (\published -> IndexArticle iArticle tags iExcerpt published) mPublished
         )
 
   notesWithPublished <-
@@ -1200,11 +1204,13 @@ publishedPostsList :: Monad m => [IndexItem m] -> Value (Build.ActionT m)
 publishedPostsList sortedPosts =
   List $
     sortedPosts <&> \case
-      IndexArticle iArticle _tags miExcerpt published ->
+      IndexArticle iArticle _tags iExcerpt published ->
         post iArticle published . Constructor (fromString "Article") $
           [ recordValue
-              [ (fromString "excerpt", bytestringValue $ Build.resourceInputContent iExcerpt)
-              | Just iExcerpt <- [miExcerpt]
+              [
+                ( fromString "excerpt"
+                , bytestringValue . Build.resourceInputContent $ iExcerpt
+                )
               ]
           ]
       IndexNote iNote _tags references published html ->
@@ -1236,7 +1242,7 @@ publishedPostsList sortedPosts =
 indexHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
-  , [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))]
+  , [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)]
   , [Build.ResourceInput m ByteString]
   ) ->
   Build.ResourceOutput m () ->
@@ -1282,7 +1288,7 @@ tagIndexHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
   , Build.ResourceInput m ByteString
-  , [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))]
+  , [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)]
   , [Build.ResourceInput m ByteString]
   ) ->
   Build.ResourceOutput m () ->
@@ -1353,7 +1359,7 @@ indexFeed ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
   , Build.ResourceInput m ByteString
-  , [(Build.ResourceInput m ByteString, Maybe (Build.ResourceInput m ByteString))]
+  , [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)]
   , [Build.ResourceInput m ByteString]
   ) ->
   Build.ResourceOutput m () ->
