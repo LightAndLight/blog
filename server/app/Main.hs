@@ -57,7 +57,6 @@ import Data.Either (isLeft)
 import Data.Foldable (for_, traverse_)
 import Data.Map (Map)
 import qualified Data.Map as Map
-import Data.Maybe (catMaybes)
 import Data.String (fromString)
 import Data.Text (Text)
 import qualified Data.Text as Text
@@ -173,34 +172,53 @@ initStore data_ = do
 
 data Routes
   = Routes
-  { routesActive :: TVar Routes.Routes
-  , routesPending :: TVar (Map Store.TransactionId Routes.Routes)
+  { routesActive :: TVar (Routes.Routes Routes.Entry)
+  , routesChanges :: TVar (Map Store.TransactionId (Routes.Routes RouteChange))
   }
 
-readActiveRoutes :: Routes -> IO Routes.Routes
+data RouteChange
+  = RouteInsert Routes.Entry
+  | RouteDelete
+
+readActiveRoutes :: Routes -> IO (Routes.Routes Routes.Entry)
 readActiveRoutes = readTVarIO . routesActive
 
 beginRoutes :: Routes -> Store.TransactionId -> IO ()
-beginRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.insert xactId Routes.empty)
+beginRoutes routes xactId = atomically $ modifyTVar (routesChanges routes) (Map.insert xactId Routes.empty)
 
 commitRoutes :: Routes -> Store.TransactionId -> IO ()
 commitRoutes routes xactId = atomically $ do
-  routes' <- readTVar $ routesPending routes
+  routes' <- readTVar $ routesChanges routes
   case Map.lookup xactId routes' of
     Nothing -> pure ()
     Just routes'' -> do
-      modifyTVar (routesActive routes) (routes'' <>)
-      modifyTVar (routesPending routes) (Map.delete xactId)
+      modifyTVar (routesActive routes) $ \active ->
+        Routes.foldlWithKey'
+          ( \acc path change ->
+              case change of
+                RouteInsert entry -> Routes.insert path entry acc
+                RouteDelete -> Routes.delete path acc
+          )
+          active
+          routes''
+      modifyTVar (routesChanges routes) (Map.delete xactId)
 
 rollbackRoutes :: Routes -> Store.TransactionId -> IO ()
-rollbackRoutes routes xactId = atomically $ modifyTVar (routesPending routes) (Map.delete xactId)
+rollbackRoutes routes xactId = atomically $ modifyTVar (routesChanges routes) (Map.delete xactId)
 
 insertRoute :: Store.TransactionId -> [Text] -> Routes.Entry -> Routes -> IO ()
 insertRoute xactId path value routes =
   atomically $
     modifyTVar
-      (routesPending routes)
-      (Map.insertWith (<>) xactId (Routes.singleton path value))
+      (routesChanges routes)
+      (Map.insertWith (<>) xactId (Routes.singleton path (RouteInsert value)))
+
+deleteRoute :: Store.TransactionId -> [Text] -> Routes -> IO ()
+deleteRoute xactId path routes =
+  atomically $
+    modifyTVar
+      (routesChanges routes)
+      (Map.insertWith (<>) xactId (Routes.singleton path RouteDelete))
 
 routeEntryParser :: Sage.Parser ([Text], Routes.Entry)
 routeEntryParser =
@@ -276,48 +294,84 @@ updateRoutes store routesVar xactId allChanges = do
           Log.attach (fromString "missing-resource") $ renderName resTyName
           pure []
         Just resTy ->
-          fmap catMaybes . for (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
+          fmap concat . for (Map.toList allChanges) $ \(changedId, Build.Change status _reasons) ->
             if resourceType changedId == resTyName
               then do
                 let
+                  parseRouteEntry content =
+                    case Sage.parse entryParser content of
+                      Right x ->
+                        pure x
+                      Left err ->
+                        throwError $
+                          DiagnosticReports
+                            (fromString $ renderResourceId changedId)
+                            (LazyByteString.fromStrict content)
+                            (sageErrorReport err)
+
                   addRouteEntry = do
                     mContent <- Store.readResource resTy (resourceName changedId)
                     content <- maybe (error $ "missing " ++ renderResourceId changedId) pure mContent
-                    (path, entry) <-
-                      case Sage.parse entryParser content of
-                        Right x ->
-                          pure x
-                        Left err ->
-                          throwError $
-                            DiagnosticReports
-                              (fromString $ renderResourceId changedId)
-                              (LazyByteString.fromStrict content)
-                              (sageErrorReport err)
+                    (path, entry) <- parseRouteEntry content
                     liftIO $ insertRoute xactId path entry routesVar
 
                     case entry of
                       Routes.EntryRedirect target ->
-                        pure $
-                          Log.object
-                            [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
-                            , fromString "type" .= "redirect"
-                            , fromString "target" .= ByteString.Char8.unpack target
-                            ]
+                        pure
+                          [ Log.object
+                              [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
+                              , fromString "change" .= "insert"
+                              , fromString "type" .= "redirect"
+                              , fromString "target" .= ByteString.Char8.unpack target
+                              ]
+                          ]
                       Routes.EntryResourceId visibility target ->
-                        pure $
-                          Log.object
-                            [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
-                            , fromString "type" .= "route"
-                            , fromString "visibility"
-                                .= (case visibility of Routes.Public -> "public"; Routes.Private -> "private")
-                            , fromString "target" .= renderResourceId target
-                            ]
+                        pure
+                          [ Log.object
+                              [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
+                              , fromString "change" .= "insert"
+                              , fromString "type" .= "route"
+                              , fromString "visibility"
+                                  .= (case visibility of Routes.Public -> "public"; Routes.Private -> "private")
+                              , fromString "target" .= renderResourceId target
+                              ]
+                          ]
 
-                Just <$> case status of
-                  Build.Created -> addRouteEntry
-                  Build.Updated -> addRouteEntry
+                case status of
+                  Build.Created -> do
+                    addRouteEntry
+                  Build.Updated -> do
+                    logs <- addRouteEntry
+                    mResTyCurrent <- Store.lookupResourceType store Nothing resTyName
+                    logs' <-
+                      {- Remove the current entry for the route resource that's being overwritten.
+
+                      For example, you change the route from `/this -> resource:name` to `/that -> resource:name`.
+                      Without the deletion code, the route table will end up with entries for `/this` *and* `/that`.
+                      -}
+                      case mResTyCurrent of
+                        Nothing ->
+                          -- If the routing resource type doesn't currently exist, then there's nothing to reomve.
+                          pure []
+                        Just resTyCurrent -> do
+                          mContentCurrent <- Store.readResource resTyCurrent (resourceName changedId)
+                          case mContentCurrent of
+                            Nothing ->
+                              -- If the updated routing resource doesn't currently exist (implying this updates
+                              -- a resource created in the current transaction) then there's nothing to remove.
+                              pure []
+                            Just contentCurrent -> do
+                              (path, _entry) <- parseRouteEntry contentCurrent
+                              liftIO $ deleteRoute xactId path routesVar
+                              pure
+                                [ Log.object
+                                    [ fromString "path" .= ByteString.Lazy.Char8.unpack (Routes.renderPath path)
+                                    , fromString "change" .= "delete"
+                                    ]
+                                ]
+                    pure $ logs ++ logs'
               else
-                pure Nothing
+                pure []
 
 main :: IO ()
 main = do

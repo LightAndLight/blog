@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 
 module Blog.Route
@@ -10,6 +11,7 @@ module Blog.Route
   , delete
   , lookup
   , unionWith
+  , foldlWithKey'
   , RouteEntry (..)
   , Visibility (..)
   , routeEntryParser
@@ -42,7 +44,7 @@ import qualified Data.Text.Lazy.Encoding as Text.Lazy.Encoding
 import qualified Text.Sage as Sage
 import Prelude hiding (lookup, null)
 
-data Routes = Routes !(Maybe Entry) !(Map Text Routes)
+data Routes a = Routes !(Maybe a) !(Map Text (Routes a))
 
 data Entry
   = EntryResourceId
@@ -52,50 +54,50 @@ data Entry
       -- | Destination URL
       !ByteString
 
-instance Semigroup Routes where
+instance Semigroup (Routes a) where
   rs <> rs' = unionWith (\l _r -> l) rs rs'
 
-instance Monoid Routes where
+instance Monoid (Routes a) where
   mempty = empty
 
-empty :: Routes
+empty :: Routes a
 empty = Routes Nothing mempty
 
-null :: Routes -> Bool
+null :: Routes a -> Bool
 null (Routes root rest) = isNothing root && Map.null rest
 
-singleton :: [Text] -> Entry -> Routes
+singleton :: [Text] -> a -> Routes a
 singleton [] value =
   Routes (Just value) mempty
 singleton (p : ps) value =
   Routes Nothing $ Map.singleton p (singleton ps value)
 
-insert :: [Text] -> Entry -> Routes -> Routes
+insert :: forall a. [Text] -> a -> Routes a -> Routes a
 insert [] value (Routes _ rest) = Routes (Just value) rest
 insert (p : ps) value (Routes root rest) = Routes root (Map.alter f p rest)
   where
-    f :: Maybe Routes -> Maybe Routes
+    f :: Maybe (Routes a) -> Maybe (Routes a)
     f Nothing = Just $ singleton ps value
     f (Just routes) = Just $ insert ps value routes
 
-delete :: [Text] -> Routes -> Routes
+delete :: [Text] -> Routes a -> Routes a
 delete [] (Routes _ rest) = Routes Nothing rest
 delete (p : ps) (Routes root rest) = Routes root (Map.alter f p rest)
   where
-    f :: Maybe Routes -> Maybe Routes
+    f :: Maybe (Routes a) -> Maybe (Routes a)
     f Nothing = Nothing
     f (Just routes) = do
       let routes' = delete ps routes
       guard . not $ null routes'
       pure routes'
 
-lookup :: [Text] -> Routes -> Maybe Entry
+lookup :: [Text] -> Routes a -> Maybe a
 lookup [] (Routes root _) = root
 lookup (p : ps) (Routes _ rest) = do
   routes <- Map.lookup p rest
   lookup ps routes
 
-unionWith :: (Entry -> Entry -> Entry) -> Routes -> Routes -> Routes
+unionWith :: (a -> a -> a) -> Routes a -> Routes a -> Routes a
 unionWith f (Routes root rest) (Routes root' rest') =
   Routes
     ( f <$> root <*> root'
@@ -103,6 +105,15 @@ unionWith f (Routes root rest) (Routes root' rest') =
         <|> root'
     )
     (Map.unionWith (unionWith f) rest rest')
+
+foldlWithKey' :: (b -> [Text] -> a -> b) -> b -> Routes a -> b
+foldlWithKey' f !z = go [] z
+  where
+    go path acc (Routes ma rest) =
+      Map.foldlWithKey'
+        (\acc' part -> go (path ++ [part]) acc')
+        (maybe acc (f acc path) ma)
+        rest
 
 data RouteEntry
   = RouteEntry
