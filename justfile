@@ -56,14 +56,16 @@ ca:
         -sha256 \
         -key tls/root.key \
         -out tls/root.csr \
-        -subj "/C=AU/O=blog.localhost"
+        -subj "/C=AU/O=blog.localhost" \
+        -addext "basicConstraints=CA:true,pathlen:1"
 
     openssl x509 \
         -req \
         -sha256 \
         -in tls/root.csr \
         -signkey tls/root.key \
-        -out tls/root.crt
+        -out tls/root.crt \
+        -copy_extensions copy
 
 # Generate a self-signed certificate
 tls:

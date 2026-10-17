@@ -57,6 +57,10 @@
             zlib
             openssl
           ];
+
+          shellHook = ''
+            export MANPATH="${pkgs.openssl.man}:$MANPATH"
+          '';
         };
       }
     );
