@@ -68,7 +68,7 @@ import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
-import Data.Foldable (fold, foldlM, for_)
+import Data.Foldable (fold, for_)
 import Data.Functor ((<&>))
 import Data.List (find, sortOn)
 import Data.Map (Map)
@@ -360,6 +360,36 @@ requireMetadata input name decoder =
           ++ renderResourceId (Build.resourceInputId input)
           ++ ":metadata): missing property '"
           ++ Text.unpack name
+          ++ "'"
+
+requireProperty ::
+  Monad m =>
+  Build.ResourceInput m a ->
+  -- | Property name
+  Name ->
+  MetadataValueDecoder b ->
+  Build.ActionT m b
+requireProperty input name decoder = do
+  mValue <- Build.resourceInputProperty input name
+  case mValue of
+    Just value ->
+      case runMetadataValueDecoder decoder [] value of
+        Left err ->
+          throwError . DiagnosticSimple $
+            "("
+              ++ renderResourceId (Build.resourceInputId input)
+              ++ ":"
+              ++ renderName name
+              ++ "): "
+              ++ renderMetadataDecodeError err
+        Right b ->
+          pure b
+    Nothing ->
+      throwError . DiagnosticSimple $
+        "("
+          ++ renderResourceId (Build.resourceInputId input)
+          ++ ": missing property '"
+          ++ renderName name
           ++ "'"
 
 articleAdjacency ::
@@ -1147,6 +1177,8 @@ data IndexItem m
       (Build.ResourceInput m ByteString)
       -- | Published
       UTCTime
+      -- | Updated
+      UTCTime
   | IndexNote
       -- | Note
       (Build.ResourceInput m ByteString)
@@ -1156,16 +1188,22 @@ data IndexItem m
       MetadataValue
       -- | Published
       UTCTime
+      -- | Updated
+      UTCTime
       -- | Rendered HTML
       Text
 
 indexItemTags :: IndexItem m -> [Text]
-indexItemTags (IndexArticle _article tags _excerpt _published) = tags
-indexItemTags (IndexNote _note tags _references _published _content) = tags
+indexItemTags (IndexArticle _article tags _excerpt _published _updated) = tags
+indexItemTags (IndexNote _note tags _references _published _updated _content) = tags
 
 indexItemPublished :: IndexItem m -> UTCTime
-indexItemPublished (IndexArticle _article _tags _excerpt published) = published
-indexItemPublished (IndexNote _note _tags _references published _content) = published
+indexItemPublished (IndexArticle _article _tags _excerpt published _updated) = published
+indexItemPublished (IndexNote _note _tags _references published _updated _content) = published
+
+indexItemUpdated :: IndexItem m -> UTCTime
+indexItemUpdated (IndexArticle _article _tags _excerpt _published updated) = updated
+indexItemUpdated (IndexNote _note _tags _references _published updated _content) = updated
 
 sortPosts ::
   MonadIO m =>
@@ -1179,8 +1217,9 @@ sortPosts iArticlesWithExcerpts iNotes = do
         iArticlesWithExcerpts
         ( \(iArticle, iExcerpt) -> do
             mPublished <- requireMetadata iArticle (fromString "published") (Metadata.option Metadata.utcTime)
+            updated <- requireProperty iArticle (unsafeName "updated") Metadata.utcTime
             tags <- requireMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
-            pure $ fmap (\published -> IndexArticle iArticle tags iExcerpt published) mPublished
+            pure $ fmap (\published -> IndexArticle iArticle tags iExcerpt published updated) mPublished
         )
 
   notesWithPublished <-
@@ -1189,11 +1228,12 @@ sortPosts iArticlesWithExcerpts iNotes = do
         iNotes
         ( \iNote -> do
             mPublished <- requireMetadata iNote (fromString "published") (Metadata.option Metadata.utcTime)
+            updated <- requireProperty iNote (unsafeName "updated") Metadata.utcTime
             tags <- requireMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
             references <- requireMetadata iNote (fromString "references") Metadata.value
             (_deps, document) <- loadMarkdown iNote
             html <- renderHtml document
-            pure $ fmap (\published -> IndexNote iNote tags references published html) mPublished
+            pure $ fmap (\published -> IndexNote iNote tags references published updated html) mPublished
         )
 
   pure
@@ -1204,7 +1244,7 @@ publishedPostsList :: Monad m => [IndexItem m] -> Value (Build.ActionT m)
 publishedPostsList sortedPosts =
   List $
     sortedPosts <&> \case
-      IndexArticle iArticle _tags iExcerpt published ->
+      IndexArticle iArticle _tags iExcerpt published _updated ->
         post iArticle published . Constructor (fromString "Article") $
           [ recordValue
               [
@@ -1213,7 +1253,7 @@ publishedPostsList sortedPosts =
                 )
               ]
           ]
-      IndexNote iNote _tags references published html ->
+      IndexNote iNote _tags references published _updated html ->
         post iNote published . Constructor (fromString "Note") $
           [ recordValue
               [ (fromString "content", textValue html)
@@ -1373,19 +1413,7 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
 
   sortedPosts <- sortPosts iArticlesWithExcerpts iNotes
 
-  updated <-
-    foldlM
-      ( \acc res -> do
-          mUpdated <- Build.resourceInputProperty res (unsafeName "updated")
-          case mUpdated of
-            Just value
-              | Right updated <- runMetadataValueDecoder Metadata.utcTime [] value ->
-                  pure $ max acc updated
-            _ ->
-              pure acc
-      )
-      (posixSecondsToUTCTime 0)
-      (fmap fst iArticlesWithExcerpts ++ iNotes)
+  let updated = foldl' (\acc res -> max acc (indexItemUpdated res)) (posixSecondsToUTCTime 0) sortedPosts
 
   output <-
     renderTemplate iTemplate $
