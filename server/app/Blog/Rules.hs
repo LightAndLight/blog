@@ -1415,6 +1415,14 @@ sitemap ::
 sitemap (iSitemapUrl, iTemplate, iHtmls) oXml = do
   url <- getFormattedContent iSitemapUrl
 
+  pages <- fmap catMaybes . for (Build.resourceInputs iHtmls) $ \iHtml -> do
+    mDraft <- Build.resourceInputProperty iHtml (unsafeName "draft")
+    case mDraft of
+      Just VTrue -> pure Nothing
+      Just VFalse -> pure $ Just iHtml
+      Just value -> error $ "invalid value for 'draft' property: " ++ show value
+      Nothing -> pure $ Just iHtml
+
   output <-
     renderTemplate iTemplate $
       resourceField
@@ -1422,7 +1430,7 @@ sitemap (iSitemapUrl, iTemplate, iHtmls) oXml = do
           [
             ( fromString "pages"
             , List $
-                Build.resourceInputs iHtmls <&> \iHtml ->
+                pages <&> \iHtml ->
                   -- TODO: add `<lastmod>` to sitemap URLs by passing the `updated`
                   -- property. Requires that either every page has an `updated`
                   -- property, or there's a way to get a reasonable default (getModificationTime?)
