@@ -743,7 +743,8 @@ app store routesVar request respond = do
     case Wai.pathInfo request of
       [part] | part == fromString ".login" ->
         case ByteString.Char8.unpack $ Wai.requestMethod request of
-          "POST" -> httpLogin store routesVar request
+          "GET" -> httpLoginGet store routesVar request
+          "POST" -> httpLoginPost store routesVar request
           _ -> methodNotAllowed
       [part] | part == fromString ".logout" ->
         case ByteString.Char8.unpack $ Wai.requestMethod request of
@@ -938,14 +939,46 @@ createSession sessionTy sessionId username expires = do
 
   pure ()
 
-httpLogin ::
+httpLoginGet ::
   (MonadLog m, MonadIO m, MonadMask m) =>
   Store (ExceptT DiagnosticReports m) ->
   Routes ->
   Wai.Request ->
   HandlerT m Wai.Response
-httpLogin store routesVar request =
-  Log.scope (fromString "endpoint.login") $ do
+httpLoginGet _store _routesVar _request =
+  Log.scope (fromString "endpoint.login-get") $ do
+    pure $
+      Wai.responseLBS
+        ok200
+        []
+        ( fromString . unlines $
+            [ "<!doctype html>"
+            , "<html>"
+            , "<head>"
+            , "<meta charset=\"utf-8\">"
+            , "<title>Login</title>"
+            , "</head>"
+            , "<body style=\"font-family: sans-serif;\">"
+            , "<form method=\"POST\" action=\"/.login\" style=\"margin: auto; max-width: 15rem; display: flex; flex-direction: column\">"
+            , "<label for=\"input-username\">Username</label>"
+            , "<input id=\"input-username\" type=\"text\" name=\"username\" autofocus style=\"margin-bottom: 1rem;\">"
+            , "<label for=\"input-password\">Password</label>"
+            , "<input id=\"input-password\" type=\"password\" name=\"password\" style=\"margin-bottom: 1rem;\">"
+            , "<input type=\"submit\" value=\"Log in\">"
+            , "</form>"
+            , "</body>"
+            , "</html>"
+            ]
+        )
+
+httpLoginPost ::
+  (MonadLog m, MonadIO m, MonadMask m) =>
+  Store (ExceptT DiagnosticReports m) ->
+  Routes ->
+  Wai.Request ->
+  HandlerT m Wai.Response
+httpLoginPost store routesVar request =
+  Log.scope (fromString "endpoint.login-post") $ do
     let contentType = "application/x-www-form-urlencoded"
     case lookup (fromString "Content-Type") $ Wai.requestHeaders request of
       Just value | value == fromString contentType -> pure ()
