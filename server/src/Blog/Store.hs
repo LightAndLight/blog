@@ -821,7 +821,7 @@ resourceTypeFromDirectory storeDir mXactId resTyName config =
     listPropertiesImpl :: Name -> m [Name]
     listPropertiesImpl resName = liftIO $ do
       entries <- overlayListDir overlay (Just $ propertiesPart resName)
-      pure $ fmap pathToName entries
+      pure [pathToName entry | entry <- entries, entry `notElem` ["dependencies", "dependents"]]
 
     readResourceModificationTimeImpl :: Name -> m (Maybe UTCTime)
     readResourceModificationTimeImpl resName =
