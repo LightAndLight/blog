@@ -57,12 +57,14 @@ module Blog.Store
   , listDependencies
   , listDependents
   , createDependency
+  , createDependencyUnchecked
   , removeDependency
 
     -- * Internals
   , Store (..)
   , ResourceType (..)
-  ) where
+  )
+where
 
 import Blog
   ( MetadataValue (..)
@@ -667,6 +669,7 @@ data ResourceType m
   , listDependenciesImpl :: !(Name -> m [ResourceId])
   , listDependentsImpl :: !(Name -> m [ResourceId])
   , createDependencyImpl :: !(Name -> ResourceId -> m ())
+  , createDependencyUncheckedImpl :: !(Name -> ResourceId -> m ())
   , removeDependencyImpl :: !(Name -> ResourceId -> m ())
   }
 
@@ -687,6 +690,7 @@ hoistResourceType f ResourceType{..} =
     , listDependenciesImpl = f . listDependenciesImpl
     , listDependentsImpl = f . listDependentsImpl
     , createDependencyImpl = \resNameSrc dependencyTarget -> f $ createDependencyImpl resNameSrc dependencyTarget
+    , createDependencyUncheckedImpl = \resNameSrc dependencyTarget -> f $ createDependencyUncheckedImpl resNameSrc dependencyTarget
     , removeDependencyImpl = \resNameSrc dependencyTarget -> f $ removeDependencyImpl resNameSrc dependencyTarget
     }
 
@@ -852,38 +856,44 @@ resourceTypeFromDirectory storeDir mXactId resTyName config =
         entries <- overlayListDir overlay . Just $ propertiesPart resName </> "dependents"
         pure $ fmap pathToResourceId entries
 
+    createDependencyUncheckedImpl :: Name -> ResourceId -> m ()
+    createDependencyUncheckedImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
+      let dependencySource = ResourceId resTyName resNameSrc
+
+      liftIO $ do
+        let dir = propertiesPart resNameSrc </> "dependencies"
+        dirExists <- overlayDoesDirectoryExist overlay dir
+        unless dirExists $ overlayCreateDir overlay dir
+        overlayWriteFile
+          overlay
+          (dir </> resourceIdToPath dependencyTarget)
+          mempty
+
+      let tgtOverlay = getOverlay $ nameToPath resTyNameTgt
+      liftIO $ do
+        let dir = propertiesPart resNameTgt </> "dependents"
+        dirExists <- overlayDoesDirectoryExist tgtOverlay dir
+        unless dirExists $ overlayCreateDir tgtOverlay dir
+        overlayWriteFile
+          tgtOverlay
+          (dir </> resourceIdToPath dependencySource)
+          mempty
+
     createDependencyImpl :: Name -> ResourceId -> m ()
     createDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
       let dependencySource = ResourceId resTyName resNameSrc
-
-      srcExists <- liftIO $ overlayDoesFileExist overlay (nameToPath resNameSrc)
-      if srcExists
-        then liftIO $ do
-          let dir = propertiesPart resNameSrc </> "dependencies"
-          dirExists <- overlayDoesDirectoryExist overlay dir
-          unless dirExists $ overlayCreateDir overlay dir
-          overlayWriteFile
-            overlay
-            (dir </> resourceIdToPath dependencyTarget)
-            mempty
-        else
-          throwError . DiagnosticSimple $
-            "dependency source " ++ renderResourceId dependencySource ++ " does not exist"
+      srcExists <- liftIO . overlayDoesFileExist overlay $ nameToPath resNameSrc
+      unless srcExists $
+        throwError . DiagnosticSimple $
+          "dependency source " ++ renderResourceId dependencySource ++ " does not exist"
 
       let tgtOverlay = getOverlay $ nameToPath resTyNameTgt
-      tgtExists <- liftIO $ overlayDoesFileExist tgtOverlay (nameToPath resNameTgt)
-      if tgtExists
-        then liftIO $ do
-          let dir = propertiesPart resNameTgt </> "dependents"
-          dirExists <- overlayDoesDirectoryExist tgtOverlay dir
-          unless dirExists $ overlayCreateDir tgtOverlay dir
-          overlayWriteFile
-            tgtOverlay
-            (dir </> resourceIdToPath dependencySource)
-            mempty
-        else
-          throwError . DiagnosticSimple $
-            "dependency target " ++ renderResourceId dependencyTarget ++ " does not exist"
+      tgtExists <- liftIO . overlayDoesFileExist tgtOverlay $ nameToPath resNameTgt
+      unless tgtExists $
+        throwError . DiagnosticSimple $
+          "dependency target " ++ renderResourceId dependencyTarget ++ " does not exist"
+
+      createDependencyUncheckedImpl resNameSrc dependencyTarget
 
     removeDependencyImpl :: Name -> ResourceId -> m ()
     removeDependencyImpl resNameSrc dependencyTarget@(ResourceId resTyNameTgt resNameTgt) = do
@@ -966,6 +976,20 @@ listDependencies = listDependenciesImpl
 
 listDependents :: ResourceType m -> Name -> m [ResourceId]
 listDependents = listDependentsImpl
+
+{-| Like 'createDependency', but don't check whether the source or target exists.
+
+Precondition: the resource is writeable (see 'lookupResourceType')
+-}
+createDependencyUnchecked ::
+  HasCallStack =>
+  ResourceType m ->
+  -- | Source name
+  Name ->
+  -- | Target ID
+  ResourceId ->
+  m ()
+createDependencyUnchecked = createDependencyUncheckedImpl
 
 -- | Precondition: the resource is writeable (see 'lookupResourceType')
 createDependency ::
