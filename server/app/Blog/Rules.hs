@@ -180,6 +180,19 @@ rules =
       (Build.oResource "html" (Build.oMatch "index"))
       indexHtml
     <> Build.rule
+      "drafts-html"
+      ( (,,)
+          <$> Build.iResource "template" (Build.iMatch "post-list.html.temple")
+          <*> Build.iAll
+            ( (,)
+                <$> Build.iResource "article" (Build.iBind "name")
+                <*> Build.iResource "excerpt" (Build.iMatch "article-" <> Build.iBind "name")
+            )
+          <*> Build.iAll (Build.iResource "note" Build.iAny)
+      )
+      (Build.oResource "html" (Build.oMatch "drafts"))
+      draftsHtml
+    <> Build.rule
       "tag-index-html"
       ( (,,,)
           <$> Build.iResource "tag" (Build.iBind "name")
@@ -388,7 +401,7 @@ requireProperty input name decoder = do
       throwError . DiagnosticSimple $
         "("
           ++ renderResourceId (Build.resourceInputId input)
-          ++ ": missing property '"
+          ++ "): missing property '"
           ++ renderName name
           ++ "'"
 
@@ -1205,12 +1218,12 @@ indexItemUpdated :: IndexItem m -> UTCTime
 indexItemUpdated (IndexArticle _article _tags _excerpt _published updated) = updated
 indexItemUpdated (IndexNote _note _tags _references _published updated _content) = updated
 
-sortPosts ::
+sortPublishedPosts ::
   MonadIO m =>
   [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)] ->
   [Build.ResourceInput m ByteString] ->
   Build.ActionT m [IndexItem m]
-sortPosts iArticlesWithExcerpts iNotes = do
+sortPublishedPosts iArticlesWithExcerpts iNotes = do
   articlesWithExcerptsWithPublished <-
     catMaybes
       <$> for
@@ -1279,6 +1292,124 @@ publishedPostsList sortedPosts =
           ]
           <> propertyFields res
 
+data DraftItem m
+  = DraftArticle
+      -- | Article
+      (Build.ResourceInput m ByteString)
+      -- | Tags
+      [Text]
+      -- | Excerpt
+      (Build.ResourceInput m ByteString)
+      -- | URL
+      Text
+      -- | Updated
+      UTCTime
+  | DraftNote
+      -- | Note
+      (Build.ResourceInput m ByteString)
+      -- | Tags
+      [Text]
+      -- | @references@ metadata
+      MetadataValue
+      -- | URL
+      Text
+      -- | Updated
+      UTCTime
+      -- | Rendered HTML
+      Text
+
+draftItemUpdated :: DraftItem m -> UTCTime
+draftItemUpdated (DraftArticle _article _tags _excerpt _url updated) = updated
+draftItemUpdated (DraftNote _note _tags _references _url updated _content) = updated
+
+sortUnpublishedPosts ::
+  MonadIO m =>
+  [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)] ->
+  [Build.ResourceInput m ByteString] ->
+  Build.ActionT m [DraftItem m]
+sortUnpublishedPosts iArticlesWithExcerpts iNotes = do
+  articlesWithExcerptsUnpublished <-
+    catMaybes
+      <$> for
+        iArticlesWithExcerpts
+        ( \(iArticle, iExcerpt) -> do
+            if isPublished iArticle
+              then pure Nothing
+              else do
+                url <- requireMetadata iArticle (fromString "url") Metadata.text
+                updated <- requireProperty iArticle (unsafeName "updated") Metadata.utcTime
+                tags <- requireMetadata iArticle (fromString "tags") (Metadata.list Metadata.text)
+                pure . Just $ DraftArticle iArticle tags iExcerpt url updated
+        )
+
+  notesUnpublished <-
+    catMaybes
+      <$> for
+        iNotes
+        ( \iNote -> do
+            if isPublished iNote
+              then pure Nothing
+              else do
+                url <- requireMetadata iNote (fromString "url") Metadata.text
+                updated <- requireProperty iNote (unsafeName "updated") Metadata.utcTime
+                tags <- requireMetadata iNote (fromString "tags") (Metadata.list Metadata.text)
+                references <- requireMetadata iNote (fromString "references") Metadata.value
+                (_deps, document) <- loadMarkdown iNote
+                html <- renderHtml document
+                pure . Just $ DraftNote iNote tags references url updated html
+        )
+
+  pure
+    . sortOn (Down . draftItemUpdated)
+    $ articlesWithExcerptsUnpublished ++ notesUnpublished
+  where
+    isPublished input =
+      case Map.lookup (fromString "published") (Build.resourceInputMetadata input) of
+        Nothing -> False
+        Just (VConstructor ctor _) | ctor == fromString "Some" -> True
+        Just (VConstructor ctor _) | ctor == fromString "None" -> False
+        Just value -> error $ "unexpected value for 'published' property: " ++ show value
+
+unpublishedPostsList :: Monad m => [DraftItem m] -> Value (Build.ActionT m)
+unpublishedPostsList sortedPosts =
+  List $
+    sortedPosts <&> \case
+      DraftArticle iArticle _tags iExcerpt url updated ->
+        post iArticle url updated . Constructor (fromString "Article") $
+          [ recordValue
+              [
+                ( fromString "excerpt"
+                , bytestringValue . Build.resourceInputContent $ iExcerpt
+                )
+              ]
+          ]
+      DraftNote iNote _tags references url updated html ->
+        post iNote url updated . Constructor (fromString "Note") $
+          [ recordValue
+              [ (fromString "content", textValue html)
+              , (fromString "references", metadataValue references)
+              ]
+          ]
+  where
+    -- TODO: the `type` property should come from metadata.
+    --
+    -- Currently blocked on having a good syntax for sum types in metadata.
+    post res url updated postType =
+      Record $
+        fields
+          [
+            ( fromString "metadata"
+            , Record $
+                fields
+                  [ (fromString "type", postType)
+                  , (fromString "published", metadataValue $ utctimeMetadataValue updated)
+                  , (fromString "url", metadataValue . VString $ fromString "/drafts" <> url)
+                  ]
+                  <> metadataFields (Build.resourceInputMetadata res)
+            )
+          ]
+          <> propertyFields res
+
 indexHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
@@ -1288,7 +1419,7 @@ indexHtml ::
   Build.ResourceOutput m () ->
   Build.ActionT m ()
 indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
-  sortedPosts <- sortPosts iArticlesWithExcerpts iNotes
+  sortedPosts <- sortPublishedPosts iArticlesWithExcerpts iNotes
 
   output <-
     renderTemplate iTemplate $
@@ -1324,6 +1455,52 @@ indexHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
 
   Build.setResourceProperty oHtml () (unsafeName "url") $ VString (fromString "/")
 
+draftsHtml ::
+  MonadIO m =>
+  ( Build.ResourceInput m ByteString
+  , [(Build.ResourceInput m ByteString, Build.ResourceInput m ByteString)]
+  , [Build.ResourceInput m ByteString]
+  ) ->
+  Build.ResourceOutput m () ->
+  Build.ActionT m ()
+draftsHtml (iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
+  sortedPosts <- sortUnpublishedPosts iArticlesWithExcerpts iNotes
+
+  output <-
+    renderTemplate iTemplate $
+      resourceField
+        <> fields
+          [
+            ( fromString "self"
+            , recordValue
+                [
+                  ( fromString "metadata"
+                  , recordValue
+                      [ (fromString "url", stringValue "/drafts")
+                      , (fromString "title", stringValue "Drafts - blog.ielliott.io")
+                      , (fromString "description", stringValue "Isaac Elliott's personal blog.")
+                      , (fromString "math", boolValue False)
+                      , (fromString "chinese", boolValue False)
+                      , (fromString "asciinema", boolValue False)
+                      ]
+                  )
+                ]
+            )
+          ,
+            ( fromString "tag"
+            , optionalValue Nothing
+            )
+          ,
+            ( fromString "posts"
+            , unpublishedPostsList sortedPosts
+            )
+          ]
+
+  Build.writeResource oHtml () output
+
+  Build.setResourceProperty oHtml () (unsafeName "url") $ VString (fromString "/drafts")
+  Build.setResourceProperty oHtml () (unsafeName "draft") VTrue
+
 tagIndexHtml ::
   MonadIO m =>
   ( Build.ResourceInput m ByteString
@@ -1339,7 +1516,7 @@ tagIndexHtml (iTag, iTemplate, iArticlesWithExcerpts, iNotes) oHtml = do
 
   sortedPosts <-
     filter ((Text.pack tagName `elem`) . indexItemTags)
-      <$> sortPosts iArticlesWithExcerpts iNotes
+      <$> sortPublishedPosts iArticlesWithExcerpts iNotes
 
   output <-
     renderTemplate iTemplate $
@@ -1411,7 +1588,7 @@ indexFeed (iFeedConfig, iTemplate, iArticlesWithExcerpts, iNotes) oFeed = do
   authorName <- requireStringProperty iFeedConfig (unsafeName "authorName")
   authorEmail <- requireStringProperty iFeedConfig (unsafeName "authorEmail")
 
-  sortedPosts <- sortPosts iArticlesWithExcerpts iNotes
+  sortedPosts <- sortPublishedPosts iArticlesWithExcerpts iNotes
 
   let updated = foldl' (\acc res -> max acc (indexItemUpdated res)) (posixSecondsToUTCTime 0) sortedPosts
 
