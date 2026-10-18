@@ -161,6 +161,9 @@ data ServerCommand
   | Import
       -- | Archive to import
       FilePath
+  | Export
+      -- | Destination file
+      FilePath
 
 data LocalCommand
   = Init
@@ -236,6 +239,9 @@ cliParser =
         <> Options.command
           "import"
           (Options.info (serverCommandParser importParser) $ Options.progDesc "Import an archive")
+        <> Options.command
+          "export"
+          (Options.info (serverCommandParser exportParser) $ Options.progDesc "Export an archive")
         <> Options.command
           "seed-user"
           (Options.info (LocalCommand <$> seedUserParser) $ Options.progDesc "Generate a user locally")
@@ -354,6 +360,11 @@ cliParser =
       Import
         <$> Options.strArgument
           (Options.metavar "FILE" <> Options.help "Archive to import")
+
+    exportParser =
+      Export
+        <$> Options.strArgument
+          (Options.metavar "FILE" <> Options.help "Export destination")
 
     seedUserParser =
       SeedUser
@@ -492,6 +503,8 @@ main = do
           refreshAll baseUrl manager mSessionId resTy
         Import path ->
           import_ baseUrl manager mSessionId path
+        Export path ->
+          export baseUrl manager mSessionId path
     LocalCommand command ->
       case command of
         SeedUser dir ->
@@ -1332,6 +1345,26 @@ import_ baseUrl manager mSessionId path = do
       exitFailure
     200 -> do
       ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+    _ ->
+      unexpected response
+
+export ::
+  String ->
+  Http.Manager ->
+  -- | Session ID
+  Maybe ID ->
+  FilePath ->
+  IO ()
+export baseUrl manager mSessionId path = do
+  let headers = sessionCookieHeaders mSessionId
+  response <- httpGet manager (baseUrl ++ "/.export") headers
+
+  case statusCode $ Http.responseStatus response of
+    400 -> do
+      ByteString.Lazy.Char8.putStrLn $ Http.responseBody response
+      exitFailure
+    200 -> do
+      LazyByteString.writeFile path $ Http.responseBody response
     _ ->
       unexpected response
 
