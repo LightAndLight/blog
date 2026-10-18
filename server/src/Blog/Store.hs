@@ -633,7 +633,14 @@ import_ store xactId archive = do
               let resName' = pathToName resName
               resTy <- getResourceType store (Just xactId) resTyName'
               let resId = pathToResourceId subKey
-              createDependency resTy resName' resId
+              {- Assumes that an archive's dependency information is valid.
+
+              Archive entries may not be in dependency order. In fact, it's
+              possible for resources to be mutually dependent, so in general
+              the archive's entries *can't* be in dependecy order.
+              -}
+              createDependencyUnchecked resTy resName' resId
+
               pure Nothing
             _ ->
               throwError . DiagnosticSimple $ "unrecognised archive path: " ++ path
