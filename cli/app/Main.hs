@@ -30,8 +30,9 @@ import qualified Data.ByteString.Char8 as ByteString.Char8
 import Data.ByteString.Lazy (LazyByteString)
 import qualified Data.ByteString.Lazy as LazyByteString
 import qualified Data.ByteString.Lazy.Char8 as ByteString.Lazy.Char8
+import qualified Data.ByteString.Lazy.Char8 as LazyByteString.Char8
 import Data.Foldable (for_)
-import Data.List (find)
+import Data.List (find, sort)
 import Data.Maybe (fromMaybe, isNothing)
 import Data.String (fromString)
 import Data.Text (Text)
@@ -948,7 +949,9 @@ list baseUrl manager mSessionId resourceTyName = do
       putStrLn $ "error: resource type " ++ resourceTyName ++ " not found"
       exitFailure
     200 -> do
-      LazyByteString.writeFile resourcePathLocal $ Http.responseBody response
+      LazyByteString.writeFile
+        resourcePathLocal
+        (LazyByteString.Char8.unlines . sort . LazyByteString.Char8.lines $ Http.responseBody response)
     _ ->
       unexpected response
 
